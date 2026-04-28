@@ -36,11 +36,14 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // Capture the login event (Stub matching Laravel Gateway login event)
-    await this.prisma.user_logs.create({
+    // Capture the login event
+    await this.prisma.audit_logs.create({
       data: {
+        workspace_id: domainInfo.modelable_type === 'App\\Models\\Workspace' ? domainInfo.modelable_id : BigInt(0),
         user_id: user.id,
-        event: 'LOGIN',
+        modelable_type: domainInfo.modelable_type,
+        modelable_id: domainInfo.modelable_id,
+        event: 'user_logged_in',
         data: JSON.stringify({ ip: 'mock-ip' }),
       },
     });
