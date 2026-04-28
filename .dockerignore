@@ -1,0 +1,11 @@
+node_modules
+dist
+.env
+.git
+.gitignore
+*.log
+scratch
+scratch_user.js
+seed_users.js
+delete_other_users.js
+uploads
