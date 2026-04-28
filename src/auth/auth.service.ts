@@ -22,53 +22,37 @@ export class AuthService {
     const user = await this.prisma.users.findFirst({
       where: {
         email: userDto.email,
-        portal_url: domainInfo.app.domain || domainInfo.app.hostname,
+        status: 'ACTIVE',
       },
     });
     console.log(`User found? ${!!user}`);
-
 
     if (!user) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    if (user.status !== 'ACTIVE') {
-      throw new UnauthorizedException('Account suspended');
-    }
-
-    // Workspace policy check logic goes here (mocked for now)
-    // if (user.isLoginBlockedByPolicy()) { ... }
-
-    const isPasswordValid = await bcrypt.compare(
-      userDto.password,
-      user.password || '',
-    );
-    console.log(`Password valid? ${isPasswordValid}`);
-
-
-    if (!isPasswordValid) {
+    const isMatched = await bcrypt.compare(userDto.password, user.password || '');
+    if (!isMatched) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // Log the login event
-    await this.prisma.audit_logs.create({
+    // Capture the login event (Stub matching Laravel Gateway login event)
+    await this.prisma.user_logs.create({
       data: {
-        workspace_id: BigInt(0), // Would normally be resolved from context
         user_id: user.id,
-        modelable_type: user.modelable_type || '',
-        modelable_id: user.modelable_id || BigInt(0),
-        event: 'user_logged_in',
+        event: 'LOGIN',
         data: JSON.stringify({ ip: 'mock-ip' }),
       },
     });
 
-    // JWT token generation
+    // JWT token generation - Smart switching based on domainInfo
     const payload = {
       email: user.email,
       sub: user.id.toString(),
-      modelable_id: user.modelable_id?.toString(),
-      modelable_type: user.modelable_type,
+      modelable_id: domainInfo.modelable_id.toString(),
+      modelable_type: domainInfo.modelable_type,
       tfa_enabled: user.tfa_enabled,
+      workspace_id: domainInfo.modelable_type === 'App\\Models\\Workspace' ? domainInfo.modelable_id.toString() : null,
     };
 
     // Expiry handling
