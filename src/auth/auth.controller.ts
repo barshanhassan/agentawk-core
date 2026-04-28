@@ -9,26 +9,19 @@ import {
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './auth.guard';
+import { AppService } from '../app.service';
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly appService: AppService,
+  ) {}
 
   @Post('login')
   async login(@Body() body: any, @Headers('host') host: string) {
-    // In Laravel Gateway, Domain validation is done via a Middleware or Request inspection.
-    // We will mock it here or extract it from headers in NestJS mapping
-    const domainInfo = {
-      modelable_id: body.agency_id || BigInt(1), // Mocked fallback
-      modelable_type: 'App\\Models\\Agency', // Can be App\Models\Workspace
-    };
-
+    const domainInfo = await this.appService.ignite(host);
     return this.authService.login(body, domainInfo);
-  }
-
-  @Post('register')
-  async register(@Body() body: any) {
-    return this.authService.register(body);
   }
 
   @UseGuards(JwtAuthGuard)
@@ -71,19 +64,13 @@ export class AuthController {
     @Body('email') email: string,
     @Headers('host') host: string,
   ) {
-    const domainInfo = {
-      modelable_id: BigInt(1), // Mocked fallback
-      modelable_type: 'App\\Models\\Agency',
-    };
+    const domainInfo = await this.appService.ignite(host);
     return this.authService.forgotPassword(email, domainInfo);
   }
 
   @Post('reset-password')
   async resetPassword(@Body() body: any, @Headers('host') host: string) {
-    const domainInfo = {
-      modelable_id: BigInt(1),
-      modelable_type: 'App\\Models\\Agency',
-    };
+    const domainInfo = await this.appService.ignite(host);
     return this.authService.resetPassword(body, domainInfo);
   }
 
@@ -110,10 +97,7 @@ export class AuthController {
     @Body('email') email: string,
     @Headers('host') host: string,
   ) {
-    const domainInfo = {
-      modelable_id: BigInt(1), // Mocked fallback
-      modelable_type: 'App\\Models\\Agency',
-    };
+    const domainInfo = await this.appService.ignite(host);
     return this.authService.verifyEmail(
       BigInt(req.user.sub),
       email,
