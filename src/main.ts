@@ -14,4 +14,8 @@ async function bootstrap() {
   await app.listen(process.env.PORT ?? 3001);
 }
 // Triggering rebuild for Gallery local storage changes
-bootstrap();
+bootstrap().catch((err) => {
+  console.error('FAILED TO START APPLICATION');
+  console.error(err);
+  process.exit(1);
+});
