@@ -322,7 +322,7 @@ export class StatisticsService {
         where: { workspace_id: workspaceId, created_at: range }
       }),
       this.prisma.automations.count({
-        where: { workspace_id: workspaceId, status: 'PUBLISHED' }
+        where: { workspace_id: workspaceId, status: 'active' }
       })
     ]);
 
