@@ -45,4 +45,4 @@ COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 RUN mkdir -p uploads
 
 # Command to run the application
-CMD [ "node", "dist/src/main.js" ]
+CMD [ "node", "dist/main.js" ]
