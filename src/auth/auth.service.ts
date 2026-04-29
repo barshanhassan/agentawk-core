@@ -36,26 +36,37 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
+    // Smart Role detection based on database
+    const userRole = user.modelable_type === 'App\\Models\\Agency' ? 'AGENCY' : 'WORKSPACE';
+    
+    // Determine the context (either from domainInfo or from user's own record)
+    const contextType = domainInfo?.modelable_type || user.modelable_type;
+    const contextId = domainInfo?.modelable_id || user.modelable_id;
+
     // Capture the login event
     await this.prisma.audit_logs.create({
       data: {
-        workspace_id: domainInfo.modelable_type === 'App\\Models\\Workspace' ? domainInfo.modelable_id : BigInt(0),
+        workspace_id: contextType === 'App\\Models\\Workspace' ? contextId : BigInt(0),
         user_id: user.id,
-        modelable_type: domainInfo.modelable_type,
-        modelable_id: domainInfo.modelable_id,
+        modelable_type: contextType,
+        modelable_id: contextId,
         event: 'user_logged_in',
-        data: JSON.stringify({ ip: 'mock-ip' }),
+        data: JSON.stringify({ 
+          ip: 'mock-ip',
+          via_central: !domainInfo?.modelable_type 
+        }),
       },
     });
 
-    // JWT token generation - Smart switching based on domainInfo
+    // JWT token generation - Smart switching
     const payload = {
       email: user.email,
       sub: user.id.toString(),
-      modelable_id: domainInfo.modelable_id.toString(),
-      modelable_type: domainInfo.modelable_type,
+      modelable_id: contextId.toString(),
+      modelable_type: contextType,
+      role: userRole,
       tfa_enabled: user.tfa_enabled,
-      workspace_id: domainInfo.modelable_type === 'App\\Models\\Workspace' ? domainInfo.modelable_id.toString() : null,
+      workspace_id: contextType === 'App\\Models\\Workspace' ? contextId.toString() : null,
     };
 
     // Expiry handling
@@ -68,8 +79,10 @@ export class AuthService {
         first_name: user.first_name,
         last_name: user.last_name,
         tfa_enabled: user.tfa_enabled,
+        role: userRole,
       },
       token: this.jwtService.sign(payload, { expiresIn }),
+      redirect_to: userRole === 'AGENCY' ? '/agency' : '/workspace',
     };
   }
 
