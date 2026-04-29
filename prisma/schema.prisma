@@ -3674,7 +3674,6 @@ model users {
   creator_id                     BigInt                           @db.UnsignedBigInt
   created_at                     DateTime?                        @db.Timestamp(0)
   updated_at                     DateTime?                        @db.Timestamp(0)
-  portal_url                     String?                          @db.VarChar(255)
   notification_sound             String                           @default("https://replyagent-staging.s3.amazonaws.com/assets/notification-sounds/notification.wav") @db.VarChar(255)
   pipeline_opportunity_step_logs pipeline_opportunity_step_logs[]
   team_members                   team_members[]
