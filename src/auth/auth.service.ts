@@ -36,36 +36,42 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // Smart Role detection based on database (using includes to be safe with backslashes)
-    const userRole = user.modelable_type.includes('Agency') ? 'AGENCY' : 'WORKSPACE';
+    // DEBUG LOGS
+    console.log(`[DEBUG] User modelable_type from DB: "${user.modelable_type}"`);
+    console.log(`[DEBUG] Hostname from request: "${hostname}"`);
+
+    // Smart Role detection based on database (Case-insensitive check)
+    const isAgency = user.modelable_type.toLowerCase().includes('agency');
+    const userRole = isAgency ? 'AGENCY' : 'WORKSPACE';
     
+    console.log(`[DEBUG] Calculated userRole: ${userRole}`);
+
     // Determine the context
-    // If we are on a specific domain (like agency.ezconn.com), use that.
-    // Otherwise, use the user's primary modelable context.
-    const contextType = domainInfo?.modelable_type && !hostname.includes('web.app') 
-      ? domainInfo.modelable_type 
-      : user.modelable_type;
-      
-    const contextId = domainInfo?.modelable_id && !hostname.includes('web.app')
-      ? domainInfo.modelable_id
-      : user.modelable_id;
+    const isCentral = hostname.includes('web.app') || hostname.includes('localhost') || hostname.includes('run.app');
+    const contextType = (domainInfo?.modelable_type && !isCentral) ? domainInfo.modelable_type : user.modelable_type;
+    const contextId = (domainInfo?.modelable_id && !isCentral) ? domainInfo.modelable_id : user.modelable_id;
+
+    console.log(`[DEBUG] Final contextType: ${contextType}, contextId: ${contextId}`);
 
     // Capture the login event
     await this.prisma.audit_logs.create({
       data: {
-        workspace_id: contextType === 'App\\Models\\Workspace' ? contextId : BigInt(0),
+        workspace_id: contextType.toLowerCase().includes('workspace') ? contextId : BigInt(0),
         user_id: user.id,
         modelable_type: contextType,
         modelable_id: contextId,
         event: 'user_logged_in',
         data: JSON.stringify({ 
           ip: 'mock-ip',
-          via_central: !domainInfo?.modelable_type 
+          via_central: isCentral 
         }),
       },
     });
 
-    // JWT token generation - Smart switching
+    const redirectTo = isAgency ? '/agency' : '/workspace';
+    console.log(`[DEBUG] Final redirect_to: ${redirectTo}`);
+
+    // JWT token generation
     const payload = {
       email: user.email,
       sub: user.id.toString(),
@@ -73,10 +79,9 @@ export class AuthService {
       modelable_type: contextType,
       role: userRole,
       tfa_enabled: user.tfa_enabled,
-      workspace_id: contextType === 'App\\Models\\Workspace' ? contextId.toString() : null,
+      workspace_id: contextType.toLowerCase().includes('workspace') ? contextId.toString() : null,
     };
 
-    // Expiry handling
     const expiresIn = userDto.remember ? '30d' : '12h';
 
     return {
@@ -89,7 +94,7 @@ export class AuthService {
         role: userRole,
       },
       token: this.jwtService.sign(payload, { expiresIn }),
-      redirect_to: userRole === 'AGENCY' ? '/agency' : '/workspace',
+      redirect_to: redirectTo,
     };
   }
 
