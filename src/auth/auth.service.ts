@@ -16,7 +16,7 @@ export class AuthService {
     private prisma: PrismaService,
   ) {}
 
-  async login(userDto: any, domainInfo: any) {
+  async login(userDto: any, domainInfo: any, hostname: string = '') {
     console.log(`Login attempt for email: "${userDto.email}"`);
 
     const user = await this.prisma.users.findFirst({
@@ -36,12 +36,19 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // Smart Role detection based on database
-    const userRole = user.modelable_type === 'App\\Models\\Agency' ? 'AGENCY' : 'WORKSPACE';
+    // Smart Role detection based on database (using includes to be safe with backslashes)
+    const userRole = user.modelable_type.includes('Agency') ? 'AGENCY' : 'WORKSPACE';
     
-    // Determine the context (either from domainInfo or from user's own record)
-    const contextType = domainInfo?.modelable_type || user.modelable_type;
-    const contextId = domainInfo?.modelable_id || user.modelable_id;
+    // Determine the context
+    // If we are on a specific domain (like agency.ezconn.com), use that.
+    // Otherwise, use the user's primary modelable context.
+    const contextType = domainInfo?.modelable_type && !hostname.includes('web.app') 
+      ? domainInfo.modelable_type 
+      : user.modelable_type;
+      
+    const contextId = domainInfo?.modelable_id && !hostname.includes('web.app')
+      ? domainInfo.modelable_id
+      : user.modelable_id;
 
     // Capture the login event
     await this.prisma.audit_logs.create({

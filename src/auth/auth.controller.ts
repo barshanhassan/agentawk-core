@@ -27,7 +27,7 @@ export class AuthController {
   ) {
     const clientHost = origin || referer || host;
     const domainInfo = await this.appService.ignite(clientHost);
-    return this.authService.login(body, domainInfo);
+    return this.authService.login(body, domainInfo, clientHost);
   }
 
   @UseGuards(JwtAuthGuard)
