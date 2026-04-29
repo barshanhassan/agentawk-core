@@ -159,7 +159,7 @@ export class AuthService {
         });
 
         // 6. Create User
-        const agencyPortalUrl = `${subdomain}.${process.env.ROOT_DOMAIN || 'ezconn.com'}`;
+
         const newUser = await tx.users.create({
           data: {
             first_name: userDto.firstName,
@@ -172,7 +172,7 @@ export class AuthService {
             status: 'ACTIVE',
             creator_id: BigInt(0),
             locale: userDto.locale || 'en-US',
-            portal_url: agencyPortalUrl,
+
           },
         });
 
