@@ -38,8 +38,10 @@ RUN npm ci --only=production
 # Copy built files from the builder stage
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/prisma ./prisma
-COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
-COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder /app/package*.json ./
+
+# Generate Prisma client for Alpine
+RUN npx prisma generate
 
 # Create uploads directory (if needed for local storage fallback)
 RUN mkdir -p uploads
