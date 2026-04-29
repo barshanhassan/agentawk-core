@@ -14,8 +14,14 @@ export class AppService {
       return { app: { name: 'Ezconn', site_type: 'WORKSPACE' } };
     }
 
-    // Standardize hostname (remove port and protocol if present)
-    const domainName = hostname.replace(/^https?:\/\//, '').split(':')[0];
+    // Standardize hostname: 
+    // 1. Remove protocol (http/https)
+    // 2. Remove port (:3000)
+    // 3. Remove path (/auth/login)
+    const domainName = hostname
+      .replace(/^https?:\/\//, '')
+      .split('/')[0]
+      .split(':')[0];
 
     // Find the domain in the database
     const domainRecord = await this.prisma.domains.findFirst({

@@ -19,8 +19,14 @@ export class AuthController {
   ) {}
 
   @Post('login')
-  async login(@Body() body: any, @Headers('host') host: string) {
-    const domainInfo = await this.appService.ignite(host);
+  async login(
+    @Body() body: any,
+    @Headers('host') host: string,
+    @Headers('origin') origin: string,
+    @Headers('referer') referer: string,
+  ) {
+    const clientHost = origin || referer || host;
+    const domainInfo = await this.appService.ignite(clientHost);
     return this.authService.login(body, domainInfo);
   }
 
@@ -63,14 +69,23 @@ export class AuthController {
   async forgotPassword(
     @Body('email') email: string,
     @Headers('host') host: string,
+    @Headers('origin') origin: string,
+    @Headers('referer') referer: string,
   ) {
-    const domainInfo = await this.appService.ignite(host);
+    const clientHost = origin || referer || host;
+    const domainInfo = await this.appService.ignite(clientHost);
     return this.authService.forgotPassword(email, domainInfo);
   }
 
   @Post('reset-password')
-  async resetPassword(@Body() body: any, @Headers('host') host: string) {
-    const domainInfo = await this.appService.ignite(host);
+  async resetPassword(
+    @Body() body: any, 
+    @Headers('host') host: string,
+    @Headers('origin') origin: string,
+    @Headers('referer') referer: string,
+  ) {
+    const clientHost = origin || referer || host;
+    const domainInfo = await this.appService.ignite(clientHost);
     return this.authService.resetPassword(body, domainInfo);
   }
 
@@ -96,8 +111,11 @@ export class AuthController {
     @Request() req: any,
     @Body('email') email: string,
     @Headers('host') host: string,
+    @Headers('origin') origin: string,
+    @Headers('referer') referer: string,
   ) {
-    const domainInfo = await this.appService.ignite(host);
+    const clientHost = origin || referer || host;
+    const domainInfo = await this.appService.ignite(clientHost);
     return this.authService.verifyEmail(
       BigInt(req.user.sub),
       email,
