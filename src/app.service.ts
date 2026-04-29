@@ -59,7 +59,9 @@ export class AppService {
         site_type: siteType,
         domain: domainRecord.domain
       },
-      site: siteData
+      site: siteData,
+      modelable_id: domainRecord.modelable_id,
+      modelable_type: domainRecord.modelable_type,
     };
   }
 }
