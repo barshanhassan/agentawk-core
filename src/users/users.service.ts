@@ -244,4 +244,132 @@ export class UsersService {
 
     return { success: true, message: 'Password updated successfully' };
   }
+
+  /**
+   * Get agencies list for user, filtered by domain
+   * Gateway equivalent: User::agenciesList()
+   *
+   * Logic:
+   * - Platform domains: Return all non-white-labeled agencies where user is member/owner
+   * - Custom domains: Return only the agency for that domain if user has access
+   */
+  async agenciesList(userId: bigint, domain: string = 'localhost'): Promise<any> {
+    const PLATFORM_DOMAINS = [
+      'localhost',
+      'localhost:3001',
+      '127.0.0.1:3001',
+      'leadagent.io',
+      'app.leadagent.io',
+      'stage.leadagent.io',
+      'api.leadagent.io',
+      'lag-frontend.pages.dev',
+    ];
+
+    const isPlatformDomain = PLATFORM_DOMAINS.some(
+      (d) => domain === d || domain.includes(d)
+    );
+
+    if (isPlatformDomain) {
+      // Platform domain - get all agencies where user is member or owner
+      const agencies = await this.prisma.agencies.findMany({
+        where: {
+          OR: [
+            // User is owner
+            { owner_id: userId },
+            // User is member of a workspace in this agency
+            {
+              workspaces: {
+                some: {
+                  workspace_members: {
+                    some: {
+                      user_id: userId,
+                      status: 'ACTIVE',
+                    },
+                  },
+                },
+              },
+            },
+          ],
+          // Exclude white-labeled agencies (they have domain field set)
+          domain: null,
+        },
+        include: {
+          workspaces: {
+            include: {
+              workspace_members: {
+                where: {
+                  user_id: userId,
+                  status: 'ACTIVE',
+                },
+              },
+            },
+          },
+        },
+      });
+
+      return { success: true, agencies };
+    } else {
+      // Custom domain - get only that agency if user has access
+      // Extract host for domain lookup
+      const protocol = 'https://';
+      const fullDomain = `${protocol}${domain}`;
+
+      const domainRecord = await this.prisma.domains.findFirst({
+        where: {
+          domain: fullDomain,
+          active: true,
+          modelable_type: 'App\\Models\\Agency',
+        },
+      });
+
+      if (!domainRecord) {
+        throw new BadRequestException('Domain not found or inactive');
+      }
+
+      // Verify user has access to this agency
+      const agency = await this.prisma.agencies.findUnique({
+        where: { id: domainRecord.modelable_id },
+      });
+
+      if (!agency) {
+        throw new NotFoundException('Agency not found');
+      }
+
+      // Check if user is owner or member of any workspace
+      const hasAccess =
+        agency.owner_id === userId ||
+        (await this.prisma.workspace_members.findFirst({
+          where: {
+            user_id: userId,
+            status: 'ACTIVE',
+            workspace: {
+              agency_id: agency.id,
+            },
+          },
+        }));
+
+      if (!hasAccess) {
+        throw new BadRequestException('User does not have access to this agency');
+      }
+
+      // Return only this agency with its workspaces
+      const agencyWithWorkspaces = await this.prisma.agencies.findUnique({
+        where: { id: agency.id },
+        include: {
+          workspaces: {
+            include: {
+              workspace_members: {
+                where: {
+                  user_id: userId,
+                  status: 'ACTIVE',
+                },
+              },
+            },
+          },
+        },
+      });
+
+      return { success: true, agencies: [agencyWithWorkspaces] };
+    }
+  }
 }

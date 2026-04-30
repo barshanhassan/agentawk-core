@@ -5,12 +5,28 @@ import { BillingController } from './billing.controller';
 import { PrismaModule } from '../prisma/prisma.module';
 import { ConfigModule } from '@nestjs/config';
 import { BillingSyncHelper } from './helpers/billing-sync.helper';
+import { WhiteLabelBillingService } from './white-label-billing.service';
+import { SubscriptionRecomputeService } from './subscription-recompute.service';
+import { OnSubscriptionUpdatedListener } from './listeners/on-subscription-updated.listener';
+import { DomainsModule } from '../domains/domains.module';
 
 @Global()
 @Module({
-  imports: [PrismaModule, ConfigModule],
+  imports: [PrismaModule, ConfigModule, DomainsModule],
   controllers: [BillingController],
-  providers: [ChargebeeService, BillingService, BillingSyncHelper],
-  exports: [ChargebeeService, BillingService],
+  providers: [
+    ChargebeeService,
+    BillingService,
+    BillingSyncHelper,
+    WhiteLabelBillingService,
+    SubscriptionRecomputeService,
+    OnSubscriptionUpdatedListener,
+  ],
+  exports: [
+    ChargebeeService,
+    BillingService,
+    WhiteLabelBillingService,
+    SubscriptionRecomputeService,
+  ],
 })
 export class BillingModule {}

@@ -6,12 +6,16 @@ import {
   Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { EntriService } from '../libraries/entri.service';
 
 @Injectable()
 export class DomainsService {
   private readonly logger = new Logger(DomainsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly entri: EntriService,
+  ) {}
 
   // ─── Domain Management ─────────────────────────────────────────────
 
@@ -70,11 +74,11 @@ export class DomainsService {
       await this.prisma.audit_logs.create({
         data: {
           workspace_id: workspaceId,
-          event_type: 'domain_added',
+          event: 'domain_added',
           user_id: userId,
-          auditable_id: domain.id,
-          auditable_type: 'App\\Models\\Domain',
-          metadata: JSON.stringify({ domain: domain.domain }),
+          modelable_id: domain.id,
+          modelable_type: 'App\\Models\\Domain',
+          data: JSON.stringify({ domain: domain.domain }),
           created_at: new Date(),
           updated_at: new Date(),
         },
@@ -119,9 +123,16 @@ export class DomainsService {
 
     if (!domain) throw new NotFoundException('Invalid domain');
 
-    // Logic from Laravel Domain::deleteIt()
-    // Stub: Entri deletion
-    this.logger.debug(`Stub: Deleting Entri domain for ${domain.domain}`);
+    // Delete from Entri (matches Domain::deleteIt() in gateway)
+    try {
+      await this.entri.deletePowerDomain(
+        `${domain.sub_domain}.${domain.root_domain}`,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Entri delete failed (continuing local cleanup): ${err.message}`,
+      );
+    }
 
     await this.prisma.$transaction([
       // Activate default domain
@@ -171,7 +182,10 @@ export class DomainsService {
   }
 
   async getEntriToken() {
-    // Stub: Fetch Entri token
-    return { token: 'stub-entri-token' };
+    const token = await this.entri.getToken();
+    if (!token) {
+      throw new BadRequestException('Failed to retrieve Entri token');
+    }
+    return { token };
   }
 }

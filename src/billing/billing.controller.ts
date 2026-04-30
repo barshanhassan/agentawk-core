@@ -11,11 +11,43 @@ import {
   Query,
 } from '@nestjs/common';
 import { BillingService } from './billing.service';
+import { WhiteLabelBillingService } from './white-label-billing.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
 
 @Controller('billing')
 export class BillingController {
-  constructor(private readonly service: BillingService) {}
+  constructor(
+    private readonly service: BillingService,
+    private readonly whiteLabelBilling: WhiteLabelBillingService,
+  ) {}
+
+  // ─── Agency Branding (Gateway parity: /billing/agency-branding) ─────
+
+  @UseGuards(JwtAuthGuard)
+  @Get('agency-branding')
+  async getAgencyBranding(@Request() req: any) {
+    return this.whiteLabelBilling.getAgencyBrandingInfo(
+      BigInt(req.user.modelable_id),
+    );
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('agency-branding')
+  async enableAgencyBranding(@Request() req: any) {
+    return this.whiteLabelBilling.enableAgencyBranding(
+      BigInt(req.user.modelable_id),
+      BigInt(req.user.sub),
+    );
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Delete('agency-branding')
+  async disableAgencyBranding(@Request() req: any) {
+    return this.whiteLabelBilling.disableAgencyBranding(
+      BigInt(req.user.modelable_id),
+      BigInt(req.user.sub),
+    );
+  }
 
   @Post('events')
   async handleBillingEvents(@Body() body: any) {

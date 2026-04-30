@@ -1,7 +1,8 @@
-import { Module } from '@nestjs/common';
+import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
+import { DomainCachingMiddleware } from './middleware/domain-caching.middleware';
 import { UsersModule } from './users/users.module';
 import { WorkspacesModule } from './workspaces/workspaces.module';
 import { AgencyModule } from './agency/agency.module';
@@ -60,6 +61,8 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ScheduleModule } from '@nestjs/schedule';
 import { join } from 'path';
 import { ConfigModule } from '@nestjs/config';
+import { LibrariesModule } from './libraries/libraries.module';
+import { CacheModule } from './cache/cache.module';
 
 @Module({
   imports: [
@@ -73,6 +76,8 @@ import { ConfigModule } from '@nestjs/config';
     }),
     EventEmitterModule.forRoot(),
     ScheduleModule.forRoot(),
+    LibrariesModule,
+    CacheModule,
     AuthModule,
     UsersModule,
     WorkspacesModule,
@@ -131,4 +136,9 @@ import { ConfigModule } from '@nestjs/config';
   controllers: [AppController],
   providers: [AppService],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    // Register domain caching middleware for all routes
+    consumer.apply(DomainCachingMiddleware).forRoutes('*');
+  }
+}

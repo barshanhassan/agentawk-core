@@ -9,8 +9,16 @@ import {
   UseGuards,
   Request,
   Param,
+  UseInterceptors,
+  UploadedFile,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { WorkspacesService } from './workspaces.service';
+import {
+  BrandingMediaService,
+  LogoType,
+} from '../agency/branding-media.service';
+import { DomainsService } from '../domains/domains.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
 import { Logger } from '@nestjs/common';
 
@@ -18,7 +26,106 @@ import { Logger } from '@nestjs/common';
 @Controller('workspaces')
 export class WorkspacesController {
   private readonly logger = new Logger(WorkspacesController.name);
-  constructor(private readonly service: WorkspacesService) {}
+  constructor(
+    private readonly service: WorkspacesService,
+    private readonly brandingMedia: BrandingMediaService,
+    private readonly domainsService: DomainsService,
+  ) {}
+
+  // ─── Workspace Domain (Gateway parity: POST /w/{workspace}/domain) ──
+
+  @Post('domain')
+  async addCustomDomain(@Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.domainsService.addCustomDomain(
+      workspaceId,
+      'WORKSPACE',
+      body.sub_domain,
+      body.root_domain,
+      BigInt(req.user.sub),
+    );
+  }
+
+  // ─── Workspace Logo / Favicon (Gateway parity: /w/{workspace}/logo etc.) ──
+
+  @Post('logo')
+  @UseInterceptors(FileInterceptor('logo'))
+  async uploadLogo(
+    @UploadedFile() file: Express.Multer.File,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.brandingMedia.uploadLogo(
+      file,
+      body.logo_id as LogoType,
+      body.canvas_data,
+      'WORKSPACE',
+      workspaceId,
+      workspaceId,
+      BigInt(req.user.sub),
+    );
+  }
+
+  @Post('logo/update')
+  async updateLogo(@Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.brandingMedia.updateLogo(
+      BigInt(body.media_id),
+      body.logo_id as LogoType,
+      'WORKSPACE',
+      workspaceId,
+      BigInt(req.user.sub),
+    );
+  }
+
+  @Delete('logo/:logo_type')
+  async removeLogo(
+    @Param('logo_type') logoType: string,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.brandingMedia.removeLogo(
+      logoType as LogoType,
+      'WORKSPACE',
+      workspaceId,
+    );
+  }
+
+  @Post('favicon')
+  @UseInterceptors(FileInterceptor('favicon'))
+  async uploadFavicon(
+    @UploadedFile() file: Express.Multer.File,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.brandingMedia.uploadFavicon(
+      file,
+      body.canvas_data,
+      'WORKSPACE',
+      workspaceId,
+      workspaceId,
+      BigInt(req.user.sub),
+    );
+  }
+
+  @Post('favicon/update')
+  async updateFavicon(@Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.brandingMedia.updateFavicon(
+      BigInt(body.media_id),
+      'WORKSPACE',
+      workspaceId,
+      BigInt(req.user.sub),
+    );
+  }
+
+  @Delete('favicon')
+  async removeFavicon(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.brandingMedia.removeFavicon('WORKSPACE', workspaceId);
+  }
 
   @Get('current')
   async getWorkspace(@Request() req: any) {

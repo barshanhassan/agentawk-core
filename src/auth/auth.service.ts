@@ -19,12 +19,26 @@ export class AuthService {
   async login(userDto: any, domainInfo: any, hostname: string = '') {
     console.log(`Login attempt for email: "${userDto.email}"`);
 
-    const user = await this.prisma.users.findFirst({
-      where: {
-        email: userDto.email,
-        status: 'ACTIVE',
-      },
-    });
+    // White-label scoping: on a custom domain, restrict user lookup to that
+    // domain's agency/workspace. Prevents cross-tenant login (gateway parity:
+    // AuthController::authenticate $request->site_domain filter).
+    const isCentral =
+      hostname.includes('web.app') ||
+      hostname.includes('localhost') ||
+      hostname.includes('run.app') ||
+      hostname.includes('leadagent.io') ||
+      hostname.includes('lag-frontend.pages.dev');
+
+    const where: any = {
+      email: userDto.email,
+      status: 'ACTIVE',
+    };
+    if (!isCentral && domainInfo?.modelable_id && domainInfo?.modelable_type) {
+      where.modelable_id = domainInfo.modelable_id;
+      where.modelable_type = domainInfo.modelable_type;
+    }
+
+    const user = await this.prisma.users.findFirst({ where });
     console.log(`User found? ${!!user}`);
 
     if (!user) {
