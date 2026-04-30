@@ -36,22 +36,14 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // DEBUG LOGS
-    console.log(`[DEBUG] User modelable_type from DB: "${user.modelable_type}"`);
-    console.log(`[DEBUG] Hostname from request: "${hostname}"`);
-
     // Smart Role detection based on database (Case-insensitive check)
     const isAgency = user.modelable_type.toLowerCase().includes('agency');
     const userRole = isAgency ? 'AGENCY' : 'WORKSPACE';
     
-    console.log(`[DEBUG] Calculated userRole: ${userRole}`);
-
     // Determine the context
     const isCentral = hostname.includes('web.app') || hostname.includes('localhost') || hostname.includes('run.app');
     const contextType = (domainInfo?.modelable_type && !isCentral) ? domainInfo.modelable_type : user.modelable_type;
     const contextId = (domainInfo?.modelable_id && !isCentral) ? domainInfo.modelable_id : user.modelable_id;
-
-    console.log(`[DEBUG] Final contextType: ${contextType}, contextId: ${contextId}`);
 
     // Capture the login event
     await this.prisma.audit_logs.create({
@@ -69,7 +61,6 @@ export class AuthService {
     });
 
     const redirectTo = isAgency ? '/agency' : '/workspace';
-    console.log(`[DEBUG] Final redirect_to: ${redirectTo}`);
 
     // JWT token generation
     const payload = {
