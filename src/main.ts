@@ -11,6 +11,7 @@ async function bootstrap() {
     origin: true,
     credentials: true,
   });
+  app.setGlobalPrefix('api');
   await app.listen(process.env.PORT ?? 3001);
 }
 // Triggering rebuild for Gallery local storage changes

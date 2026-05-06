@@ -31,7 +31,6 @@ export class AgencyService {
       where: { brandable_id: agencyId, brandable_type: 'App\\Models\\Agency' }
     });
 
-
     const address = await this.prisma.addresses.findFirst({
       where: {
         addressable_id: agencyId,
@@ -39,15 +38,32 @@ export class AgencyService {
       },
     });
 
+    // Resolve media URLs
+    let logoUrl = '';
+    let faviconUrl = '';
+    if (branding) {
+      if (branding.mid_logo_light) {
+        const logo = await this.prisma.media_gallery.findUnique({ where: { id: branding.mid_logo_light } });
+        logoUrl = logo?.file_url || '';
+      }
+      if (branding.favicon_media_id) {
+        const fav = await this.prisma.media_gallery.findUnique({ where: { id: branding.favicon_media_id } });
+        faviconUrl = fav?.file_url || '';
+      }
+    }
+
     return { 
       success: true, 
       agency: {
         ...this.serialize(agency),
-        branding: branding ? this.serialize(branding) : null,
+        branding: branding ? {
+          ...this.serialize(branding),
+          logo: logoUrl,
+          favicon: faviconUrl
+        } : null,
         address: address ? this.serialize(address) : null
       } 
     };
-
   }
 
 
@@ -143,13 +159,7 @@ export class AgencyService {
   }
 
   async updateBranding(agencyId: bigint, data: any) {
-    // 1. Enable/Disable branding on agency
-    await this.prisma.agencies.update({
-      where: { id: agencyId },
-      data: { branding_enabled: data.enabled ?? true },
-    });
-
-    // 2. Fetch or create branding record
+    // 1. Fetch or create branding record
     let branding = await this.prisma.brandings.findFirst({
       where: { brandable_id: agencyId, brandable_type: 'App\\Models\\Agency' }
     });
@@ -159,31 +169,63 @@ export class AgencyService {
         data: {
           brandable_id: agencyId,
           brandable_type: 'App\\Models\\Agency',
-          color: '#0a7a22',
+          color: data.color || '#149f8f',
         }
       });
     }
 
-    // 3. Update branding details
     const updateData: any = {};
-    if (data.mainTheme !== undefined) updateData.color = data.mainTheme;
-    if (data.links !== undefined) updateData.link_color = data.links;
-    if (data.incomingBubble !== undefined) updateData.incoming_chat_color = data.incomingBubble;
-    if (data.incomingText !== undefined) updateData.incoming_chat_text_color = data.incomingText;
-    if (data.outgoingBubble !== undefined) updateData.outgoing_chat_color = data.outgoingBubble;
-    if (data.outgoingText !== undefined) updateData.outgoing_chat_text_color = data.outgoingText;
-    
-    // Logo and Favicon IDs
-    if (data.logoLightId !== undefined) updateData.mid_logo_light = BigInt(data.logoLightId);
-    if (data.logoLightSmallId !== undefined) updateData.mid_logo_light_small = BigInt(data.logoLightSmallId);
-    if (data.logoDarkId !== undefined) updateData.mid_logo_dark = BigInt(data.logoDarkId);
-    if (data.logoDarkSmallId !== undefined) updateData.mid_logo_dark_small = BigInt(data.logoDarkSmallId);
-    if (data.faviconId !== undefined) updateData.favicon_media_id = BigInt(data.faviconId);
+    if (data.color !== undefined) updateData.color = data.color;
 
-    return this.prisma.brandings.update({
+    // Helper to handle media URLs
+    const getMediaId = async (url: string, objectName: string) => {
+      if (!url) return null;
+      // Check if media already exists for this agency and url
+      let media = await this.prisma.media_gallery.findFirst({
+        where: { modelable_id: agencyId, modelable_type: 'App\\Models\\Agency', file_url: url }
+      });
+
+      if (!media) {
+        media = await this.prisma.media_gallery.create({
+          data: {
+            modelable_id: agencyId,
+            modelable_type: 'App\\Models\\Agency',
+            file_url: url,
+            object_name: objectName,
+            media_type: 'IMAGE',
+            object_status: 'AVAILABLE'
+          }
+        });
+      }
+      return media.id;
+    };
+
+    if (data.logo !== undefined) {
+      const mediaId = await getMediaId(data.logo, 'Agency Logo');
+      updateData.mid_logo_light = mediaId;
+    }
+
+    if (data.favicon !== undefined) {
+      const mediaId = await getMediaId(data.favicon, 'Agency Favicon');
+      updateData.favicon_media_id = mediaId;
+    }
+
+    const updatedBranding = await this.prisma.brandings.update({
       where: { id: branding.id },
       data: updateData,
     });
+
+    // 3. Update Agency slug/domain if provided
+    if (data.slug !== undefined) {
+      await this.prisma.agencies.update({
+        where: { id: agencyId },
+        data: {
+          slug: data.slug,
+        }
+      });
+    }
+
+    return { success: true, branding: this.serialize(updatedBranding) };
   }
 
   // ─── Workspace Management ───────────────────────────────────────────
@@ -340,19 +382,45 @@ export class AgencyService {
   }
 
   async suspendWorkspace(workspaceId: bigint, agencyId: bigint) {
-    return { success: true };
+    const updated = await this.prisma.workspaces.updateMany({
+      where: { id: workspaceId, agency_id: agencyId },
+      data: { status: 'SUSPENDED' },
+    });
+    return { success: updated.count > 0 };
   }
 
   async activateWorkspace(workspaceId: bigint, agencyId: bigint) {
-    return { success: true };
+    const updated = await this.prisma.workspaces.updateMany({
+      where: { id: workspaceId, agency_id: agencyId },
+      data: { status: 'ACTIVE' },
+    });
+    return { success: updated.count > 0 };
   }
 
   async deleteWorkspace(workspaceId: bigint, agencyId: bigint) {
-    return { success: true };
+    const updated = await this.prisma.workspaces.updateMany({
+      where: { id: workspaceId, agency_id: agencyId },
+      data: { deleted_at: new Date() },
+    });
+    return { success: updated.count > 0 };
   }
 
   async getWorkspaceUsage(workspaceId: bigint, agencyId: bigint) {
-    return { success: true };
+    const workspace = await this.prisma.workspaces.findFirst({
+      where: { id: workspaceId, agency_id: agencyId },
+    });
+    if (!workspace) throw new NotFoundException('Workspace not found');
+
+    // This is a placeholder for actual usage calculation logic
+    // In a real scenario, you'd aggregate data from various tables (messages, agents, etc.)
+    return { 
+      success: true, 
+      usage: {
+        contacts: workspace.contacts_counter || 0,
+        agents: 0, // Placeholder
+        messages: 0, // Placeholder
+      } 
+    };
   }
 
   // ─── Member Management ──────────────────────────────────────────────
@@ -366,41 +434,134 @@ export class AgencyService {
 
 
   async getMember(agencyId: bigint, memberId: bigint) {
-    return { success: true, member: null };
+    const user = await this.prisma.users.findFirst({
+      where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
+    });
+    if (!user) throw new NotFoundException('Member not found');
+
+    return { success: true, member: this.serialize(user) };
   }
 
   async updateMember(agencyId: bigint, memberId: bigint, data: any) {
-    return { success: true };
+    const user = await this.prisma.users.findFirst({
+      where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
+    });
+    if (!user) throw new NotFoundException('Member not found');
+
+    const updateData: any = {
+      first_name: data.first_name,
+      last_name: data.last_name,
+      email: data.email,
+      phone: data.phone,
+      whatsapp: data.whatsapp,
+      language: data.language,
+      status: data.status,
+    };
+
+    if (data.password) {
+      updateData.password = await bcrypt.hash(data.password, 10);
+    }
+
+    const updated = await this.prisma.users.update({
+      where: { id: memberId },
+      data: updateData,
+    });
+
+    return { success: true, member: this.serialize(updated) };
   }
 
   async removeMember(agencyId: bigint, memberId: bigint) {
-    return { success: true };
+    const deleted = await this.prisma.users.deleteMany({
+      where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
+    });
+    return { success: deleted.count > 0 };
   }
 
-  // ─── Logs ──────────────────────────────────────────────────────────
+  async getDashboardStats(agencyId: bigint) {
+    const [totalWorkspaces, totalAgents, recentLogs] = await Promise.all([
+      this.prisma.workspaces.count({ where: { agency_id: agencyId, deleted_at: null } }),
+      this.prisma.users.count({ where: { modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' } }),
+      this.prisma.agency_logs.findMany({
+        where: { agency_id: agencyId },
+        take: 5,
+        orderBy: { created_at: 'desc' },
+      })
+    ]);
+
+    return {
+      success: true,
+      stats: {
+        total_workspaces: totalWorkspaces,
+        total_agents: totalAgents,
+        premium_support_seats: "0 of 5", // Still hardcoded as per business logic usually
+      },
+      recent_activity: (recentLogs as any[]).map(log => ({
+        name: log.user ? `${log.user.first_name} ${log.user.last_name}` : 'System',
+        action: log.event.replace(/_/g, ' '),
+        target: log.modelable_type?.split('\\').pop() || 'System',
+        time: log.created_at,
+        initials: log.user ? `${log.user.first_name?.[0] || ''}${log.user.last_name?.[0] || ''}` : 'S'
+      }))
+    };
+  }
 
   async getAuditLogs(workspaceId: bigint) {
-    return { success: true, logs: [] };
+    const logs = await this.prisma.audit_logs.findMany({
+      where: { workspace_id: workspaceId },
+      take: 50,
+      orderBy: { created_at: 'desc' },
+    });
+    return { success: true, logs: this.serialize(logs) };
   }
 
   async getAgencyLogs(agencyId: bigint) {
-    return { success: true, logs: [] };
+    const logs = await this.prisma.agency_logs.findMany({
+      where: { agency_id: agencyId },
+      take: 50,
+      orderBy: { created_at: 'desc' },
+    });
+    return { success: true, logs: this.serialize(logs) };
   }
 
   async addMember(agencyId: bigint, data: any) {
     const hashedPassword = await bcrypt.hash(data.password, 10);
+    
     const user = await this.prisma.users.create({
       data: {
         first_name: data.first_name,
         last_name: data.last_name,
         email: data.email,
         password: hashedPassword,
+        locale: data.language || 'en',
         modelable_id: agencyId,
         modelable_type: 'App\\Models\\Agency',
         status: 'ACTIVE',
-        creator_id: 0n, // or actual creator ID if passed, but typically system/admin
+        creator_id: 0n,
+        tfa_required: !!data.tfa_required,
       },
     });
+
+    // Handle Role Assignment
+    if (data.role) {
+      const role = await this.prisma.acl_roles.findFirst({
+        where: { 
+          slug: data.role.toLowerCase().replace(/_/g, '-'),
+          ownerable_id: agencyId,
+          ownerable_type: 'App\\Models\\Agency'
+        }
+      });
+
+      if (role) {
+        await this.prisma.acl_roleables.create({
+          data: {
+            role_id: Number(role.id),
+            roleable_id: user.id,
+            roleable_type: 'App\\Models\\User'
+          }
+        });
+      }
+    }
+
     return { success: true, user: this.serialize(user) };
   }
 

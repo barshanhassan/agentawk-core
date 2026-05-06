@@ -11,12 +11,16 @@ import {
   Query,
 } from '@nestjs/common';
 import { AgencyService } from './agency.service';
+import { RolesService } from '../roles/roles.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
 
 @UseGuards(JwtAuthGuard)
 @Controller('agencies')
 export class AgencyController {
-  constructor(private readonly service: AgencyService) {}
+  constructor(
+    private readonly service: AgencyService,
+    private readonly rolesService: RolesService,
+  ) {}
 
   // ─── Agency Profile ────────────────────────────────────────────────
   
@@ -154,5 +158,32 @@ export class AgencyController {
   @Get(':id/agency-logs')
   async getAgencyLogs(@Param('id') id: string) {
     return this.service.getAgencyLogs(BigInt(id));
+  }
+
+  @Get(':id/dashboard-stats')
+  async getDashboardStats(@Param('id') id: string) {
+    return this.service.getDashboardStats(BigInt(id));
+  }
+
+  // ─── Agency Roles ──────────────────────────────────────────────────
+  @Get(':id/roles')
+  async getRoles(@Param('id') id: string) {
+    return this.rolesService.getRoles(BigInt(id), 'App\\Models\\Agency');
+  }
+
+  @Post(':id/roles')
+  async createRole(@Param('id') id: string, @Body() data: any) {
+    console.log(`[DEBUG] Creating role for agency ${id}:`, data);
+    return this.rolesService.createRole(BigInt(id), 'App\\Models\\Agency', data);
+  }
+
+  @Patch(':id/roles/:roleId')
+  async updateRole(@Param('id') id: string, @Param('roleId') roleId: string, @Body() data: any) {
+    return this.rolesService.updateRole(BigInt(id), 'App\\Models\\Agency', BigInt(roleId), data);
+  }
+
+  @Delete(':id/roles/:roleId')
+  async deleteRole(@Param('id') id: string, @Param('roleId') roleId: string) {
+    return this.rolesService.deleteRole(BigInt(id), 'App\\Models\\Agency', BigInt(roleId));
   }
 }
