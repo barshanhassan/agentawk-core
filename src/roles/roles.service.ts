@@ -13,11 +13,13 @@ export class RolesService {
       }
     });
 
-    return roles.map(r => ({
-      ...this.serialize(r),
+    const results = roles.map(r => ({
+      ...r,
       isArchived: r.status === 'ARCHIVE',
       permissions: {}, 
     }));
+
+    return this.serialize(results);
   }
 
   async createRole(ownerId: bigint, ownerType: string, data: any) {
