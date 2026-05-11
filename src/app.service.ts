@@ -23,14 +23,24 @@ export class AppService {
       .split('/')[0]
       .split(':')[0];
 
-    // Find the domain in the database
+    // Dev shortcut: agency.localhost → treat as AGENCY context
+    if (domainName.startsWith('agency.localhost')) {
+      return { app: { name: 'Ezconn Agency', site_type: 'AGENCY', hostname } };
+    }
+
+    // Extract subdomain part: 'app1' from 'app1.laglobal.local'
+    const subDomain = domainName.split('.')[0];
+
+    // Find the domain in the database — match by full domain OR sub_domain
+    // sub_domain match handles port mismatches (DB has :3000, request has :5173)
     const domainRecord = await this.prisma.domains.findFirst({
       where: {
         OR: [
           { domain: hostname },
           { domain: `http://${hostname}` },
           { domain: `https://${hostname}` },
-          { domain: domainName }
+          { domain: domainName },
+          { sub_domain: subDomain },
         ]
       }
     });

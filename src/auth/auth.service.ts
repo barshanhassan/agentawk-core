@@ -41,7 +41,9 @@ export class AuthService {
     const userRole = isAgency ? 'AGENCY' : 'WORKSPACE';
     
     // Determine the context
-    const isCentral = hostname.includes('web.app') || hostname.includes('localhost') || hostname.includes('run.app');
+    // agency.localhost is a tenant subdomain in dev — NOT central
+    const isCentral = !hostname.includes('agency.localhost') &&
+      (hostname.includes('web.app') || hostname.includes('localhost') || hostname.includes('run.app'));
     const contextType = (domainInfo?.modelable_type && !isCentral) ? domainInfo.modelable_type : user.modelable_type;
     const contextId = (domainInfo?.modelable_id && !isCentral) ? domainInfo.modelable_id : user.modelable_id;
 
@@ -62,6 +64,9 @@ export class AuthService {
 
     const redirectTo = isAgency ? '/agency' : '/workspace';
 
+    // Load user's permissions from their assigned role
+    const permissions = await this.loadUserPermissions(user.id);
+
     // JWT token generation
     const payload = {
       email: user.email,
@@ -71,6 +76,7 @@ export class AuthService {
       role: userRole,
       tfa_enabled: user.tfa_enabled,
       workspace_id: contextType.toLowerCase().includes('workspace') ? contextId.toString() : null,
+      permissions,
     };
 
     const expiresIn = userDto.remember ? '30d' : '12h';
@@ -83,6 +89,8 @@ export class AuthService {
         last_name: user.last_name,
         tfa_enabled: user.tfa_enabled,
         role: userRole,
+        modelable_id: contextId.toString(),
+        modelable_type: contextType,
       },
       token: this.jwtService.sign(payload, { expiresIn }),
       redirect_to: redirectTo,
@@ -589,6 +597,48 @@ export class AuthService {
     });
 
     return { message: 'Password updated successfully' };
+  }
+
+  async loadUserPermissions(userId: bigint): Promise<string[]> {
+    // Owner gets wildcard — all permissions granted
+    const user = await this.prisma.users.findUnique({
+      where: { id: userId },
+      select: { is_owner: true },
+    });
+    if (user?.is_owner) return ['agency.*', 'workspace.*'];
+
+    const roleable = await this.prisma.acl_roleables.findFirst({
+      where: { roleable_id: userId, roleable_type: 'App\\Models\\User' },
+    });
+
+    const slugs: string[] = [];
+
+    if (roleable) {
+      const rolePerms = await this.prisma.acl_role_permissions.findMany({
+        where: { role_id: roleable.role_id },
+      });
+      if (rolePerms.length > 0) {
+        const perms = await this.prisma.acl_permissions.findMany({
+          where: { id: { in: rolePerms.map(rp => rp.permission_id) } },
+          select: { slug: true },
+        });
+        slugs.push(...perms.map(p => p.slug));
+      }
+    }
+
+    // Direct entity permissions (without role)
+    const entityPerms = await this.prisma.acl_entity_permissions.findMany({
+      where: { entity_id: userId, entity_type: 'App\\Models\\User' },
+    });
+    if (entityPerms.length > 0) {
+      const perms = await this.prisma.acl_permissions.findMany({
+        where: { id: { in: entityPerms.map(ep => ep.permission_id) } },
+        select: { slug: true },
+      });
+      slugs.push(...perms.map(p => p.slug));
+    }
+
+    return [...new Set(slugs)];
   }
 
   private slugify(text: string): string {

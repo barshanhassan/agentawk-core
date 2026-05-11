@@ -73,13 +73,6 @@ export class AgencyService {
     });
     if (!agency) throw new NotFoundException('Agency not found');
 
-    const address = await this.prisma.addresses.findFirst({
-      where: {
-        addressable_id: agencyId,
-        addressable_type: 'App\\Models\\Agency',
-      },
-    });
-
     const updated = await this.prisma.agencies.update({
       where: { id: agencyId },
       data: {
@@ -429,7 +422,21 @@ export class AgencyService {
     const users = await this.prisma.users.findMany({
       where: { modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
     });
-    return { success: true, members: this.serialize(users) };
+
+    // Attach actual role name from acl_roleables → acl_roles
+    const enriched = await Promise.all(users.map(async (u) => {
+      const roleable = await this.prisma.acl_roleables.findFirst({
+        where: { roleable_id: u.id, roleable_type: 'App\\Models\\User' },
+      });
+      let roleName = 'Agent';
+      if (roleable) {
+        const role = await this.prisma.acl_roles.findUnique({ where: { id: BigInt(roleable.role_id) } });
+        if (role) roleName = role.name;
+      }
+      return { ...u, role: roleName };
+    }));
+
+    return { success: true, members: this.serialize(enriched) };
   }
 
 
@@ -589,7 +596,7 @@ export class AgencyService {
 
   private serialize(obj: any) {
     return JSON.parse(
-      JSON.stringify(obj, (key, value) =>
+      JSON.stringify(obj, (_key, value) =>
         typeof value === 'bigint' ? value.toString() : value,
       ),
     );

@@ -7,9 +7,15 @@ import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
-  // Removed global prefix to match original production setup
   app.enableCors({
-    origin: ['http://localhost:5173', 'https://ezconn-fe.web.app'],
+    origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+      // Allow requests with no origin (curl, Postman, mobile)
+      if (!origin) return callback(null, true);
+      const allowed =
+        origin === 'https://ezconn-fe.web.app' ||
+        /^https?:\/\/([\w-]+\.)?(localhost|laglobal\.local)(:\d+)?$/.test(origin);
+      callback(allowed ? null : new Error('CORS blocked'), allowed);
+    },
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
     credentials: true,
   });

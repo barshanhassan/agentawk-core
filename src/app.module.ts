@@ -60,6 +60,8 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ScheduleModule } from '@nestjs/schedule';
 import { join } from 'path';
 import { ConfigModule } from '@nestjs/config';
+import { APP_GUARD } from '@nestjs/core';
+import { PermissionsGuard } from './auth/permissions.guard';
 
 @Module({
   imports: [
@@ -129,6 +131,9 @@ import { ConfigModule } from '@nestjs/config';
     UserStatesModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    { provide: APP_GUARD, useClass: PermissionsGuard },
+  ],
 })
 export class AppModule {}

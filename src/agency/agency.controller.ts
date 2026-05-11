@@ -165,6 +165,12 @@ export class AgencyController {
     return this.service.getDashboardStats(BigInt(id));
   }
 
+  // ─── Agency Permissions Tree ───────────────────────────────────────
+  @Get(':id/permissions')
+  async getPermissions(@Param('id') id: string) {
+    return this.rolesService.getPermissionsTree('agency.*');
+  }
+
   // ─── Agency Roles ──────────────────────────────────────────────────
   @Get(':id/roles')
   async getRoles(@Param('id') id: string) {
