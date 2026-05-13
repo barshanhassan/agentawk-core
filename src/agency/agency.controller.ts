@@ -64,7 +64,8 @@ export class AgencyController {
     @Body() body: any,
     @Request() req: any,
   ) {
-    return this.service.createWorkspace(BigInt(id), body, BigInt(req.user.sub));
+    const creatorId = req.user.sub || req.user.id || 0;
+    return this.service.createWorkspace(BigInt(id), body, BigInt(creatorId));
   }
 
   @Patch(':id/workspaces/:workspace_id')

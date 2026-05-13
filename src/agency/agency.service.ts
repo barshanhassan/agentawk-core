@@ -17,10 +17,10 @@ export class AgencyService {
     private readonly prisma: PrismaService,
     private readonly chargebee: ChargebeeService,
     private readonly domainsService: DomainsService,
-  ) {}
+  ) { }
 
   // ─── Agency Profile & Branding ──────────────────────────────────────
-  
+
   async getAgency(agencyId: bigint) {
     const agency = await this.prisma.agencies.findUnique({
       where: { id: agencyId },
@@ -52,8 +52,8 @@ export class AgencyService {
       }
     }
 
-    return { 
-      success: true, 
+    return {
+      success: true,
       agency: {
         ...this.serialize(agency),
         branding: branding ? {
@@ -62,7 +62,7 @@ export class AgencyService {
           favicon: faviconUrl
         } : null,
         address: address ? this.serialize(address) : null
-      } 
+      }
     };
   }
 
@@ -295,8 +295,8 @@ export class AgencyService {
 
     const plan = subscription && subscription.billing_plan_id
       ? await this.prisma.billing_plans.findUnique({
-          where: { id: subscription.billing_plan_id },
-        })
+        where: { id: subscription.billing_plan_id },
+      })
       : null;
 
     const workspace = await this.prisma.$transaction(async (tx) => {
@@ -307,9 +307,24 @@ export class AgencyService {
           slug: data.slug,
           agency_id: agencyId,
           creator_id: creatorId,
+          agency_agent_id: data.agent_id ? BigInt(data.agent_id) : null,
           timezone: data.timezone || 'UTC',
           status: 'ACTIVE',
           contacts_counter: 0,
+          allow_branding: data.allow_branding ?? false,
+          allow_support: data.allow_support ?? false,
+          allow_agents: data.allow_agents ?? true,
+          agents_limit: data.agents_limit ?? 4,
+          limited_contacts: data.limited_contacts ?? false,
+          maximum_contacts: data.maximum_contacts ?? 0,
+          chatgpt_assistant_limit: data.chatgpt_assistant_limit ?? 10,
+          whatsapp_channels_limit: data.whatsapp_channels_limit ?? 1,
+          instagram_channels_limit: data.instagram_channels_limit ?? 1,
+          facebook_channels_limit: data.facebook_channels_limit ?? 1,
+          telegram_channels_limit: data.telegram_channels_limit ?? 1,
+          twilio_channels_limit: data.twilio_channels_limit ?? 1,
+          zapi_channels_limit: data.zapi_channels_limit ?? 0,
+          webchat_channels_limit: data.webchat_channels_limit ?? 0,
         },
       });
 
@@ -406,13 +421,13 @@ export class AgencyService {
 
     // This is a placeholder for actual usage calculation logic
     // In a real scenario, you'd aggregate data from various tables (messages, agents, etc.)
-    return { 
-      success: true, 
+    return {
+      success: true,
       usage: {
         contacts: workspace.contacts_counter || 0,
         agents: 0, // Placeholder
         messages: 0, // Placeholder
-      } 
+      }
     };
   }
 
@@ -532,7 +547,7 @@ export class AgencyService {
 
   async addMember(agencyId: bigint, data: any) {
     const hashedPassword = await bcrypt.hash(data.password, 10);
-    
+
     const user = await this.prisma.users.create({
       data: {
         first_name: data.first_name,
@@ -551,7 +566,7 @@ export class AgencyService {
     // Handle Role Assignment
     if (data.role) {
       const role = await this.prisma.acl_roles.findFirst({
-        where: { 
+        where: {
           slug: data.role.toLowerCase().replace(/_/g, '-'),
           ownerable_id: agencyId,
           ownerable_type: 'App\\Models\\Agency'

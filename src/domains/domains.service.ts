@@ -70,11 +70,11 @@ export class DomainsService {
       await this.prisma.audit_logs.create({
         data: {
           workspace_id: workspaceId,
-          event_type: 'domain_added',
+          event: 'domain_added',
           user_id: userId,
-          auditable_id: domain.id,
-          auditable_type: 'App\\Models\\Domain',
-          metadata: JSON.stringify({ domain: domain.domain }),
+          modelable_id: domain.id,
+          modelable_type: 'App\\Models\\Domain',
+          data: JSON.stringify({ domain: domain.domain }),
           created_at: new Date(),
           updated_at: new Date(),
         },
