@@ -28,9 +28,15 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 
     return {
       id: user.id.toString(),
+      sub: payload.sub,
       email: user.email,
       modelable_id: user.modelable_id?.toString(),
       modelable_type: user.modelable_type,
+      role: payload.role,
+      is_owner: user.is_owner,
+      // Surface permissions array from the JWT payload so PermissionsGuard can enforce
+      // @RequirePermission(...) on routes. Owners get wildcard slugs ('agency.*'/'workspace.*').
+      permissions: Array.isArray(payload.permissions) ? (payload.permissions as string[]) : [],
       workspace_id: (user.active_workspace_id || (user.modelable_type === 'App\\Models\\Workspace' ? user.modelable_id : null))?.toString(),
     };
   }

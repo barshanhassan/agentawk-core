@@ -2,9 +2,10 @@ import {
   Controller,
   Get,
   Post,
-  Put,
   Delete,
   Param,
+  Query,
+  Body,
   UseGuards,
   Request,
 } from '@nestjs/common';
@@ -14,30 +15,50 @@ import { JwtAuthGuard } from '../auth/auth.guard';
 @UseGuards(JwtAuthGuard)
 @Controller('notifications')
 export class NotificationsController {
-  constructor(private readonly notificationsService: NotificationsService) {}
+  constructor(private readonly notifications: NotificationsService) {}
 
   @Get()
-  getAll(@Request() req: any) {
-    return { message: 'All Notifications', user: req.user };
+  list(@Request() req: any, @Query() q: any) {
+    const notifiableType = 'App\\Models\\User';
+    const notifiableId = BigInt(req.user.sub || req.user.id || 0);
+    return this.notifications.list(notifiableType, notifiableId, {
+      limit: q.limit ? parseInt(q.limit, 10) : undefined,
+      offset: q.offset ? parseInt(q.offset, 10) : undefined,
+    });
   }
 
-  @Get(':id')
-  getOne(@Param('id') id: string, @Request() req: any) {
-    return { message: `Notification ${id}`, user: req.user };
+  @Post(':id/read')
+  markRead(@Param('id') id: string, @Request() req: any) {
+    const userId = BigInt(req.user.sub || req.user.id || 0);
+    return this.notifications.markRead(id, 'App\\Models\\User', userId);
   }
 
-  @Post()
-  create(@Request() req: any) {
-    return { message: 'Notification created', user: req.user };
-  }
-
-  @Put(':id')
-  update(@Param('id') id: string, @Request() req: any) {
-    return { message: `Notification ${id} updated`, user: req.user };
+  @Post('read-all')
+  markAllRead(@Request() req: any) {
+    const userId = BigInt(req.user.sub || req.user.id || 0);
+    return this.notifications.markAllRead('App\\Models\\User', userId);
   }
 
   @Delete(':id')
-  delete(@Param('id') id: string, @Request() req: any) {
-    return { message: `Notification ${id} deleted`, user: req.user };
+  remove(@Param('id') id: string, @Request() req: any) {
+    const userId = BigInt(req.user.sub || req.user.id || 0);
+    return this.notifications.deleteOne(id, 'App\\Models\\User', userId);
+  }
+
+  /**
+   * Admin/internal use — directly create a notification. Useful for system
+   * events generated outside the EventEmitter pipeline.
+   */
+  @Post()
+  create(@Request() req: any, @Body() body: any) {
+    return this.notifications.create({
+      slug: body.slug,
+      type: body.type,
+      notifiableType: body.notifiable_type ?? 'App\\Models\\User',
+      notifiableId: BigInt(body.notifiable_id ?? req.user.sub ?? req.user.id ?? 0),
+      data: body.data ?? {},
+      triggerableType: body.triggerable_type,
+      triggerableId: body.triggerable_id ? BigInt(body.triggerable_id) : undefined,
+    });
   }
 }

@@ -19,19 +19,37 @@ export class AuthService {
   async login(userDto: any, domainInfo: any, hostname: string = '') {
     console.log(`Login attempt for email: "${userDto.email}"`);
 
-    const user = await this.prisma.users.findFirst({
-      where: {
-        email: userDto.email,
-        status: 'ACTIVE',
-      },
-    });
-    console.log(`User found? ${!!user}`);
+    // Tenant-scoped lookup: if the request arrived on a registered tenant subdomain
+    // (domainInfo carries modelable_*), require the user to belong to that exact
+    // workspace/agency. This mirrors the PHP gateway's Auth::attempt + modelable filter,
+    // and prevents an agency-only user from logging into a workspace subdomain (or vice
+    // versa). On the "central" dev hosts (web.app/run.app/localhost without a tenant
+    // subdomain), fall back to email-only so the original behaviour is preserved.
+    const isCentral =
+      !hostname.includes('agency.localhost') &&
+      (hostname.includes('web.app') ||
+        hostname.includes('localhost') ||
+        hostname.includes('run.app'));
+    const useTenantScope =
+      !isCentral && !!domainInfo?.modelable_id && !!domainInfo?.modelable_type;
+
+    const baseWhere: any = { email: userDto.email, status: 'ACTIVE' };
+    if (useTenantScope) {
+      baseWhere.modelable_id = domainInfo.modelable_id;
+      baseWhere.modelable_type = domainInfo.modelable_type;
+    }
+
+    const user = await this.prisma.users.findFirst({ where: baseWhere });
+    console.log(`User found? ${!!user} (tenantScope=${useTenantScope})`);
 
     if (!user) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    const isMatched = await bcrypt.compare(userDto.password, user.password || '');
+    const isMatched = await bcrypt.compare(
+      userDto.password,
+      user.password || '',
+    );
     if (!isMatched) {
       throw new UnauthorizedException('Invalid credentials');
     }
@@ -39,28 +57,51 @@ export class AuthService {
     // Smart Role detection based on database (Case-insensitive check)
     const isAgency = user.modelable_type.toLowerCase().includes('agency');
     const userRole = isAgency ? 'AGENCY' : 'WORKSPACE';
-    
-    // Determine the context
-    // agency.localhost is a tenant subdomain in dev — NOT central
-    const isCentral = !hostname.includes('agency.localhost') &&
-      (hostname.includes('web.app') || hostname.includes('localhost') || hostname.includes('run.app'));
-    const contextType = (domainInfo?.modelable_type && !isCentral) ? domainInfo.modelable_type : user.modelable_type;
-    const contextId = (domainInfo?.modelable_id && !isCentral) ? domainInfo.modelable_id : user.modelable_id;
 
-    // Capture the login event
-    await this.prisma.audit_logs.create({
-      data: {
-        workspace_id: contextType.toLowerCase().includes('workspace') ? contextId : BigInt(0),
-        user_id: user.id,
-        modelable_type: contextType,
-        modelable_id: contextId,
-        event: 'user_logged_in',
-        data: JSON.stringify({ 
-          ip: 'mock-ip',
-          via_central: isCentral 
-        }),
-      },
-    });
+    // Context derives from the tenant subdomain when available; otherwise from the
+    // user's own modelable. isCentral / useTenantScope are computed above for the
+    // user-lookup filter.
+    const contextType =
+      domainInfo?.modelable_type && !isCentral
+        ? domainInfo.modelable_type
+        : user.modelable_type;
+    const contextId =
+      domainInfo?.modelable_id && !isCentral
+        ? domainInfo.modelable_id
+        : user.modelable_id;
+
+    // Capture the login event. Workspace-context logins go into audit_logs
+    // (workspace-scoped); agency-context logins go into agency_logs so the
+    // Agency Logs UI shows them under the agent filter.
+    const isWorkspaceContext = contextType.toLowerCase().includes('workspace');
+    if (isWorkspaceContext) {
+      await this.prisma.audit_logs.create({
+        data: {
+          workspace_id: contextId,
+          user_id: user.id,
+          modelable_type: contextType,
+          modelable_id: contextId,
+          event: 'user_logged_in',
+          data: JSON.stringify({ ip: 'mock-ip', via_central: isCentral }),
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      });
+    } else {
+      // Agency-context login → agency_logs. Use the agency id (= contextId).
+      await this.prisma.agency_logs.create({
+        data: {
+          agency_id: contextId,
+          user_id: user.id,
+          modelable_type: contextType,
+          modelable_id: contextId,
+          event: 'user_logged_in',
+          data: JSON.stringify({ ip: 'mock-ip', via_central: isCentral }),
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      });
+    }
 
     const redirectTo = isAgency ? '/agency' : '/workspace';
 
@@ -75,7 +116,9 @@ export class AuthService {
       modelable_type: contextType,
       role: userRole,
       tfa_enabled: user.tfa_enabled,
-      workspace_id: contextType.toLowerCase().includes('workspace') ? contextId.toString() : null,
+      workspace_id: contextType.toLowerCase().includes('workspace')
+        ? contextId.toString()
+        : null,
       permissions,
     };
 
@@ -196,7 +239,6 @@ export class AuthService {
             status: 'ACTIVE',
             creator_id: BigInt(0),
             locale: userDto.locale || 'en-US',
-
           },
         });
 
@@ -619,10 +661,10 @@ export class AuthService {
       });
       if (rolePerms.length > 0) {
         const perms = await this.prisma.acl_permissions.findMany({
-          where: { id: { in: rolePerms.map(rp => rp.permission_id) } },
+          where: { id: { in: rolePerms.map((rp) => rp.permission_id) } },
           select: { slug: true },
         });
-        slugs.push(...perms.map(p => p.slug));
+        slugs.push(...perms.map((p) => p.slug));
       }
     }
 
@@ -632,10 +674,10 @@ export class AuthService {
     });
     if (entityPerms.length > 0) {
       const perms = await this.prisma.acl_permissions.findMany({
-        where: { id: { in: entityPerms.map(ep => ep.permission_id) } },
+        where: { id: { in: entityPerms.map((ep) => ep.permission_id) } },
         select: { slug: true },
       });
-      slugs.push(...perms.map(p => p.slug));
+      slugs.push(...perms.map((p) => p.slug));
     }
 
     return [...new Set(slugs)];

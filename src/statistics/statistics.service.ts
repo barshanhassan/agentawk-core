@@ -409,4 +409,75 @@ export class StatisticsService {
       orderBy: { updated_at: 'asc' },
     });
   }
+
+  /**
+   * Workspace-scoped time-series for the Insights Overview tab. Returns four
+   * arrays the frontend chart components expect (Daily Active Users, Monthly
+   * Active Users, Weekly Growth, Stickiness Ratio). Each series is built from
+   * actual user records filtered by `workspace_id` — a fresh workspace simply
+   * gets zero-valued buckets, which is the correct empty state.
+   *
+   * Source columns:
+   *   - DAU/MAU "active" = users with `last_seen_at` falling in the bucket
+   *   - Weekly Growth   = users created (new sign-ups) in the bucket
+   *   - Stickiness      = DAU / MAU * 100 per day
+   */
+  async getDashboardCharts(workspaceId: bigint) {
+    const now = dayjs();
+    const wsScope = {
+      modelable_type: 'App\\Models\\Workspace',
+      modelable_id: workspaceId,
+    } as const;
+
+    // ─── Daily Active Users (last 7 days) ──────────────────────────────
+    const dauData: Array<{ day: string; users: number }> = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = now.subtract(i, 'day');
+      const start = d.startOf('day').toDate();
+      const end = d.endOf('day').toDate();
+      const count = await this.prisma.users.count({
+        where: { ...wsScope, last_seen_at: { gte: start, lte: end } },
+      });
+      dauData.push({ day: d.format('ddd'), users: count });
+    }
+
+    // ─── Monthly Active Users (last 6 months) ──────────────────────────
+    const mauData: Array<{ month: string; users: number }> = [];
+    for (let i = 5; i >= 0; i--) {
+      const m = now.subtract(i, 'month');
+      const start = m.startOf('month').toDate();
+      const end = m.endOf('month').toDate();
+      const count = await this.prisma.users.count({
+        where: { ...wsScope, last_seen_at: { gte: start, lte: end } },
+      });
+      mauData.push({ month: m.format('MMM'), users: count });
+    }
+
+    // ─── Weekly Growth (new sign-ups, last 5 weeks) ────────────────────
+    const wauData: Array<{ week: string; users: number }> = [];
+    for (let i = 4; i >= 0; i--) {
+      const w = now.subtract(i, 'week');
+      const start = w.startOf('week').toDate();
+      const end = w.endOf('week').toDate();
+      const count = await this.prisma.users.count({
+        where: { ...wsScope, created_at: { gte: start, lte: end } },
+      });
+      wauData.push({ week: `Week ${5 - i}`, users: count });
+    }
+
+    // ─── Stickiness Ratio (DAU/MAU × 100, last 7 days) ────────────────
+    const stickinessData: Array<{ day: string; ratio: number }> = [];
+    const mauWindowStart = now.subtract(30, 'day').toDate();
+    const mauTotal = await this.prisma.users.count({
+      where: { ...wsScope, last_seen_at: { gte: mauWindowStart } },
+    });
+    for (let i = 6; i >= 0; i--) {
+      const d = now.subtract(i, 'day');
+      const dau = dauData[6 - i]?.users ?? 0;
+      const ratio = mauTotal > 0 ? Math.round((dau / mauTotal) * 100) : 0;
+      stickinessData.push({ day: `Day ${7 - i}`, ratio });
+    }
+
+    return { dauData, mauData, wauData, stickinessData };
+  }
 }

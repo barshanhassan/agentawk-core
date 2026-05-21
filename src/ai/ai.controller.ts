@@ -11,12 +11,30 @@ import {
   Request,
 } from '@nestjs/common';
 import { AiService } from './ai.service';
+import { RagService } from './rag.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
 
 @UseGuards(JwtAuthGuard)
 @Controller('ai')
 export class AiController {
-  constructor(private readonly aiService: AiService) {}
+  constructor(
+    private readonly aiService: AiService,
+    private readonly rag: RagService,
+  ) {}
+
+  // ─── RAG (knowledge-base retrieval) ─────────────────────────────────
+
+  /** Re-ingest all KB files for an agent (chunk + embed). Call after upload. */
+  @Post('agents/:id/kb/ingest')
+  async kbIngest(@Param('id') id: string) {
+    return this.rag.ingestAgentFiles(BigInt(id));
+  }
+
+  /** Semantic search across the agent's KB. Body: { query, top_k? } */
+  @Post('agents/:id/kb/search')
+  async kbSearch(@Param('id') id: string, @Body() body: any) {
+    return this.rag.searchSimilar(BigInt(id), body.query ?? '', body.top_k ?? 5);
+  }
 
   // ─── Agents CRUD ────────────────────────────────────────────────────
 

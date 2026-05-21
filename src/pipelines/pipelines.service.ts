@@ -291,4 +291,38 @@ export class PipelinesService {
 
     return { success: true };
   }
+
+  /**
+   * Update generic opportunity fields (name, amount, expected_close_date,
+   * contact_id, etc.). Status + step moves have their own dedicated methods so
+   * automation events fire correctly — keep this method for non-state changes.
+   */
+  async updateOpportunity(workspaceId: bigint, opportunityId: bigint, data: any) {
+    const opp = await this.prisma.pipeline_opportunities.findFirst({
+      where: { id: opportunityId, workspace_id: workspaceId },
+    });
+    if (!opp) throw new NotFoundException('Opportunity not found');
+
+    const update: any = { updated_at: new Date() };
+    if (data.name !== undefined) update.name = data.name;
+    if (data.amount !== undefined) update.amount = data.amount;
+    if (data.expected_close_date !== undefined) update.expected_close_date = data.expected_close_date ? new Date(data.expected_close_date) : null;
+    if (data.contact_id !== undefined) update.contact_id = data.contact_id ? BigInt(data.contact_id) : null;
+    if (data.lost_reason_id !== undefined) update.pl_lost_reason_id = data.lost_reason_id ? BigInt(data.lost_reason_id) : null;
+    if (data.notes !== undefined) update.notes = data.notes;
+
+    const updated = await this.prisma.pipeline_opportunities.update({
+      where: { id: opportunityId },
+      data: update,
+    });
+    return { success: true, opportunity: this.serialize(updated) };
+  }
+
+  async deleteOpportunity(workspaceId: bigint, opportunityId: bigint) {
+    const result = await this.prisma.pipeline_opportunities.deleteMany({
+      where: { id: opportunityId, workspace_id: workspaceId },
+    });
+    if (result.count === 0) throw new NotFoundException('Opportunity not found');
+    return { success: true };
+  }
 }

@@ -106,4 +106,14 @@ export class ZapiController {
       BigInt(id),
     );
   }
+
+  @Post('instances/:id/send')
+  async send(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    return this.service.sendMessage(
+      BigInt(req.user.workspace_id || 1),
+      BigInt(req.user.sub || req.user.id || 0),
+      BigInt(id),
+      body,
+    );
+  }
 }

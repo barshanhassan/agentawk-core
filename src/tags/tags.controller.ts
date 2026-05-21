@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Patch,
   Delete,
   Body,
   Query,
@@ -50,6 +51,16 @@ export class TagsController {
   @Delete('unlink/:linkId')
   async unlinkTag(@Param('linkId') linkId: string) {
     return this.service.unlinkTag(BigInt(linkId));
+  }
+
+  @Patch(':id')
+  async updateTag(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.updateTag(workspaceId, BigInt(id), body);
   }
 
   @Delete(':id')

@@ -9,6 +9,19 @@ import { ChargebeeService } from '../billing/chargebee.service';
 import { DomainsService } from '../domains/domains.service';
 import * as bcrypt from 'bcrypt';
 
+// Date-only strings (YYYY-MM-DD) need explicit start/end-of-day so a request
+// like ?from=2026-05-21&to=2026-05-21 covers the full day, not just midnight.
+function parseRangeStart(v: string): Date {
+  const d = new Date(v);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) d.setHours(0, 0, 0, 0);
+  return d;
+}
+function parseRangeEnd(v: string): Date {
+  const d = new Date(v);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) d.setHours(23, 59, 59, 999);
+  return d;
+}
+
 @Injectable()
 export class AgencyService {
   private readonly logger = new Logger(AgencyService.name);
@@ -310,6 +323,8 @@ export class AgencyService {
           agency_agent_id: data.agent_id ? BigInt(data.agent_id) : null,
           timezone: data.timezone || 'UTC',
           status: 'ACTIVE',
+          created_at: new Date(),
+          updated_at: new Date(),
           contacts_counter: 0,
           allow_branding: data.allow_branding ?? false,
           allow_support: data.allow_support ?? false,
@@ -328,7 +343,53 @@ export class AgencyService {
         },
       });
 
-      // 2. Chargebee Sync (if needed)
+      // 2. If an agency agent is assigned, mirror them as a workspace user row so they
+      //    can later log in at the workspace's subdomain (login flow filters by
+      //    modelable_id + modelable_type matching the host's site_domain).
+      //    Pattern mirrors gateway: separate user row, agency_user_id cross-links back.
+      if (data.agent_id) {
+        const agentId = BigInt(data.agent_id);
+        const agencyUser = await tx.users.findFirst({
+          where: {
+            id: agentId,
+            modelable_type: 'App\\Models\\Agency',
+            modelable_id: agencyId,
+            status: 'ACTIVE',
+          },
+        });
+        if (agencyUser) {
+          const existing = await tx.users.findFirst({
+            where: {
+              modelable_type: 'App\\Models\\Workspace',
+              modelable_id: ws.id,
+              agency_user_id: agencyUser.id,
+            },
+          });
+          if (!existing) {
+            await tx.users.create({
+              data: {
+                first_name: agencyUser.first_name,
+                last_name: agencyUser.last_name,
+                full_name: agencyUser.full_name,
+                email: agencyUser.email,
+                password: agencyUser.password,
+                modelable_type: 'App\\Models\\Workspace',
+                modelable_id: ws.id,
+                agency_user_id: agencyUser.id,
+                is_owner: true,
+                locale: agencyUser.locale,
+                timezone: agencyUser.timezone,
+                status: 'ACTIVE',
+                creator_id: creatorId,
+                created_at: new Date(),
+                updated_at: new Date(),
+              },
+            });
+          }
+        }
+      }
+
+      // 3. Chargebee Sync (if needed)
       if (subscription && plan) {
         const totalWs = await tx.workspaces.count({
           where: { agency_id: agencyId, deleted_at: null },
@@ -499,15 +560,65 @@ export class AgencyService {
     return { success: deleted.count > 0 };
   }
 
-  async getDashboardStats(agencyId: bigint) {
+  async suspendMember(agencyId: bigint, memberId: bigint) {
+    const updated = await this.prisma.users.updateMany({
+      where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
+      data: { status: 'SUSPENDED', updated_at: new Date() },
+    });
+    if (updated.count === 0) throw new NotFoundException('Member not found in this agency');
+    return { success: true };
+  }
+
+  async activateMember(agencyId: bigint, memberId: bigint) {
+    const updated = await this.prisma.users.updateMany({
+      where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
+      data: { status: 'ACTIVE', updated_at: new Date() },
+    });
+    if (updated.count === 0) throw new NotFoundException('Member not found in this agency');
+    return { success: true };
+  }
+
+  /**
+   * Dashboard stats — scoped per user.
+   *  - Agency owner (is_owner=true OR has agency.* wildcard) sees agency-wide totals.
+   *  - Role-limited agent sees ONLY what they personally created: workspaces
+   *    they're the creator/agency_agent of, and users they created. Each new
+   *    agent therefore lands on a "0 / 0" dashboard until they actually create
+   *    resources, matching the request that counts reflect the logged-in agent.
+   */
+  async getDashboardStats(agencyId: bigint, user?: any) {
+    const userId = BigInt(user?.sub ?? user?.id ?? 0);
+    const perms: string[] = Array.isArray(user?.permissions) ? user.permissions : [];
+    const isOwner = user?.is_owner === true || perms.includes('agency.*') || perms.includes('*');
+
+    const workspaceWhere: any = isOwner
+      ? { agency_id: agencyId, deleted_at: null }
+      : {
+          agency_id: agencyId,
+          deleted_at: null,
+          OR: [{ creator_id: userId }, { agency_agent_id: userId }],
+        };
+
+    const userWhere: any = isOwner
+      ? { modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' }
+      : {
+          modelable_id: agencyId,
+          modelable_type: 'App\\Models\\Agency',
+          creator_id: userId,
+        };
+
+    const recentLogsWhere: any = isOwner
+      ? { agency_id: agencyId }
+      : { agency_id: agencyId, user_id: userId };
+
     const [totalWorkspaces, totalAgents, recentLogs] = await Promise.all([
-      this.prisma.workspaces.count({ where: { agency_id: agencyId, deleted_at: null } }),
-      this.prisma.users.count({ where: { modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' } }),
+      this.prisma.workspaces.count({ where: workspaceWhere }),
+      this.prisma.users.count({ where: userWhere }),
       this.prisma.agency_logs.findMany({
-        where: { agency_id: agencyId },
+        where: recentLogsWhere,
         take: 5,
         orderBy: { created_at: 'desc' },
-      })
+      }),
     ]);
 
     return {
@@ -527,22 +638,138 @@ export class AgencyService {
     };
   }
 
-  async getAuditLogs(workspaceId: bigint) {
-    const logs = await this.prisma.audit_logs.findMany({
-      where: { workspace_id: workspaceId },
-      take: 50,
-      orderBy: { created_at: 'desc' },
-    });
-    return { success: true, logs: this.serialize(logs) };
+  /**
+   * Workspace-level audit logs (audit_logs table) with user hydration and
+   * pagination. Optional filters: workspace_id (specific WS), event (slug),
+   * date range, user_id, page/per_page.
+   */
+  async getAuditLogs(agencyId: bigint, q: any = {}) {
+    const where: any = {};
+    // Restrict to workspaces of this agency
+    const wsIds = (
+      await this.prisma.workspaces.findMany({
+        where: { agency_id: agencyId, deleted_at: null },
+        select: { id: true },
+      })
+    ).map((w) => w.id);
+
+    if (wsIds.length === 0) {
+      return { success: true, logs: [], total: 0, page: 1, per_page: 20 };
+    }
+
+    where.workspace_id = q.workspace_id ? BigInt(q.workspace_id) : { in: wsIds };
+    if (q.event) where.event = q.event;
+    if (q.user_id) where.user_id = BigInt(q.user_id);
+    if (q.from || q.to) {
+      where.created_at = {} as any;
+      if (q.from) (where.created_at as any).gte = parseRangeStart(q.from);
+      if (q.to) (where.created_at as any).lte = parseRangeEnd(q.to);
+    }
+
+    const perPage = Math.min(parseInt(q.per_page ?? '20', 10), 200);
+    const page = Math.max(parseInt(q.page ?? '1', 10), 1);
+
+    const [rows, total] = await Promise.all([
+      this.prisma.audit_logs.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        take: perPage,
+        skip: (page - 1) * perPage,
+      }),
+      this.prisma.audit_logs.count({ where }),
+    ]);
+
+    return { success: true, logs: await this.hydrateLogs(rows), total, page, per_page: perPage };
   }
 
-  async getAgencyLogs(agencyId: bigint) {
-    const logs = await this.prisma.agency_logs.findMany({
-      where: { agency_id: agencyId },
-      take: 50,
-      orderBy: { created_at: 'desc' },
+  /**
+   * Agency-level activity (agency_logs). Same shape as getAuditLogs but
+   * scoped to this agency only.
+   */
+  async getAgencyLogs(agencyId: bigint, q: any = {}) {
+    const where: any = { agency_id: agencyId };
+    if (q.event) where.event = q.event;
+    if (q.user_id) where.user_id = BigInt(q.user_id);
+    if (q.from || q.to) {
+      where.created_at = {} as any;
+      if (q.from) (where.created_at as any).gte = parseRangeStart(q.from);
+      if (q.to) (where.created_at as any).lte = parseRangeEnd(q.to);
+    }
+
+    const perPage = Math.min(parseInt(q.per_page ?? '20', 10), 200);
+    const page = Math.max(parseInt(q.page ?? '1', 10), 1);
+
+    const [rows, total] = await Promise.all([
+      this.prisma.agency_logs.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        take: perPage,
+        skip: (page - 1) * perPage,
+      }),
+      this.prisma.agency_logs.count({ where }),
+    ]);
+
+    return { success: true, logs: await this.hydrateLogs(rows), total, page, per_page: perPage };
+  }
+
+  /**
+   * Joins user details onto raw log rows (Prisma relations aren't defined for
+   * audit_logs/agency_logs in this schema, so we batch-fetch users by id).
+   * Returns serialized logs with `user`, `action`, `target` derived for UI.
+   */
+  private async hydrateLogs(rows: any[]) {
+    // Batch-fetch users + workspaces because the underlying tables don't have
+    // Prisma relations declared. One round-trip per entity type, then map back.
+    const userIds = Array.from(
+      new Set(rows.filter((r) => r.user_id != null).map((r) => r.user_id)),
+    ) as bigint[];
+    const wsIds = Array.from(
+      new Set(rows.filter((r) => r.workspace_id != null && r.workspace_id !== 0n).map((r) => r.workspace_id)),
+    ) as bigint[];
+
+    const [users, workspaces] = await Promise.all([
+      userIds.length
+        ? this.prisma.users.findMany({
+            where: { id: { in: userIds } },
+            select: { id: true, first_name: true, last_name: true, email: true },
+          })
+        : Promise.resolve([] as any[]),
+      wsIds.length
+        ? this.prisma.workspaces.findMany({
+            where: { id: { in: wsIds } },
+            select: { id: true, name: true, slug: true },
+          })
+        : Promise.resolve([] as any[]),
+    ]);
+
+    const userById = new Map(users.map((u: any) => [u.id.toString(), u]));
+    const wsById = new Map(workspaces.map((w: any) => [w.id.toString(), w]));
+
+    return rows.map((r) => {
+      const u = r.user_id ? userById.get(r.user_id.toString()) : null;
+      const w = r.workspace_id ? wsById.get(r.workspace_id.toString()) : null;
+      return {
+        id: r.id?.toString(),
+        agency_id: r.agency_id?.toString(),
+        workspace_id: r.workspace_id?.toString(),
+        workspace: w
+          ? { id: w.id.toString(), name: w.name, slug: w.slug }
+          : null,
+        event: r.event,
+        action: (r.event ?? '').replace(/_/g, ' '),
+        target: r.modelable_type?.split('\\').pop() ?? null,
+        modelable_id: r.modelable_id?.toString(),
+        data: r.data,
+        created_at: r.created_at,
+        user: u
+          ? {
+              id: u.id.toString(),
+              name: `${u.first_name ?? ''} ${u.last_name ?? ''}`.trim() || u.email,
+              email: u.email,
+            }
+          : null,
+      };
     });
-    return { success: true, logs: this.serialize(logs) };
   }
 
   async addMember(agencyId: bigint, data: any) {
@@ -605,6 +832,8 @@ export class AgencyService {
         modelable_type: modelableType,
         modelable_id: modelableId,
         data: data ? JSON.stringify(data) : null,
+        created_at: new Date(),
+        updated_at: new Date(),
       },
     });
   }

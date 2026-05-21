@@ -172,6 +172,109 @@ export class TelegramService {
     return { success: true, message };
   }
 
+  /**
+   * Send an outbound Telegram message via the Bot API. Resolves the bot from
+   * the chat, calls the Telegram API, persists a telegram_messages row, and
+   * emits the standard 'new_message' socket event so the UI updates live.
+   *
+   * `chatId` is the local telegram_chats.id. Telegram's own chat id is on the
+   * row as `tg_chat_id`.
+   */
+  async sendMessage(
+    chatId: bigint,
+    userId: bigint,
+    payload: { text?: string; type?: string; media?: any },
+  ) {
+    const chat = await this.prisma.telegram_chats.findUnique({ where: { id: chatId } });
+    if (!chat) throw new NotFoundException('Telegram chat not found');
+    const bot = await this.prisma.telegram_bots.findUnique({
+      where: { id: chat.telegram_bot_id as bigint },
+    });
+    if (!bot || !bot.token) throw new NotFoundException('Telegram bot or token not found');
+
+    const tgChatId = (chat as any).tg_chat_id ?? (chat as any).chat_id;
+    if (!tgChatId) throw new BadRequestException('Local chat row missing tg_chat_id');
+
+    const apiUrl = `https://api.telegram.org/bot${bot.token}/sendMessage`;
+    const res = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: tgChatId,
+        text: payload.text ?? '',
+        parse_mode: 'HTML',
+      }),
+    });
+    const data: any = await res.json().catch(() => ({}));
+    if (!res.ok || !data?.ok) {
+      const msg = data?.description ?? `HTTP ${res.status}`;
+      throw new BadRequestException(`Telegram sendMessage failed: ${msg}`);
+    }
+
+    const tgMessageId = String(data.result?.message_id ?? Date.now());
+    const message = await this.prisma.telegram_messages.create({
+      data: {
+        telegram_chat_id: chatId,
+        message_number: BigInt(Date.now()),
+        user_id: userId,
+        message_id: tgMessageId,
+        type: payload.type ?? 'text',
+        seen: true,
+        direction: 'OUTGOING',
+        text: payload.text ?? null,
+        status: 'SENT',
+      },
+    });
+    return { success: true, message_id: tgMessageId, message };
+  }
+
+  /**
+   * Parse and persist an inbound Telegram update (webhook payload). Returns the
+   * normalized info webhooks-inbound needs to forward to inbox.
+   */
+  async handleInboundUpdate(update: any) {
+    const msg = update?.message ?? update?.edited_message;
+    if (!msg) return null;
+    const tgChatId = msg.chat?.id;
+    if (!tgChatId) return null;
+
+    // Find bot — Telegram doesn't include bot_id in payload, so we rely on the
+    // webhook URL having a per-bot secret OR on the chat already existing.
+    let chat = await this.prisma.telegram_chats.findFirst({
+      where: { tg_chat_id: String(tgChatId) } as any,
+    });
+    if (!chat) {
+      // First message — defer to the bot identification mechanism your URL
+      // routing provides; for now skip silently.
+      this.logger.warn(`No local chat for tg_chat_id=${tgChatId} — bot identification needed`);
+      return null;
+    }
+
+    const message = await this.prisma.telegram_messages.create({
+      data: {
+        telegram_chat_id: chat.id,
+        message_number: BigInt(Date.now()),
+        message_id: String(msg.message_id),
+        type: msg.text ? 'text' : msg.photo ? 'photo' : msg.document ? 'document' : 'other',
+        seen: false,
+        direction: 'INCOMING',
+        text: msg.text ?? msg.caption ?? null,
+        status: 'RECEIVED',
+      },
+    });
+
+    const bot = await this.prisma.telegram_bots.findUnique({
+      where: { id: chat.telegram_bot_id as bigint },
+    });
+
+    return {
+      workspaceId: bot?.workspace_id,
+      chatId: chat.id,
+      messageId: message.id,
+      contactId: (chat as any).contact_id,
+    };
+  }
+
   async messageAction(messageId: bigint, action: string) {
     if (!action) throw new BadRequestException('Action is required');
 

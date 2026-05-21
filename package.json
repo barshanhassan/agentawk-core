@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@nestjs/axios": "^4.0.1",
+    "@nestjs/bullmq": "^11.0.4",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.3",
     "@nestjs/core": "^11.0.1",
@@ -36,8 +37,10 @@
     "@types/multer": "^2.0.0",
     "axios": "^1.13.5",
     "bcrypt": "^6.0.0",
+    "bullmq": "^5.76.10",
     "chargebee": "^3.23.1",
     "dayjs": "^1.11.20",
+    "ioredis": "^5.10.1",
     "otplib": "^13.3.0",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",

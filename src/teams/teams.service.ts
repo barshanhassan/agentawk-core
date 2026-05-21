@@ -154,6 +154,44 @@ export class TeamsService {
   }
 
   /**
+   * Distribution-rule based member picker. Used by routing layers (inbox
+   * assignment, pipeline auto-assign) to decide which agent gets the next
+   * piece of work for this team.
+   *
+   *  - EQUAL    → round-robin: pick the member with the OLDEST
+   *               last_opportunity_assigned_at (NULL counts as oldest).
+   *  - PRIORITY → pick the member with the highest priority (smallest int).
+   *               Ties broken by oldest last_opportunity_assigned_at.
+   *
+   * Updates `last_opportunity_assigned_at` + bumps `opportunity_counter` so
+   * the next call advances the rotation.
+   */
+  async pickNextMember(teamId: bigint) {
+    const team = await this.prisma.teams.findUnique({ where: { id: teamId } });
+    if (!team) throw new NotFoundException('Team not found');
+
+    const orderBy: any[] =
+      team.distribution === 'PRIORITY'
+        ? [{ priority: 'asc' }, { last_opportunity_assigned_at: { sort: 'asc', nulls: 'first' } }]
+        : [{ last_opportunity_assigned_at: { sort: 'asc', nulls: 'first' } }];
+
+    const candidate = await this.prisma.team_members.findFirst({
+      where: { team_id: teamId },
+      orderBy: orderBy as any,
+    });
+    if (!candidate) return null;
+
+    await this.prisma.team_members.update({
+      where: { id: candidate.id },
+      data: {
+        last_opportunity_assigned_at: new Date(),
+        opportunity_counter: { increment: 1 },
+      },
+    });
+    return candidate;
+  }
+
+  /**
    * Delete a team
    */
   async deleteTeam(workspaceId: bigint, teamId: bigint) {

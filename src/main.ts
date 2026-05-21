@@ -6,7 +6,10 @@ import { AppModule } from './app.module';
 };
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // rawBody: true preserves the original request body buffer on req.rawBody so
+  // webhook signature verification (HMAC over the exact bytes the provider signed)
+  // works correctly. Without this, NestJS parses JSON and discards the raw form.
+  const app = await NestFactory.create(AppModule, { rawBody: true });
   app.enableCors({
     origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
       // Allow requests with no origin (curl, Postman, mobile)

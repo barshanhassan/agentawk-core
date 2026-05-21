@@ -108,5 +108,17 @@ export class PipelinesController {
       BigInt(stepId),
     );
   }
+
+  @Patch('opportunities/:id')
+  async updateOpportunity(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.updateOpportunity(workspaceId, BigInt(id), body);
+  }
+
+  @Delete('opportunities/:id')
+  async deleteOpportunity(@Param('id') id: string, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.deleteOpportunity(workspaceId, BigInt(id));
+  }
 }
 

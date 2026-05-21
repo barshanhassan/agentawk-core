@@ -95,6 +95,16 @@ export class TelegramController {
     );
   }
 
+  @Post('chats/:chatId/send')
+  async sendMessage(
+    @Param('chatId') chatId: string,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const userId = BigInt(req.user.sub || req.user.id || 0);
+    return this.telegramService.sendMessage(BigInt(chatId), userId, body);
+  }
+
   @Post('messages/:messageId/action')
   async messageAction(
     @Param('messageId') messageId: string,

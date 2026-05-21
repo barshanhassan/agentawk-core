@@ -34,6 +34,27 @@ export class BroadcastProcessorService {
     }
   }
 
+  /**
+   * Public entrypoint used by the BullMQ worker. Loads the broadcast by id and
+   * delegates to the same private executor — keeps cron + queue paths sharing
+   * the same body of work.
+   */
+  async executeBroadcastById(broadcastId: bigint) {
+    const broadcast = await this.prisma.broadcasts.findUnique({
+      where: { id: broadcastId },
+    });
+    if (!broadcast) {
+      this.logger.warn(`executeBroadcastById: broadcast ${broadcastId} not found`);
+      return { skipped: true, reason: 'not_found' };
+    }
+    if (broadcast.locked) {
+      this.logger.warn(`executeBroadcastById: broadcast ${broadcastId} is locked — already running`);
+      return { skipped: true, reason: 'locked' };
+    }
+    await this.executeBroadcast(broadcast);
+    return { processed: true };
+  }
+
   private async executeBroadcast(broadcast: any) {
     this.logger.log(`Executing broadcast: ${broadcast.name} (${broadcast.id})`);
 

@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChatGateway } from './chat.gateway';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 
 @Injectable()
 export class InboxService {
@@ -15,6 +16,7 @@ export class InboxService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly chatGateway: ChatGateway,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   /**
@@ -680,6 +682,74 @@ export class InboxService {
       inbox_id: inbox.id.toString(),
       provider,
       data,
+    });
+
+    // Fire the domain event that AutomationTriggerService listens to. Any
+    // automation whose trigger activity event is 'inbound_message' (optionally
+    // narrowed by channel) will run.
+    this.eventEmitter.emit('message.inbound', {
+      workspaceId,
+      inboxId: inbox.id,
+      contactId: data.contact_id ? BigInt(data.contact_id) : undefined,
+      channel: provider,
+    });
+
+    return { success: true, inbox_id: inbox.id };
+  }
+
+  /**
+   * Used after a per-provider webhook parser has already persisted the channel
+   * message rows (wa_messages, telegram_messages, etc.). Upserts the inbox row,
+   * fires the realtime socket event, and emits the domain automation trigger.
+   * Callers: WebhooksInboundController for parsed providers (currently WhatsApp).
+   */
+  async notifyInboundMessage(params: {
+    workspaceId: bigint;
+    modelableType: string; // e.g. 'App\\Models\\WhatsappChat'
+    modelableId: bigint;   // chat row id
+    contactId?: bigint;
+    channel: string;       // 'whatsapp' | 'telegram' | ...
+    messageId?: bigint;
+  }) {
+    let inbox = await this.prisma.inbox.findFirst({
+      where: {
+        workspace_id: params.workspaceId,
+        modelable_id: params.modelableId,
+        modelable_type: params.modelableType,
+      },
+    });
+    if (!inbox) {
+      inbox = await this.prisma.inbox.create({
+        data: {
+          workspace_id: params.workspaceId,
+          modelable_id: params.modelableId,
+          modelable_type: params.modelableType,
+          status: 'UNASSIGNED',
+          last_updated: new Date(),
+        },
+      });
+    } else {
+      await this.prisma.inbox.update({
+        where: { id: inbox.id },
+        data: {
+          updated_at: new Date(),
+          last_updated: new Date(),
+          status: inbox.status === 'COMPLETED' ? 'ACTIVE' : inbox.status,
+        },
+      });
+    }
+
+    this.chatGateway.emitToWorkspace(params.workspaceId, 'new_message', {
+      inbox_id: inbox.id.toString(),
+      provider: params.channel,
+      message_id: params.messageId?.toString(),
+    });
+
+    this.eventEmitter.emit('message.inbound', {
+      workspaceId: params.workspaceId,
+      inboxId: inbox.id,
+      contactId: params.contactId,
+      channel: params.channel,
     });
 
     return { success: true, inbox_id: inbox.id };

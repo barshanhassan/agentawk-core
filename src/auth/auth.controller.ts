@@ -145,6 +145,11 @@ export class AuthController {
     return this.authService.logout(BigInt(req.user.sub));
   }
 
+  @Post('register')
+  async register(@Body() body: any) {
+    return this.authService.register(body);
+  }
+
   @Get('init-registration')
   async initRegistration() {
     return this.authService.initRegistration();

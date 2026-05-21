@@ -255,6 +255,38 @@ export class TagsService {
     return { success: true };
   }
 
+  /**
+   * Update a tag's name/status. Also propagates the new name to all tag_links
+   * rows so denormalized "name" stays in sync (mirrors gateway behavior).
+   */
+  async updateTag(workspaceId: bigint, tagId: bigint, data: any) {
+    const tag = await this.prisma.tags.findFirst({
+      where: { id: tagId, workspace_id: workspaceId },
+    });
+    if (!tag) throw new NotFoundException('Tag not found');
+
+    const update: any = { updated_at: new Date() };
+    if (data.name !== undefined && data.name !== tag.name) {
+      update.name = data.name;
+    }
+    if (data.display_inbox !== undefined) {
+      update.display_inbox = data.display_inbox ? 1 : 0;
+    }
+    if (data.folder_id !== undefined) {
+      update.folder_id = data.folder_id ? BigInt(data.folder_id) : null;
+    }
+
+    const updated = await this.prisma.tags.update({ where: { id: tagId }, data: update });
+
+    if (update.name) {
+      await this.prisma.tag_links.updateMany({
+        where: { tag_id: tagId },
+        data: { name: update.name, updated_at: new Date() },
+      });
+    }
+    return { success: true, tag: updated };
+  }
+
   // ─── Folder Management ──────────────────────────────────────────────
 
   async getFolders(workspaceId: bigint) {

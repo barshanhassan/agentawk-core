@@ -43,4 +43,15 @@ export class StatisticsController {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     return this.service.statisticsV1(workspaceId, body);
   }
+
+  /**
+   * Workspace-scoped time-series for the Insights Overview tab. Returns four
+   * arrays (dauData, mauData, wauData, stickinessData). Used by OverviewTab
+   * to replace what were previously hardcoded mock arrays.
+   */
+  @Get('dashboard-charts')
+  async getDashboardCharts(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getDashboardCharts(workspaceId);
+  }
 }

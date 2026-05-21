@@ -34,4 +34,14 @@ export class TeamsController {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     return this.teamsService.deleteTeam(workspaceId, BigInt(id));
   }
+
+  /**
+   * Pick the next member from a team according to its distribution rule.
+   * Internal/routing helper — useful for integration testing and as a
+   * frontend "preview which agent gets the next assignment" indicator.
+   */
+  @Post(':id/pick-next-member')
+  async pickNextMember(@Param('id') id: string) {
+    return this.teamsService.pickNextMember(BigInt(id));
+  }
 }

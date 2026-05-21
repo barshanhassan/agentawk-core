@@ -41,4 +41,14 @@ export class WabaController {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     return this.service.deleteTemplate(BigInt(id), workspaceId);
   }
+
+  /**
+   * Fetch authoritative template list from Meta Graph API and upsert local
+   * wa_templates rows. Idempotent — safe to call any time.
+   */
+  @Post('templates/sync')
+  async syncTemplates(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.syncTemplatesFromMeta(workspaceId);
+  }
 }

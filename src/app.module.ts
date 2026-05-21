@@ -36,6 +36,10 @@ import { BillingModule } from './billing/billing.module';
 import { StatisticsModule } from './statistics/statistics.module';
 import { ChatStatisticsModule } from './chat-statistics/chat-statistics.module';
 import { EventLogsModule } from './event-logs/event-logs.module';
+import { LegalModule } from './legal/legal.module';
+import { QueueModule } from './queue/queue.module';
+import { EvolutionModule } from './evolution/evolution.module';
+import { LogsModule } from './logs/logs.module';
 import { ReportsModule } from './reports/reports.module';
 import { GalleryModule } from './gallery/gallery.module';
 import { TextToSpeechModule } from './text-to-speech/text-to-speech.module';
@@ -75,6 +79,7 @@ import { PermissionsGuard } from './auth/permissions.guard';
     }),
     EventEmitterModule.forRoot(),
     ScheduleModule.forRoot(),
+    QueueModule.forRoot(),
     AuthModule,
     UsersModule,
     WorkspacesModule,
@@ -105,6 +110,9 @@ import { PermissionsGuard } from './auth/permissions.guard';
     StatisticsModule,
     ChatStatisticsModule,
     EventLogsModule,
+    LegalModule,
+    EvolutionModule,
+    LogsModule,
     ReportsModule,
     GalleryModule,
     TextToSpeechModule,

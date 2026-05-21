@@ -390,4 +390,271 @@ export class ContactsService {
 
     return { success: true };
   }
+
+  // ─── Bulk operations (mirror gateway's BulkTagAction / BulkCustomFieldAction jobs) ─────────────────
+
+  /** Apply one or more tags to many contacts. Idempotent — skips existing links. */
+  async applyTagsBulk(workspaceId: bigint, contactIds: bigint[], tagIds: bigint[]) {
+    if (contactIds.length === 0 || tagIds.length === 0) return { applied: 0 };
+    const valid = await this.prisma.contacts.findMany({
+      where: { id: { in: contactIds }, workspace_id: workspaceId },
+      select: { id: true },
+    });
+    const tags = await this.prisma.tags.findMany({
+      where: { id: { in: tagIds }, workspace_id: workspaceId },
+      select: { id: true, name: true },
+    });
+
+    let applied = 0;
+    for (const c of valid) {
+      for (const t of tags) {
+        const existing = await this.prisma.tag_links.findFirst({
+          where: {
+            linkable_type: 'App\\Models\\Contact',
+            linkable_id: c.id,
+            tag_id: t.id,
+          },
+        });
+        if (!existing) {
+          await this.prisma.tag_links.create({
+            data: {
+              linkable_type: 'App\\Models\\Contact',
+              linkable_id: c.id,
+              tag_id: t.id,
+              name: t.name,
+              created_at: new Date(),
+              updated_at: new Date(),
+            },
+          });
+          applied++;
+        }
+      }
+    }
+    return { applied, contacts: valid.length, tags: tags.length };
+  }
+
+  async removeTagsBulk(workspaceId: bigint, contactIds: bigint[], tagIds: bigint[]) {
+    if (contactIds.length === 0 || tagIds.length === 0) return { removed: 0 };
+    const valid = await this.prisma.contacts.findMany({
+      where: { id: { in: contactIds }, workspace_id: workspaceId },
+      select: { id: true },
+    });
+    const result = await this.prisma.tag_links.deleteMany({
+      where: {
+        linkable_type: 'App\\Models\\Contact',
+        linkable_id: { in: valid.map((c) => c.id) },
+        tag_id: { in: tagIds },
+      },
+    });
+    return { removed: result.count };
+  }
+
+  /**
+   * Export contacts to CSV. Returns the raw CSV string; the controller adds
+   * the Content-Disposition header. Columns: id, first_name, last_name,
+   * full_name, email (first), phone (first), tags (semicolon-joined), created_at.
+   */
+  async exportCsv(workspaceId: bigint, filters: { status?: string } = {}) {
+    const where: any = { workspace_id: workspaceId, deleted_at: null };
+    if (filters.status) where.status = filters.status;
+
+    const contacts = await this.prisma.contacts.findMany({
+      where,
+      orderBy: { id: 'asc' },
+      take: 10000,
+    });
+
+    const lines: string[] = [
+      'id,first_name,last_name,full_name,email,phone,tags,created_at',
+    ];
+    for (const c of contacts) {
+      const emailRow = await this.prisma.contact_emails.findFirst({
+        where: {
+          ownership_id: workspaceId,
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: c.id,
+        } as any,
+        select: { email: true },
+      });
+      const phoneRow = await this.prisma.contact_mobiles.findFirst({
+        where: {
+          ownership_id: workspaceId,
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: c.id,
+        } as any,
+        select: { full_mobile_number: true },
+      });
+      const tagLinks = await this.prisma.tag_links.findMany({
+        where: { linkable_type: 'App\\Models\\Contact', linkable_id: c.id },
+        select: { name: true },
+      });
+      const row = [
+        c.id.toString(),
+        this.csvEscape(c.first_name ?? ''),
+        this.csvEscape(c.last_name ?? ''),
+        this.csvEscape(c.full_name ?? ''),
+        this.csvEscape(emailRow?.email ?? ''),
+        this.csvEscape(phoneRow?.full_mobile_number ?? ''),
+        this.csvEscape(tagLinks.map((t) => t.name).join(';')),
+        c.created_at ? c.created_at.toISOString() : '',
+      ].join(',');
+      lines.push(row);
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * Import a CSV. Header expected: first_name,last_name,email,phone[,tags]
+   * Tags column is semicolon-separated; tags auto-created if missing.
+   * Existing contacts matched by email/phone are updated; otherwise created.
+   */
+  async importCsv(workspaceId: bigint, userId: bigint, csv: string) {
+    const lines = csv.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    if (lines.length < 2) {
+      throw new BadRequestException('CSV is empty or has no rows');
+    }
+    const header = lines[0].split(',').map((h) => h.trim().toLowerCase());
+    const idxFirst = header.indexOf('first_name');
+    const idxLast = header.indexOf('last_name');
+    const idxEmail = header.indexOf('email');
+    const idxPhone = header.indexOf('phone');
+    const idxTags = header.indexOf('tags');
+
+    let created = 0;
+    let updated = 0;
+
+    for (let i = 1; i < lines.length; i++) {
+      const cols = this.csvParseLine(lines[i]);
+      const first = idxFirst >= 0 ? cols[idxFirst] : '';
+      const last = idxLast >= 0 ? cols[idxLast] : '';
+      const email = idxEmail >= 0 ? cols[idxEmail] : '';
+      const phone = idxPhone >= 0 ? cols[idxPhone] : '';
+      const tagsRaw = idxTags >= 0 ? cols[idxTags] : '';
+
+      if (!first && !email && !phone) continue;
+
+      const existing = await this.findExistingContact(workspaceId, email, phone);
+      let contactId: bigint;
+      if (existing) {
+        contactId = existing.id;
+        await this.prisma.contacts.update({
+          where: { id: existing.id },
+          data: {
+            first_name: first || existing.first_name,
+            last_name: last || existing.last_name,
+            updated_at: new Date(),
+          },
+        });
+        updated++;
+      } else {
+        const c = await this.prisma.contacts.create({
+          data: {
+            workspace_id: workspaceId,
+            first_name: first || null,
+            last_name: last || null,
+            source: 'IMPORT' as any,
+            status: 'ACTIVE' as any,
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+        });
+        contactId = c.id;
+        if (email) {
+          await this.prisma.contact_emails.create({
+            data: {
+              ownership_type: 'App\\Models\\Workspace',
+              ownership_id: workspaceId,
+              modelable_type: 'App\\Models\\Contact',
+              modelable_id: c.id,
+              email,
+            } as any,
+          });
+        }
+        if (phone) {
+          const clean = phone.replace(/[^0-9]/g, '');
+          await this.prisma.contact_mobiles.create({
+            data: {
+              ownership_type: 'App\\Models\\Workspace',
+              ownership_id: workspaceId,
+              modelable_type: 'App\\Models\\Contact',
+              modelable_id: c.id,
+              country_id: 0,
+              mobile_number: clean,
+              national_mobile_number: clean,
+              full_mobile_number: clean,
+            },
+          });
+        }
+        created++;
+      }
+
+      if (tagsRaw) {
+        const names = tagsRaw.split(';').map((s) => s.trim()).filter(Boolean);
+        for (const name of names) {
+          let tag = await this.prisma.tags.findFirst({
+            where: { workspace_id: workspaceId, name } as any,
+          });
+          if (!tag) {
+            tag = await this.prisma.tags.create({
+              data: {
+                workspace_id: workspaceId,
+                user_id: userId,
+                taggable_type: 'App\\Models\\Workspace',
+                taggable_id: workspaceId,
+                name,
+                display_inbox: 1,
+              } as any,
+            });
+          }
+          const linkExists = await this.prisma.tag_links.findFirst({
+            where: {
+              linkable_type: 'App\\Models\\Contact',
+              linkable_id: contactId,
+              tag_id: tag.id,
+            },
+          });
+          if (!linkExists) {
+            await this.prisma.tag_links.create({
+              data: {
+                linkable_type: 'App\\Models\\Contact',
+                linkable_id: contactId,
+                tag_id: tag.id,
+                name: tag.name,
+                created_at: new Date(),
+                updated_at: new Date(),
+              },
+            });
+          }
+        }
+      }
+    }
+
+    return { created, updated, total: created + updated };
+  }
+
+  private csvEscape(v: string): string {
+    if (!v) return '';
+    if (/[,"\n\r]/.test(v)) return '"' + v.replace(/"/g, '""') + '"';
+    return v;
+  }
+
+  private csvParseLine(line: string): string[] {
+    const out: string[] = [];
+    let cur = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQuotes) {
+        if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+        else if (ch === '"') { inQuotes = false; }
+        else { cur += ch; }
+      } else {
+        if (ch === ',') { out.push(cur); cur = ''; }
+        else if (ch === '"') { inQuotes = true; }
+        else { cur += ch; }
+      }
+    }
+    out.push(cur);
+    return out;
+  }
 }
