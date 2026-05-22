@@ -39,18 +39,29 @@ export class AuthService {
       baseWhere.modelable_type = domainInfo.modelable_type;
     }
 
-    const user = await this.prisma.users.findFirst({ where: baseWhere });
-    console.log(`User found? ${!!user} (tenantScope=${useTenantScope})`);
+    // A single email can map to multiple user rows — the same person across an
+    // agency + its workspaces, or (on a shared/central host doing email-only
+    // lookup) even unrelated accounts that happen to reuse the email. Fetch all
+    // candidates and pick the one whose password actually verifies, instead of
+    // blindly taking findFirst (which could land on a different account whose
+    // password won't match → a false "Invalid credentials").
+    const candidates = await this.prisma.users.findMany({
+      where: baseWhere,
+      orderBy: { id: 'asc' },
+    });
+    console.log(
+      `Candidates found: ${candidates.length} (tenantScope=${useTenantScope})`,
+    );
 
-    if (!user) {
-      throw new UnauthorizedException('Invalid credentials');
+    let user: any = null;
+    for (const candidate of candidates) {
+      if (await bcrypt.compare(userDto.password, candidate.password || '')) {
+        user = candidate;
+        break;
+      }
     }
 
-    const isMatched = await bcrypt.compare(
-      userDto.password,
-      user.password || '',
-    );
-    if (!isMatched) {
+    if (!user) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
