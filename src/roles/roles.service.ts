@@ -134,17 +134,15 @@ export class RolesService {
     });
   }
 
-  // Assigns a role to a user (roleable)
+  // Assigns a role to a user (roleable). acl_roleables has only an index (not a
+  // unique constraint) on (roleable_type, roleable_id), so we clear any existing
+  // link then create — upsert-by-compound-key is not valid here.
   async assignRoleToUser(userId: bigint, roleId: number, entityType: string) {
-    return this.prisma.acl_roleables.upsert({
-      where: {
-        roleable_type_roleable_id_unique: {
-          roleable_type: entityType,
-          roleable_id: userId,
-        },
-      } as any,
-      create: { role_id: roleId, roleable_id: userId, roleable_type: entityType },
-      update: { role_id: roleId },
+    await this.prisma.acl_roleables.deleteMany({
+      where: { roleable_type: entityType, roleable_id: userId },
+    });
+    return this.prisma.acl_roleables.create({
+      data: { role_id: roleId, roleable_id: userId, roleable_type: entityType },
     });
   }
 

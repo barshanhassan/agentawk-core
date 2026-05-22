@@ -161,6 +161,15 @@ export class AgencyService {
       },
     });
 
+    await this.logAgencyEvent(
+      agencyId,
+      'billing_address_updated',
+      data.user_id ?? 0n,
+      'App\\Models\\Agency',
+      agencyId,
+      { city: data.address?.city, country: data.address?.country_iso2 },
+    );
+
     return { success: true };
   }
 
@@ -230,6 +239,15 @@ export class AgencyService {
         }
       });
     }
+
+    await this.logAgencyEvent(
+      agencyId,
+      'branding_updated',
+      data.user_id ?? 0n,
+      'App\\Models\\Agency',
+      agencyId,
+      { color: data.color },
+    );
 
     return { success: true, branding: this.serialize(updatedBranding) };
   }
@@ -430,7 +448,7 @@ export class AgencyService {
     return { success: true, workspace: this.serialize(workspace) };
   }
 
-  async updateWorkspace(workspaceId: bigint, agencyId: bigint, data: any) {
+  async updateWorkspace(workspaceId: bigint, agencyId: bigint, data: any, actorId: bigint = 0n) {
     const workspace = await this.prisma.workspaces.findFirst({
       where: { id: workspaceId, agency_id: agencyId },
     });
@@ -447,30 +465,61 @@ export class AgencyService {
       },
     });
 
+    await this.logAgencyEvent(agencyId, 'workspace_updated', actorId, 'App\\Models\\Workspace', workspaceId, {
+      workspace_name: updated.name,
+    });
+
     return { success: true, workspace: this.serialize(updated) };
   }
 
-  async suspendWorkspace(workspaceId: bigint, agencyId: bigint) {
+  async suspendWorkspace(workspaceId: bigint, agencyId: bigint, actorId: bigint = 0n) {
+    const workspace = await this.prisma.workspaces.findFirst({
+      where: { id: workspaceId, agency_id: agencyId },
+      select: { name: true },
+    });
     const updated = await this.prisma.workspaces.updateMany({
       where: { id: workspaceId, agency_id: agencyId },
       data: { status: 'SUSPENDED' },
     });
+    if (updated.count > 0) {
+      await this.logAgencyEvent(agencyId, 'workspace_suspended', actorId, 'App\\Models\\Workspace', workspaceId, {
+        workspace_name: workspace?.name,
+      });
+    }
     return { success: updated.count > 0 };
   }
 
-  async activateWorkspace(workspaceId: bigint, agencyId: bigint) {
+  async activateWorkspace(workspaceId: bigint, agencyId: bigint, actorId: bigint = 0n) {
+    const workspace = await this.prisma.workspaces.findFirst({
+      where: { id: workspaceId, agency_id: agencyId },
+      select: { name: true },
+    });
     const updated = await this.prisma.workspaces.updateMany({
       where: { id: workspaceId, agency_id: agencyId },
       data: { status: 'ACTIVE' },
     });
+    if (updated.count > 0) {
+      await this.logAgencyEvent(agencyId, 'workspace_activated', actorId, 'App\\Models\\Workspace', workspaceId, {
+        workspace_name: workspace?.name,
+      });
+    }
     return { success: updated.count > 0 };
   }
 
-  async deleteWorkspace(workspaceId: bigint, agencyId: bigint) {
+  async deleteWorkspace(workspaceId: bigint, agencyId: bigint, actorId: bigint = 0n) {
+    const workspace = await this.prisma.workspaces.findFirst({
+      where: { id: workspaceId, agency_id: agencyId },
+      select: { name: true },
+    });
     const updated = await this.prisma.workspaces.updateMany({
       where: { id: workspaceId, agency_id: agencyId },
       data: { deleted_at: new Date() },
     });
+    if (updated.count > 0) {
+      await this.logAgencyEvent(agencyId, 'workspace_deleted', actorId, 'App\\Models\\Workspace', workspaceId, {
+        workspace_name: workspace?.name,
+      });
+    }
     return { success: updated.count > 0 };
   }
 
@@ -529,22 +578,24 @@ export class AgencyService {
     return { success: true, member: this.serialize(user) };
   }
 
-  async updateMember(agencyId: bigint, memberId: bigint, data: any) {
+  async updateMember(agencyId: bigint, memberId: bigint, data: any, actorId: bigint = 0n) {
     const user = await this.prisma.users.findFirst({
       where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
     });
     if (!user) throw new NotFoundException('Member not found');
 
+    // Only set columns that exist on the users table. phone/whatsapp are not
+    // user columns, and the form's "language" maps to the `locale` column
+    // (mirrors addMember). Skip undefined fields so partial updates are safe.
     const updateData: any = {
       first_name: data.first_name,
       last_name: data.last_name,
       email: data.email,
-      phone: data.phone,
-      whatsapp: data.whatsapp,
-      language: data.language,
-      status: data.status,
+      updated_at: new Date(),
     };
-
+    if (data.language) updateData.locale = data.language;
+    if (data.status) updateData.status = data.status;
+    if (typeof data.tfa_required !== 'undefined') updateData.tfa_required = !!data.tfa_required;
     if (data.password) {
       updateData.password = await bcrypt.hash(data.password, 10);
     }
@@ -554,31 +605,94 @@ export class AgencyService {
       data: updateData,
     });
 
+    // Re-sync the role assignment when a role slug is provided (Edit form has a
+    // role dropdown). Upsert keeps the single roleable row per user in sync.
+    if (data.role) {
+      const role = await this.prisma.acl_roles.findFirst({
+        where: {
+          slug: data.role.toLowerCase().replace(/_/g, '-'),
+          ownerable_id: agencyId,
+          ownerable_type: 'App\\Models\\Agency',
+        },
+      });
+      if (role) {
+        // acl_roleables has only an index (not a unique constraint) on
+        // (roleable_type, roleable_id), so upsert-by-compound-key isn't valid.
+        // Clear any existing role link for this user, then create the new one —
+        // guarantees a single, clean role assignment.
+        await this.prisma.acl_roleables.deleteMany({
+          where: { roleable_id: memberId, roleable_type: 'App\\Models\\User' },
+        });
+        await this.prisma.acl_roleables.create({
+          data: {
+            role_id: Number(role.id),
+            roleable_id: memberId,
+            roleable_type: 'App\\Models\\User',
+          },
+        });
+      }
+    }
+
+    await this.logAgencyEvent(agencyId, 'user_updated', actorId, 'App\\Models\\User', memberId, {
+      name: `${data.first_name ?? user.first_name ?? ''} ${data.last_name ?? user.last_name ?? ''}`.trim() || user.email,
+      email: user.email,
+    });
+
     return { success: true, member: this.serialize(updated) };
   }
 
-  async removeMember(agencyId: bigint, memberId: bigint) {
+  async removeMember(agencyId: bigint, memberId: bigint, actorId: bigint = 0n) {
+    // Capture identity before deletion so the log can show who was removed.
+    const target = await this.prisma.users.findFirst({
+      where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
+      select: { first_name: true, last_name: true, email: true },
+    });
+
     const deleted = await this.prisma.users.deleteMany({
       where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
     });
+
+    if (deleted.count > 0) {
+      await this.logAgencyEvent(agencyId, 'user_deleted', actorId, 'App\\Models\\User', memberId, {
+        name: `${target?.first_name ?? ''} ${target?.last_name ?? ''}`.trim() || target?.email,
+        email: target?.email,
+      });
+    }
+
     return { success: deleted.count > 0 };
   }
 
-  async suspendMember(agencyId: bigint, memberId: bigint) {
+  async suspendMember(agencyId: bigint, memberId: bigint, actorId: bigint = 0n) {
+    const target = await this.prisma.users.findFirst({
+      where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
+      select: { first_name: true, last_name: true, email: true },
+    });
     const updated = await this.prisma.users.updateMany({
       where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
       data: { status: 'SUSPENDED', updated_at: new Date() },
     });
     if (updated.count === 0) throw new NotFoundException('Member not found in this agency');
+    await this.logAgencyEvent(agencyId, 'user_suspended', actorId, 'App\\Models\\User', memberId, {
+      name: `${target?.first_name ?? ''} ${target?.last_name ?? ''}`.trim() || target?.email,
+      email: target?.email,
+    });
     return { success: true };
   }
 
-  async activateMember(agencyId: bigint, memberId: bigint) {
+  async activateMember(agencyId: bigint, memberId: bigint, actorId: bigint = 0n) {
+    const target = await this.prisma.users.findFirst({
+      where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
+      select: { first_name: true, last_name: true, email: true },
+    });
     const updated = await this.prisma.users.updateMany({
       where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
       data: { status: 'ACTIVE', updated_at: new Date() },
     });
     if (updated.count === 0) throw new NotFoundException('Member not found in this agency');
+    await this.logAgencyEvent(agencyId, 'user_activated', actorId, 'App\\Models\\User', memberId, {
+      name: `${target?.first_name ?? ''} ${target?.last_name ?? ''}`.trim() || target?.email,
+      email: target?.email,
+    });
     return { success: true };
   }
 
@@ -776,7 +890,7 @@ export class AgencyService {
     });
   }
 
-  async addMember(agencyId: bigint, data: any) {
+  async addMember(agencyId: bigint, data: any, actorId: bigint = 0n) {
     const hashedPassword = await bcrypt.hash(data.password, 10);
 
     const user = await this.prisma.users.create({
@@ -789,9 +903,14 @@ export class AgencyService {
         modelable_id: agencyId,
         modelable_type: 'App\\Models\\Agency',
         status: 'ACTIVE',
-        creator_id: 0n,
+        creator_id: actorId,
         tfa_required: !!data.tfa_required,
       },
+    });
+
+    await this.logAgencyEvent(agencyId, 'user_created', actorId, 'App\\Models\\User', user.id, {
+      name: `${data.first_name ?? ''} ${data.last_name ?? ''}`.trim() || data.email,
+      email: data.email,
     });
 
     // Handle Role Assignment
@@ -820,7 +939,12 @@ export class AgencyService {
 
   // ─── Helpers ───────────────────────────────────────────────────────
 
-  private async logAgencyEvent(
+  // Public so controllers can log events for actions handled by other services
+  // (e.g. role create/update/delete go through RolesService).
+  //
+  // Logging must NEVER break the actual operation — it's a side-effect, always
+  // the last step. So a failed log-write is caught and warned, not thrown.
+  async logAgencyEvent(
     agencyId: bigint,
     event: string,
     userId: bigint,
@@ -828,18 +952,24 @@ export class AgencyService {
     modelableId?: bigint,
     data?: any,
   ) {
-    await this.prisma.agency_logs.create({
-      data: {
-        agency_id: agencyId,
-        event: event,
-        user_id: userId,
-        modelable_type: modelableType,
-        modelable_id: modelableId,
-        data: data ? JSON.stringify(data) : null,
-        created_at: new Date(),
-        updated_at: new Date(),
-      },
-    });
+    try {
+      await this.prisma.agency_logs.create({
+        data: {
+          agency_id: agencyId,
+          event: event,
+          user_id: userId,
+          modelable_type: modelableType,
+          modelable_id: modelableId,
+          data: data ? JSON.stringify(data) : null,
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      });
+    } catch (err: any) {
+      this.logger.warn(
+        `Failed to write agency_log "${event}" for agency ${agencyId}: ${err?.message}`,
+      );
+    }
   }
 
   private serialize(obj: any) {

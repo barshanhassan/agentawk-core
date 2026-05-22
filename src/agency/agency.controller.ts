@@ -47,7 +47,8 @@ export class AgencyController {
 
   @Patch(':id/branding')
   @RequirePermission('agency.settings.branding')
-  async updateBranding(@Param('id') id: string, @Body() body: any) {
+  async updateBranding(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    body.user_id = BigInt(req.user.sub);
     return this.service.updateBranding(BigInt(id), body);
   }
 
@@ -81,8 +82,10 @@ export class AgencyController {
     @Param('id') id: string,
     @Param('workspace_id') workspaceId: string,
     @Body() body: any,
+    @Request() req: any,
   ) {
-    return this.service.updateWorkspace(BigInt(workspaceId), BigInt(id), body);
+    const actorId = req.user.sub || req.user.id || 0;
+    return this.service.updateWorkspace(BigInt(workspaceId), BigInt(id), body, BigInt(actorId));
   }
 
   @Post(':id/workspaces/:workspace_id/suspend')
@@ -90,8 +93,10 @@ export class AgencyController {
   async suspendWorkspace(
     @Param('id') id: string,
     @Param('workspace_id') workspaceId: string,
+    @Request() req: any,
   ) {
-    return this.service.suspendWorkspace(BigInt(workspaceId), BigInt(id));
+    const actorId = req.user.sub || req.user.id || 0;
+    return this.service.suspendWorkspace(BigInt(workspaceId), BigInt(id), BigInt(actorId));
   }
 
   @Post(':id/workspaces/:workspace_id/activate')
@@ -99,8 +104,10 @@ export class AgencyController {
   async activateWorkspace(
     @Param('id') id: string,
     @Param('workspace_id') workspaceId: string,
+    @Request() req: any,
   ) {
-    return this.service.activateWorkspace(BigInt(workspaceId), BigInt(id));
+    const actorId = req.user.sub || req.user.id || 0;
+    return this.service.activateWorkspace(BigInt(workspaceId), BigInt(id), BigInt(actorId));
   }
 
   @Delete(':id/workspaces/:workspace_id')
@@ -108,8 +115,10 @@ export class AgencyController {
   async deleteWorkspace(
     @Param('id') id: string,
     @Param('workspace_id') workspaceId: string,
+    @Request() req: any,
   ) {
-    return this.service.deleteWorkspace(BigInt(workspaceId), BigInt(id));
+    const actorId = req.user.sub || req.user.id || 0;
+    return this.service.deleteWorkspace(BigInt(workspaceId), BigInt(id), BigInt(actorId));
   }
 
   @Get(':id/workspaces/:workspace_id/usage')
@@ -140,8 +149,9 @@ export class AgencyController {
 
   @Post(':id/members')
   @RequirePermission('agency.users.add')
-  async addMember(@Param('id') id: string, @Body() body: any) {
-    return this.service.addMember(BigInt(id), body);
+  async addMember(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    const actorId = req.user.sub || req.user.id || 0;
+    return this.service.addMember(BigInt(id), body, BigInt(actorId));
   }
 
   @Patch(':id/members/:member_id')
@@ -150,8 +160,10 @@ export class AgencyController {
     @Param('id') id: string,
     @Param('member_id') memberId: string,
     @Body() body: any,
+    @Request() req: any,
   ) {
-    return this.service.updateMember(BigInt(id), BigInt(memberId), body);
+    const actorId = req.user.sub || req.user.id || 0;
+    return this.service.updateMember(BigInt(id), BigInt(memberId), body, BigInt(actorId));
   }
 
   @Delete(':id/members/:member_id')
@@ -159,8 +171,10 @@ export class AgencyController {
   async removeMember(
     @Param('id') id: string,
     @Param('member_id') memberId: string,
+    @Request() req: any,
   ) {
-    return this.service.removeMember(BigInt(id), BigInt(memberId));
+    const actorId = req.user.sub || req.user.id || 0;
+    return this.service.removeMember(BigInt(id), BigInt(memberId), BigInt(actorId));
   }
 
   @Post(':id/members/:member_id/suspend')
@@ -168,8 +182,10 @@ export class AgencyController {
   async suspendMember(
     @Param('id') id: string,
     @Param('member_id') memberId: string,
+    @Request() req: any,
   ) {
-    return this.service.suspendMember(BigInt(id), BigInt(memberId));
+    const actorId = req.user.sub || req.user.id || 0;
+    return this.service.suspendMember(BigInt(id), BigInt(memberId), BigInt(actorId));
   }
 
   @Post(':id/members/:member_id/activate')
@@ -177,8 +193,10 @@ export class AgencyController {
   async activateMember(
     @Param('id') id: string,
     @Param('member_id') memberId: string,
+    @Request() req: any,
   ) {
-    return this.service.activateMember(BigInt(id), BigInt(memberId));
+    const actorId = req.user.sub || req.user.id || 0;
+    return this.service.activateMember(BigInt(id), BigInt(memberId), BigInt(actorId));
   }
 
   // ─── Logs ──────────────────────────────────────────────────────────
@@ -217,20 +235,39 @@ export class AgencyController {
 
   @Post(':id/roles')
   @RequirePermission('agency.acl.add')
-  async createRole(@Param('id') id: string, @Body() data: any) {
-    console.log(`[DEBUG] Creating role for agency ${id}:`, data);
-    return this.rolesService.createRole(BigInt(id), 'App\\Models\\Agency', data);
+  async createRole(@Param('id') id: string, @Body() data: any, @Request() req: any) {
+    const actorId = BigInt(req.user.sub || req.user.id || 0);
+    const result: any = await this.rolesService.createRole(BigInt(id), 'App\\Models\\Agency', data);
+    await this.service.logAgencyEvent(
+      BigInt(id), 'role_created', actorId, 'App\\Models\\Role',
+      result?.id ? BigInt(result.id) : undefined, { name: data.name },
+    );
+    return result;
   }
 
   @Patch(':id/roles/:roleId')
   @RequirePermission('agency.acl.edit')
-  async updateRole(@Param('id') id: string, @Param('roleId') roleId: string, @Body() data: any) {
-    return this.rolesService.updateRole(BigInt(id), 'App\\Models\\Agency', BigInt(roleId), data);
+  async updateRole(@Param('id') id: string, @Param('roleId') roleId: string, @Body() data: any, @Request() req: any) {
+    const actorId = BigInt(req.user.sub || req.user.id || 0);
+    const result = await this.rolesService.updateRole(BigInt(id), 'App\\Models\\Agency', BigInt(roleId), data);
+    // Distinguish archive/restore (status toggle) from a normal edit.
+    const isArchive = data.status === 'ARCHIVE' || data.isArchived === true;
+    const isRestore = data.status === 'ACTIVE' || data.isArchived === false;
+    const event = isArchive ? 'role_archived' : isRestore ? 'role_restored' : 'role_updated';
+    await this.service.logAgencyEvent(
+      BigInt(id), event, actorId, 'App\\Models\\Role', BigInt(roleId), { name: data.name },
+    );
+    return result;
   }
 
   @Delete(':id/roles/:roleId')
   @RequirePermission('agency.acl.delete')
-  async deleteRole(@Param('id') id: string, @Param('roleId') roleId: string) {
-    return this.rolesService.deleteRole(BigInt(id), 'App\\Models\\Agency', BigInt(roleId));
+  async deleteRole(@Param('id') id: string, @Param('roleId') roleId: string, @Request() req: any) {
+    const actorId = BigInt(req.user.sub || req.user.id || 0);
+    const result = await this.rolesService.deleteRole(BigInt(id), 'App\\Models\\Agency', BigInt(roleId));
+    await this.service.logAgencyEvent(
+      BigInt(id), 'role_deleted', actorId, 'App\\Models\\Role', BigInt(roleId),
+    );
+    return result;
   }
 }
