@@ -53,7 +53,10 @@ export class RolesService {
   async getRoles(ownerId: bigint, ownerType: string = 'App\\Models\\Workspace') {
     const roles = await this.prisma.acl_roles.findMany({
       where: { ownerable_id: ownerId, ownerable_type: ownerType },
-      orderBy: { created_at: 'asc' },
+      // Newest first so a freshly created role appears at the top of the list.
+      // Order by id (auto-increment PK, never null) rather than created_at,
+      // which can be null on Laravel-migrated rows.
+      orderBy: { id: 'desc' },
     });
 
     // Load permissions for each role

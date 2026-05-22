@@ -497,6 +497,10 @@ export class AgencyService {
   async members(agencyId: bigint) {
     const users = await this.prisma.users.findMany({
       where: { modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
+      // Keep the agency owner pinned at the top, then newest users first so a
+      // freshly added member appears right under the owner. Order by id (PK,
+      // never null) rather than created_at which can be null on migrated rows.
+      orderBy: [{ is_owner: 'desc' }, { id: 'desc' }],
     });
 
     // Attach actual role name from acl_roleables → acl_roles
