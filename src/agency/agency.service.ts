@@ -697,43 +697,20 @@ export class AgencyService {
   }
 
   /**
-   * Dashboard stats — scoped per user.
-   *  - Agency owner (is_owner=true OR has agency.* wildcard) sees agency-wide totals.
-   *  - Role-limited agent sees ONLY what they personally created: workspaces
-   *    they're the creator/agency_agent of, and users they created. Each new
-   *    agent therefore lands on a "0 / 0" dashboard until they actually create
-   *    resources, matching the request that counts reflect the logged-in agent.
+   * Dashboard stats — agency-wide totals (replyagent parity). An agent sees the
+   * whole agency's counts; visibility is gated by module permissions, not by who
+   * created each resource. The recent-activity feed shows the real actor name.
    */
-  async getDashboardStats(agencyId: bigint, user?: any) {
-    const userId = BigInt(user?.sub ?? user?.id ?? 0);
-    const perms: string[] = Array.isArray(user?.permissions) ? user.permissions : [];
-    const isOwner = user?.is_owner === true || perms.includes('agency.*') || perms.includes('*');
-
-    const workspaceWhere: any = isOwner
-      ? { agency_id: agencyId, deleted_at: null }
-      : {
-          agency_id: agencyId,
-          deleted_at: null,
-          OR: [{ creator_id: userId }, { agency_agent_id: userId }],
-        };
-
-    const userWhere: any = isOwner
-      ? { modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' }
-      : {
-          modelable_id: agencyId,
-          modelable_type: 'App\\Models\\Agency',
-          creator_id: userId,
-        };
-
-    const recentLogsWhere: any = isOwner
-      ? { agency_id: agencyId }
-      : { agency_id: agencyId, user_id: userId };
-
+  async getDashboardStats(agencyId: bigint, _user?: any) {
     const [totalWorkspaces, totalAgents, recentLogs] = await Promise.all([
-      this.prisma.workspaces.count({ where: workspaceWhere }),
-      this.prisma.users.count({ where: userWhere }),
+      this.prisma.workspaces.count({
+        where: { agency_id: agencyId, deleted_at: null },
+      }),
+      this.prisma.users.count({
+        where: { modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
+      }),
       this.prisma.agency_logs.findMany({
-        where: recentLogsWhere,
+        where: { agency_id: agencyId },
         take: 5,
         orderBy: { created_at: 'desc' },
       }),
