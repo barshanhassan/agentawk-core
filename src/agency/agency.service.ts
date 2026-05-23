@@ -739,6 +739,19 @@ export class AgencyService {
       }),
     ]);
 
+    // agency_logs has no Prisma relation to users, so batch-fetch the actors to
+    // show real names in the recent-activity feed instead of a generic "System".
+    const logUserIds = Array.from(
+      new Set((recentLogs as any[]).filter(l => l.user_id != null).map(l => l.user_id)),
+    ) as bigint[];
+    const logUsers = logUserIds.length
+      ? await this.prisma.users.findMany({
+          where: { id: { in: logUserIds } },
+          select: { id: true, first_name: true, last_name: true, email: true },
+        })
+      : [];
+    const logUserById = new Map(logUsers.map((u: any) => [u.id.toString(), u]));
+
     return {
       success: true,
       stats: {
@@ -746,13 +759,23 @@ export class AgencyService {
         total_agents: totalAgents,
         premium_support_seats: "0 of 5", // Still hardcoded as per business logic usually
       },
-      recent_activity: (recentLogs as any[]).map(log => ({
-        name: log.user ? `${log.user.first_name} ${log.user.last_name}` : 'System',
-        action: log.event.replace(/_/g, ' '),
-        target: log.modelable_type?.split('\\').pop() || 'System',
-        time: log.created_at,
-        initials: log.user ? `${log.user.first_name?.[0] || ''}${log.user.last_name?.[0] || ''}` : 'S'
-      }))
+      recent_activity: (recentLogs as any[]).map(log => {
+        const u = log.user_id ? logUserById.get(log.user_id.toString()) : null;
+        const name = u
+          ? (`${u.first_name ?? ''} ${u.last_name ?? ''}`.trim() || u.email)
+          : 'System';
+        const initials = u
+          ? (`${u.first_name?.[0] ?? ''}${u.last_name?.[0] ?? ''}`.toUpperCase()
+              || (u.email?.[0]?.toUpperCase() ?? 'S'))
+          : 'S';
+        return {
+          name,
+          action: log.event.replace(/_/g, ' '),
+          target: log.modelable_type?.split('\\').pop() || 'System',
+          time: log.created_at,
+          initials,
+        };
+      }),
     };
   }
 
