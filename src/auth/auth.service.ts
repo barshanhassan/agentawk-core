@@ -84,40 +84,44 @@ export class AuthService {
     // Capture the login event. Workspace-context logins go into audit_logs
     // (workspace-scoped); agency-context logins go into agency_logs so the
     // Agency Logs UI shows them under the agent filter.
+    // Build the login-event log write (workspace-context → audit_logs;
+    // agency-context → agency_logs). Not awaited on its own — it runs in parallel
+    // with the permission load below to cut total login latency.
     const isWorkspaceContext = contextType.toLowerCase().includes('workspace');
-    if (isWorkspaceContext) {
-      await this.prisma.audit_logs.create({
-        data: {
-          workspace_id: contextId,
-          user_id: user.id,
-          modelable_type: contextType,
-          modelable_id: contextId,
-          event: 'user_logged_in',
-          data: JSON.stringify({ ip: 'mock-ip', via_central: isCentral }),
-          created_at: new Date(),
-          updated_at: new Date(),
-        },
-      });
-    } else {
-      // Agency-context login → agency_logs. Use the agency id (= contextId).
-      await this.prisma.agency_logs.create({
-        data: {
-          agency_id: contextId,
-          user_id: user.id,
-          modelable_type: contextType,
-          modelable_id: contextId,
-          event: 'user_logged_in',
-          data: JSON.stringify({ ip: 'mock-ip', via_central: isCentral }),
-          created_at: new Date(),
-          updated_at: new Date(),
-        },
-      });
-    }
+    const logWrite = isWorkspaceContext
+      ? this.prisma.audit_logs.create({
+          data: {
+            workspace_id: contextId,
+            user_id: user.id,
+            modelable_type: contextType,
+            modelable_id: contextId,
+            event: 'user_logged_in',
+            data: JSON.stringify({ ip: 'mock-ip', via_central: isCentral }),
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+        })
+      : this.prisma.agency_logs.create({
+          data: {
+            agency_id: contextId,
+            user_id: user.id,
+            modelable_type: contextType,
+            modelable_id: contextId,
+            event: 'user_logged_in',
+            data: JSON.stringify({ ip: 'mock-ip', via_central: isCentral }),
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+        });
 
     const redirectTo = isAgency ? '/agency' : '/workspace';
 
-    // Load user's permissions from their assigned role
-    const permissions = await this.loadUserPermissions(user.id);
+    // Run the log write and permission load concurrently (pass is_owner so the
+    // loader skips a redundant users query) — fewer serial DB round-trips.
+    const [, permissions] = await Promise.all([
+      logWrite,
+      this.loadUserPermissions(user.id, user.is_owner),
+    ]);
 
     // JWT token generation
     const payload = {
@@ -652,13 +656,18 @@ export class AuthService {
     return { message: 'Password updated successfully' };
   }
 
-  async loadUserPermissions(userId: bigint): Promise<string[]> {
-    // Owner gets wildcard — all permissions granted
-    const user = await this.prisma.users.findUnique({
-      where: { id: userId },
-      select: { is_owner: true },
-    });
-    if (user?.is_owner) return ['agency.*', 'workspace.*'];
+  async loadUserPermissions(userId: bigint, isOwner?: boolean): Promise<string[]> {
+    // Owner gets wildcard — all permissions granted. Use the caller-provided
+    // is_owner when available to avoid a redundant users lookup on login.
+    let owner = isOwner;
+    if (owner === undefined) {
+      const user = await this.prisma.users.findUnique({
+        where: { id: userId },
+        select: { is_owner: true },
+      });
+      owner = user?.is_owner ?? false;
+    }
+    if (owner) return ['agency.*', 'workspace.*'];
 
     const roleable = await this.prisma.acl_roleables.findFirst({
       where: { roleable_id: userId, roleable_type: 'App\\Models\\User' },
