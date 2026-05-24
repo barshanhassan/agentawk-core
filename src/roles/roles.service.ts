@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
@@ -86,7 +86,11 @@ export class RolesService {
   }
 
   async createRole(ownerId: bigint, ownerType: string, data: any) {
-    const slug = data.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    // Slug is a stable, unique machine key — mirrors replyagent exactly:
+    //   "ar_<ownerId>_<slugified-name>_<unix-timestamp>"
+    // The timestamp (+ owner id) guarantees uniqueness even for duplicate role
+    // names, so no separate "does this slug exist?" check is ever needed.
+    const slug = `ar_${ownerId}_${this.slugifyName(data.name)}_${Math.floor(Date.now() / 1000)}`;
     const role = await this.prisma.acl_roles.create({
       data: {
         ownerable_id: ownerId,
@@ -94,7 +98,7 @@ export class RolesService {
         name: data.name,
         slug,
         description: data.description || '',
-        icon: data.icon || 'fa-user-tie',
+        icon: data.icon || 'fa-person-military-pointing',
         status: 'ACTIVE',
         system: false,
         admin: false,
@@ -112,7 +116,10 @@ export class RolesService {
     if (!role) throw new NotFoundException('Role not found');
 
     const updateData: any = {};
-    if (data.name) { updateData.name = data.name; updateData.slug = data.name.toLowerCase().replace(/[^a-z0-9]+/g, '-'); }
+    // The display name can change, but the slug stays fixed — it is the role's
+    // permanent unique key (replyagent parity). User↔role links live in
+    // acl_roleables by role_id, so a stable slug never breaks an assignment.
+    if (data.name) { updateData.name = data.name; }
     if (data.description !== undefined) updateData.description = data.description;
     if (data.icon) updateData.icon = data.icon;
     if (data.status !== undefined) updateData.status = data.status;
@@ -128,7 +135,18 @@ export class RolesService {
   }
 
   async deleteRole(ownerId: bigint, ownerType: string, roleId: bigint) {
+    // System roles are built-in and must not be deleted (gateway parity).
+    const role = await this.prisma.acl_roles.findFirst({
+      where: { id: roleId, ownerable_id: ownerId, ownerable_type: ownerType },
+      select: { system: true },
+    });
+    if (!role) throw new NotFoundException('Role not found');
+    if (role.system) throw new BadRequestException('System roles cannot be deleted');
+
+    // Remove the role's permission links first, then the role itself.
     await this.prisma.acl_role_permissions.deleteMany({ where: { role_id: Number(roleId) } });
+    // Also clear any user assignments of this role so no user is left pointing at a deleted role.
+    await this.prisma.acl_roleables.deleteMany({ where: { role_id: Number(roleId) } });
     return this.prisma.acl_roles.deleteMany({
       where: { id: roleId, ownerable_id: ownerId, ownerable_type: ownerType },
     });
@@ -161,6 +179,16 @@ export class RolesService {
         skipDuplicates: true,
       });
     }
+  }
+
+  // Laravel Str::slug() equivalent: lowercase, non-alphanumeric runs → single
+  // dash, trimmed of leading/trailing dashes. Used to build the role slug.
+  private slugifyName(name: string): string {
+    return String(name ?? '')
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
   }
 
   private toStr(val: any) {

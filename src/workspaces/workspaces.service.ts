@@ -320,7 +320,12 @@ export class WorkspacesService {
   }
 
   async createRole(workspaceId: bigint, data: any) {
-    const slug = data.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    // Stable, unique machine key — mirrors replyagent exactly:
+    //   "ar_<workspaceId>_<slugified-name>_<unix-timestamp>"
+    // The timestamp guarantees uniqueness even for duplicate names.
+    const base = String(data.name ?? '')
+      .toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    const slug = `ar_${workspaceId}_${base}_${Math.floor(Date.now() / 1000)}`;
     return this.prisma.acl_roles.create({
       data: {
         ownerable_id: workspaceId,
@@ -339,8 +344,9 @@ export class WorkspacesService {
   async updateRole(workspaceId: bigint, roleId: bigint, data: any) {
     const updateData: any = {};
     if (data.name) {
+      // Name can change; the slug stays fixed (permanent unique key,
+      // replyagent parity — assignments link by role_id, not slug).
       updateData.name = data.name;
-      updateData.slug = data.name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
     }
     if (data.description !== undefined) updateData.description = data.description;
     if (data.icon) updateData.icon = data.icon;

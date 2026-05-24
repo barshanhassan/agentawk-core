@@ -455,14 +455,94 @@ export class AgencyService {
     if (!workspace)
       throw new NotFoundException('Workspace not found in this agency');
 
-    const updated = await this.prisma.workspaces.update({
-      where: { id: workspaceId },
-      data: {
-        name: data.name,
-        allow_branding: data.allow_branding,
-        allow_agents: data.allow_agents,
-        agents_limit: data.agents_limit,
-      },
+    // Agent reassignment (agency_agent_id holds the agency-level user id).
+    const oldAgentId = workspace.agency_agent_id;
+    const newAgentId = data.agent_id ? BigInt(data.agent_id) : null;
+    const agentChanged = String(oldAgentId ?? '') !== String(newAgentId ?? '');
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // 1. Persist all editable fields. `?? existing` keeps the current value
+      //    when a field isn't supplied, so a partial update never wipes data.
+      const ws = await tx.workspaces.update({
+        where: { id: workspaceId },
+        data: {
+          name: data.name ?? workspace.name,
+          timezone: data.timezone ?? workspace.timezone,
+          agency_agent_id: newAgentId,
+          allow_branding: data.allow_branding ?? workspace.allow_branding,
+          allow_support: data.allow_support ?? workspace.allow_support,
+          allow_agents: data.allow_agents ?? workspace.allow_agents,
+          agents_limit: data.agents_limit ?? workspace.agents_limit,
+          limited_contacts: data.limited_contacts ?? workspace.limited_contacts,
+          maximum_contacts: data.maximum_contacts ?? workspace.maximum_contacts,
+          chatgpt_assistant_limit: data.chatgpt_assistant_limit ?? workspace.chatgpt_assistant_limit,
+          whatsapp_channels_limit: data.whatsapp_channels_limit ?? workspace.whatsapp_channels_limit,
+          instagram_channels_limit: data.instagram_channels_limit ?? workspace.instagram_channels_limit,
+          facebook_channels_limit: data.facebook_channels_limit ?? workspace.facebook_channels_limit,
+          telegram_channels_limit: data.telegram_channels_limit ?? workspace.telegram_channels_limit,
+          twilio_channels_limit: data.twilio_channels_limit ?? workspace.twilio_channels_limit,
+          zapi_channels_limit: data.zapi_channels_limit ?? workspace.zapi_channels_limit,
+          webchat_channels_limit: data.webchat_channels_limit ?? workspace.webchat_channels_limit,
+          updated_at: new Date(),
+        },
+      });
+
+      // 2. If the assigned agent changed, re-sync the cross-link workspace-user
+      //    (mirrors gateway): remove the old agent's mirrored row, add the new one
+      //    so the new agent can log in at the workspace subdomain.
+      if (agentChanged) {
+        if (oldAgentId) {
+          await tx.users.deleteMany({
+            where: {
+              modelable_type: 'App\\Models\\Workspace',
+              modelable_id: workspaceId,
+              agency_user_id: oldAgentId,
+            },
+          });
+        }
+        if (newAgentId) {
+          const agencyUser = await tx.users.findFirst({
+            where: {
+              id: newAgentId,
+              modelable_type: 'App\\Models\\Agency',
+              modelable_id: agencyId,
+              status: 'ACTIVE',
+            },
+          });
+          if (agencyUser) {
+            const existing = await tx.users.findFirst({
+              where: {
+                modelable_type: 'App\\Models\\Workspace',
+                modelable_id: workspaceId,
+                agency_user_id: agencyUser.id,
+              },
+            });
+            if (!existing) {
+              await tx.users.create({
+                data: {
+                  first_name: agencyUser.first_name,
+                  last_name: agencyUser.last_name,
+                  full_name: agencyUser.full_name,
+                  email: agencyUser.email,
+                  password: agencyUser.password,
+                  modelable_type: 'App\\Models\\Workspace',
+                  modelable_id: workspaceId,
+                  agency_user_id: agencyUser.id,
+                  is_owner: true,
+                  locale: agencyUser.locale,
+                  timezone: agencyUser.timezone,
+                  status: 'ACTIVE',
+                  creator_id: actorId,
+                  created_at: new Date(),
+                  updated_at: new Date(),
+                },
+              });
+            }
+          }
+        }
+      }
+
+      return ws;
     });
 
     await this.logAgencyEvent(agencyId, 'workspace_updated', actorId, 'App\\Models\\Workspace', workspaceId, {
@@ -552,6 +632,24 @@ export class AgencyService {
       orderBy: [{ is_owner: 'desc' }, { id: 'desc' }],
     });
 
+    // Batch-load every member's mobile/whatsapp in one query (avoids N+1) and
+    // map their country_id → iso2 so the edit form can pre-fill the selectors.
+    const userIds = users.map((u) => u.id);
+    const mobiles = userIds.length
+      ? await this.prisma.contact_mobiles.findMany({
+          where: {
+            modelable_type: 'App\\Models\\User',
+            modelable_id: { in: userIds },
+            slug: { in: ['mobile', 'whatsapp'] },
+          },
+        })
+      : [];
+    const countryIds = [...new Set(mobiles.map((m) => m.country_id))];
+    const countries = countryIds.length
+      ? await this.prisma.countries.findMany({ where: { id: { in: countryIds } }, select: { id: true, iso2: true } })
+      : [];
+    const iso = new Map(countries.map((c) => [String(c.id), c.iso2]));
+
     // Attach actual role name from acl_roleables → acl_roles
     const enriched = await Promise.all(users.map(async (u) => {
       const roleable = await this.prisma.acl_roleables.findFirst({
@@ -562,7 +660,16 @@ export class AgencyService {
         const role = await this.prisma.acl_roles.findUnique({ where: { id: BigInt(roleable.role_id) } });
         if (role) roleName = role.name;
       }
-      return { ...u, role: roleName };
+      const mob = mobiles.find((m) => String(m.modelable_id) === String(u.id) && m.slug === 'mobile');
+      const wa = mobiles.find((m) => String(m.modelable_id) === String(u.id) && m.slug === 'whatsapp');
+      return {
+        ...u,
+        role: roleName,
+        phone: mob?.mobile_number ?? '',
+        phone_country: mob ? (iso.get(String(mob.country_id)) ?? '') : '',
+        whatsapp: wa?.mobile_number ?? '',
+        whatsapp_country: wa ? (iso.get(String(wa.country_id)) ?? '') : '',
+      };
     }));
 
     return { success: true, members: this.serialize(enriched) };
@@ -610,7 +717,9 @@ export class AgencyService {
     if (data.role) {
       const role = await this.prisma.acl_roles.findFirst({
         where: {
-          slug: data.role.toLowerCase().replace(/_/g, '-'),
+          // Frontend dropdown sends the role's exact stored slug, so match it
+          // verbatim (replyagent parity — slugs are unique machine keys).
+          slug: data.role,
           ownerable_id: agencyId,
           ownerable_type: 'App\\Models\\Agency',
         },
@@ -633,6 +742,14 @@ export class AgencyService {
       }
     }
 
+    // Persist phone / whatsapp changes into contact_mobiles (replyagent parity).
+    try {
+      await this.upsertUserMobile(memberId, agencyId, 'mobile', data.phone_country, data.phone);
+      await this.upsertUserMobile(memberId, agencyId, 'whatsapp', data.whatsapp_country, data.whatsapp);
+    } catch (err: any) {
+      this.logger.warn(`Failed to update member contact numbers: ${err?.message ?? err}`);
+    }
+
     await this.logAgencyEvent(agencyId, 'user_updated', actorId, 'App\\Models\\User', memberId, {
       name: `${data.first_name ?? user.first_name ?? ''} ${data.last_name ?? user.last_name ?? ''}`.trim() || user.email,
       email: user.email,
@@ -645,8 +762,13 @@ export class AgencyService {
     // Capture identity before deletion so the log can show who was removed.
     const target = await this.prisma.users.findFirst({
       where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
-      select: { first_name: true, last_name: true, email: true },
+      select: { first_name: true, last_name: true, email: true, is_owner: true },
     });
+
+    // The agency owner can never be deleted (gateway parity).
+    if (target?.is_owner) {
+      throw new BadRequestException('The agency owner cannot be deleted');
+    }
 
     const deleted = await this.prisma.users.deleteMany({
       where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
@@ -891,6 +1013,18 @@ export class AgencyService {
   }
 
   async addMember(agencyId: bigint, data: any, actorId: bigint = 0n) {
+    // Reject duplicate emails within this agency (gateway parity: agency->isMember).
+    const existing = await this.prisma.users.findFirst({
+      where: {
+        email: data.email,
+        modelable_id: agencyId,
+        modelable_type: 'App\\Models\\Agency',
+      },
+    });
+    if (existing) {
+      throw new BadRequestException('A member with this email already exists in the agency');
+    }
+
     const hashedPassword = await bcrypt.hash(data.password, 10);
 
     const user = await this.prisma.users.create({
@@ -917,7 +1051,9 @@ export class AgencyService {
     if (data.role) {
       const role = await this.prisma.acl_roles.findFirst({
         where: {
-          slug: data.role.toLowerCase().replace(/_/g, '-'),
+          // Frontend dropdown sends the role's exact stored slug, so match it
+          // verbatim (replyagent parity — slugs are unique machine keys).
+          slug: data.role,
           ownerable_id: agencyId,
           ownerable_type: 'App\\Models\\Agency'
         }
@@ -934,10 +1070,87 @@ export class AgencyService {
       }
     }
 
+    // Persist the agent's phone / whatsapp into contact_mobiles (replyagent parity).
+    // Wrapped so a contact-write hiccup never blocks user creation.
+    try {
+      await this.upsertUserMobile(user.id, agencyId, 'mobile', data.phone_country, data.phone);
+      await this.upsertUserMobile(user.id, agencyId, 'whatsapp', data.whatsapp_country, data.whatsapp);
+    } catch (err: any) {
+      this.logger.warn(`Failed to save member contact numbers: ${err?.message ?? err}`);
+    }
+
     return { success: true, user: this.serialize(user) };
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────
+
+  // Strip a phone number down to digits, dropping a leading 0 or + first
+  // (mirrors replyagent's ContactHelper::removeNumberFormating).
+  private cleanNumber(n: string): string {
+    return String(n ?? '')
+      .trim()
+      .replace(/^[0+]+/, '')
+      .replace(/[^0-9]/g, '');
+  }
+
+  /**
+   * Persist an agent's mobile / whatsapp number into contact_mobiles, polymorphic
+   * on the User — mirrors replyagent's ContactHelper::updateContactFields.
+   *   slug : 'mobile' | 'whatsapp'   iso2 : 2-letter country code the form sends
+   * No value → nothing written (replyagent parity: numbers aren't cleared here).
+   * One row per (user, slug): existing row is updated, otherwise created.
+   */
+  private async upsertUserMobile(
+    userId: bigint,
+    agencyId: bigint,
+    slug: 'mobile' | 'whatsapp',
+    iso2: string | undefined,
+    rawValue: string | undefined,
+  ) {
+    const digits = this.cleanNumber(rawValue ?? '');
+    if (!digits) return; // nothing to store
+
+    // country_id is required on contact_mobiles, so a valid country is mandatory.
+    const country = iso2
+      ? await this.prisma.countries.findFirst({ where: { iso2: iso2.toUpperCase() } })
+      : null;
+    if (!country) return;
+
+    const phoneCode = String(country.phone_code ?? '').replace(/[^0-9]/g, ''); // e.g. "92"
+    const national = `${phoneCode}${digits}`;        // 923123456789
+    const full = `+${national}`;                     // +923123456789
+
+    const fields = {
+      country_id: country.id,
+      country_code: country.phone_code ?? null,
+      mobile_number: digits,
+      national_mobile_number: national,
+      full_mobile_number: full,
+      type: slug,
+      is_primary: 1,
+      updated_at: new Date(),
+    };
+
+    const existing = await this.prisma.contact_mobiles.findFirst({
+      where: { modelable_type: 'App\\Models\\User', modelable_id: userId, slug },
+    });
+
+    if (existing) {
+      await this.prisma.contact_mobiles.update({ where: { id: existing.id }, data: fields });
+    } else {
+      await this.prisma.contact_mobiles.create({
+        data: {
+          ...fields,
+          slug,
+          modelable_type: 'App\\Models\\User',
+          modelable_id: userId,
+          ownership_type: 'App\\Models\\Agency',
+          ownership_id: agencyId,
+          created_at: new Date(),
+        },
+      });
+    }
+  }
 
   // Public so controllers can log events for actions handled by other services
   // (e.g. role create/update/delete go through RolesService).
