@@ -128,13 +128,17 @@ export class InboxController {
   @Get('folders')
   async getFolders(@Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.manageFolders(workspaceId, '');
+    return this.service.listFolders(workspaceId);
   }
 
   @Post('folders')
   async createFolder(@Body() body: any, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.manageFolders(workspaceId, body.name);
+    return this.service.createFolder(workspaceId, {
+      name: body.name,
+      assign_to: body.assign_to ?? null,
+      assigned_to: body.assigned_to ? BigInt(body.assigned_to) : null,
+    });
   }
 
   @Patch('folders/:id')
@@ -144,6 +148,16 @@ export class InboxController {
     @Request() req: any,
   ) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.manageFolders(workspaceId, body.name, BigInt(id));
+    return this.service.updateFolder(workspaceId, BigInt(id), {
+      name: body.name,
+      assign_to: body.assign_to ?? null,
+      assigned_to: body.assigned_to ? BigInt(body.assigned_to) : null,
+    });
+  }
+
+  @Delete('folders/:id')
+  async deleteFolder(@Param('id') id: string, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.deleteFolder(workspaceId, BigInt(id));
   }
 }

@@ -91,7 +91,6 @@ export class QuickResponseService {
       success: true,
       qr: await this.prisma.quick_responses.findUnique({
         where: { id: message.id },
-        include: { quick_response_media: { include: { gallery_media: true } } },
       }),
       group,
     };
@@ -151,7 +150,6 @@ export class QuickResponseService {
           },
         ],
       },
-      include: { quick_response_media: { include: { gallery_media: true } } },
       orderBy: { id: 'asc' },
     });
 

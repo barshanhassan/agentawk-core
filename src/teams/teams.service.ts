@@ -19,9 +19,9 @@ export class TeamsService {
   async createOrUpdate(workspaceId: bigint, userId: bigint, data: any) {
     const { name, members, distribution, auto_assign, id } = data;
 
-    if (!name || !members || !distribution) {
+    if (!name || !members || members.length === 0 || !distribution) {
       throw new BadRequestException(
-        'Name, members, and distribution are required',
+        'Name, members (at least one), and distribution are required',
       );
     }
 

@@ -11,19 +11,31 @@ import {
   Param,
 } from '@nestjs/common';
 import { WorkspacesService } from './workspaces.service';
+import { RolesService } from '../roles/roles.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
 import { Logger } from '@nestjs/common';
+
+const WORKSPACE_OWNER = 'App\\Models\\Workspace';
 
 @UseGuards(JwtAuthGuard)
 @Controller('workspaces')
 export class WorkspacesController {
   private readonly logger = new Logger(WorkspacesController.name);
-  constructor(private readonly service: WorkspacesService) {}
+  constructor(
+    private readonly service: WorkspacesService,
+    private readonly rolesService: RolesService,
+  ) {}
 
   @Get('current')
   async getWorkspace(@Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     return this.service.getWorkspace(workspaceId);
+  }
+
+  // Workspaces the logged-in user can switch to (for the workspace switcher).
+  @Get('accessible')
+  async getAccessibleWorkspaces(@Request() req: any) {
+    return this.service.getAccessibleWorkspaces(req.user);
   }
 
   @Patch('current')
@@ -81,29 +93,35 @@ export class WorkspacesController {
     return this.service.updateMember(workspaceId, BigInt(id), body);
   }
 
+  // Roles & Permissions — delegated to the shared RolesService (same engine as agency),
+  // scoped to this workspace. Real acl_permissions tree + acl_role_permissions persistence.
   @Get('all-roles')
   async getRoles(@Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.getRoles(workspaceId);
+    return this.rolesService.getRoles(workspaceId, WORKSPACE_OWNER);
+  }
+
+  @Get('permissions')
+  async getPermissions() {
+    return this.rolesService.getPermissionsTree('workspace.*');
   }
 
   @Post('create-role')
   async createRole(@Body() body: any, @Request() req: any) {
-    this.logger.log('Create role called with body: ' + JSON.stringify(body));
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.createRole(workspaceId, body);
+    return this.rolesService.createRole(workspaceId, WORKSPACE_OWNER, body);
   }
 
   @Patch('roles/:id')
   async updateRole(@Param('id') id: string, @Body() body: any, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.updateRole(workspaceId, BigInt(id), body);
+    return this.rolesService.updateRole(workspaceId, WORKSPACE_OWNER, BigInt(id), body);
   }
 
   @Delete('roles/:id')
   async deleteRole(@Param('id') id: string, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.deleteRole(workspaceId, BigInt(id));
+    return this.rolesService.deleteRole(workspaceId, WORKSPACE_OWNER, BigInt(id));
   }
 
   @Get('business-hours')

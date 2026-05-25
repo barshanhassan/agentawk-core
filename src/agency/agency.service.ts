@@ -656,15 +656,21 @@ export class AgencyService {
         where: { roleable_id: u.id, roleable_type: 'App\\Models\\User' },
       });
       let roleName = 'Agent';
+      let roleSlug = '';
+      let roleId: string | null = null;
       if (roleable) {
         const role = await this.prisma.acl_roles.findUnique({ where: { id: BigInt(roleable.role_id) } });
-        if (role) roleName = role.name;
+        if (role) { roleName = role.name; roleSlug = role.slug ?? ''; roleId = String(role.id); }
       }
       const mob = mobiles.find((m) => String(m.modelable_id) === String(u.id) && m.slug === 'mobile');
       const wa = mobiles.find((m) => String(m.modelable_id) === String(u.id) && m.slug === 'whatsapp');
       return {
         ...u,
         role: roleName,
+        // Return the assigned role's slug + id so the edit form can pre-select the
+        // dropdown directly — no fragile name→slug matching on the client.
+        role_slug: roleSlug,
+        role_id: roleId,
         phone: mob?.mobile_number ?? '',
         phone_country: mob ? (iso.get(String(mob.country_id)) ?? '') : '',
         whatsapp: wa?.mobile_number ?? '',

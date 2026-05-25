@@ -584,15 +584,52 @@ export class InboxService {
     });
   }
 
-  async manageFolders(workspaceId: bigint, name: string, id?: bigint) {
-    if (id) {
-      return this.prisma.inbox_folders.update({
-        where: { id },
-        data: { name },
-      });
-    }
+  /** List conversation folders for a workspace (does NOT create — mirrors replyagent's getSettings folders). */
+  async listFolders(workspaceId: bigint) {
+    return this.prisma.inbox_folders.findMany({
+      where: { workspace_id: workspaceId },
+      orderBy: { id: 'asc' },
+    });
+  }
+
+  async createFolder(
+    workspaceId: bigint,
+    data: { name: string; assign_to?: string | null; assigned_to?: bigint | null },
+  ) {
     return this.prisma.inbox_folders.create({
-      data: { workspace_id: workspaceId, name },
+      data: {
+        workspace_id: workspaceId,
+        name: (data.name || '').slice(0, 30),
+        assign_to: data.assign_to ?? null,
+        assigned_to: data.assigned_to ?? null,
+      },
+    });
+  }
+
+  async updateFolder(
+    workspaceId: bigint,
+    id: bigint,
+    data: { name?: string; assign_to?: string | null; assigned_to?: bigint | null },
+  ) {
+    const updateData: any = {};
+    if (data.name !== undefined) updateData.name = (data.name || '').slice(0, 30);
+    if (data.assign_to !== undefined) updateData.assign_to = data.assign_to ?? null;
+    if (data.assigned_to !== undefined) updateData.assigned_to = data.assigned_to ?? null;
+    // scoped by workspace so a tenant can't edit another workspace's folder
+    return this.prisma.inbox_folders.updateMany({
+      where: { id, workspace_id: workspaceId },
+      data: updateData,
+    });
+  }
+
+  async deleteFolder(workspaceId: bigint, id: bigint) {
+    // detach conversations from the folder first so we don't orphan a folder_id
+    await this.prisma.inbox.updateMany({
+      where: { folder_id: id, workspace_id: workspaceId },
+      data: { folder_id: null },
+    });
+    return this.prisma.inbox_folders.deleteMany({
+      where: { id, workspace_id: workspaceId },
     });
   }
 

@@ -14,6 +14,97 @@ export class WorkspacesService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
+   * Workspaces the logged-in user can switch to (mirrors replyagent's
+   * getUserWorkspaces):
+   *   - Agency owner  → every active workspace in the agency.
+   *   - Other agent   → only workspaces they're a member of (cross-link rows
+   *                     linked by agency_user_id).
+   * Each result carries its sub_domain so the client switches by navigating to
+   * that workspace's subdomain. The agency-owner flag is read from the linked
+   * agency user — NOT the cross-link row (that row is always is_owner=true).
+   */
+  async getAccessibleWorkspaces(reqUser: any) {
+    const me = await this.prisma.users.findUnique({
+      where: { id: BigInt(reqUser.id) },
+    });
+    if (!me) return { success: true, workspaces: [] };
+
+    let agencyId: bigint | null = null;
+    let agencyAgentId: bigint = me.id;
+    let isAgencyOwner = false;
+
+    if (me.modelable_type === 'App\\Models\\Agency') {
+      agencyId = me.modelable_id;
+      agencyAgentId = me.id;
+      isAgencyOwner = !!me.is_owner;
+    } else if (me.modelable_type === 'App\\Models\\Workspace') {
+      const ws = await this.prisma.workspaces.findUnique({
+        where: { id: me.modelable_id },
+      });
+      agencyId = ws?.agency_id ?? null;
+      agencyAgentId = me.agency_user_id ?? me.id;
+      if (me.agency_user_id) {
+        const agencyAgent = await this.prisma.users.findUnique({
+          where: { id: me.agency_user_id },
+        });
+        isAgencyOwner = !!agencyAgent?.is_owner;
+      }
+    }
+
+    if (!agencyId) return { success: true, workspaces: [] };
+
+    let wsList;
+    if (isAgencyOwner) {
+      wsList = await this.prisma.workspaces.findMany({
+        where: { agency_id: agencyId, deleted_at: null, status: 'ACTIVE' },
+        orderBy: { created_at: 'desc' },
+      });
+    } else {
+      const memberRows = await this.prisma.users.findMany({
+        where: {
+          modelable_type: 'App\\Models\\Workspace',
+          agency_user_id: agencyAgentId,
+        },
+        select: { modelable_id: true },
+      });
+      const ids = [...new Set(memberRows.map((r) => r.modelable_id))];
+      wsList = ids.length
+        ? await this.prisma.workspaces.findMany({
+            where: { id: { in: ids }, agency_id: agencyId, deleted_at: null, status: 'ACTIVE' },
+            orderBy: { created_at: 'desc' },
+          })
+        : [];
+    }
+
+    // Attach each workspace's domain (prefer the active one) for switching.
+    const ids = wsList.map((w) => w.id);
+    const domains = ids.length
+      ? await this.prisma.domains.findMany({
+          where: { modelable_type: 'App\\Models\\Workspace', modelable_id: { in: ids } },
+        })
+      : [];
+    const domainByWs = new Map<string, any>();
+    for (const d of domains) {
+      const key = String(d.modelable_id);
+      if (!domainByWs.has(key) || d.active) domainByWs.set(key, d);
+    }
+
+    return {
+      success: true,
+      workspaces: wsList.map((w) => {
+        const d = domainByWs.get(String(w.id));
+        return {
+          id: w.id.toString(),
+          name: w.name,
+          slug: w.slug,
+          sub_domain: d?.sub_domain ?? w.slug,
+          domain: d?.domain ?? null,
+        };
+      }),
+    };
+  }
+
+  /**
    * Get detailed workspace info including creator and status
    */
   async getWorkspace(workspaceId: bigint) {
@@ -167,6 +258,11 @@ export class WorkspacesService {
         full_name: true,
         email: true,
         status: true,
+        locale: true,
+        tfa_required: true,
+        mobile_access: true,
+        receive_sms_notification: true,
+        receive_whatsapp_notification: true,
       }
     });
 
@@ -183,13 +279,49 @@ export class WorkspacesService {
       where: { id: { in: roleIds } }
     });
 
+    // Batched phone/whatsapp read-back (with country iso2 for the form's country selector)
+    const mobiles = userIds.length
+      ? await this.prisma.contact_mobiles.findMany({
+          where: { modelable_type: 'App\\Models\\User', modelable_id: { in: userIds } },
+        })
+      : [];
+    const countryIds = [...new Set(mobiles.map(m => m.country_id))];
+    const countries = countryIds.length
+      ? await this.prisma.countries.findMany({ where: { id: { in: countryIds } } })
+      : [];
+    const iso2Of = (cid: any) => countries.find(c => c.id === cid)?.iso2 || '';
+
+    // Login policies (allowed hours / IP) per user
+    const policies = userIds.length
+      ? await this.prisma.user_login_policies.findMany({ where: { user_id: { in: userIds } } })
+      : [];
+
+    // Access scopes (system/custom fields, tags, agents) per user
+    const accesses = userIds.length
+      ? await this.prisma.user_accesses.findMany({ where: { user_id: { in: userIds } } })
+      : [];
+    const accessOf = (uid: bigint, type: string) =>
+      accesses.filter(a => a.user_id === uid && a.accessable_type === type).map(a => a.accessable_id.toString());
+
     return users.map(user => {
       const roleRelation = roleables.find(r => r.roleable_id === user.id);
       const role = roleRelation ? roles.find(r => r.id === BigInt(roleRelation.role_id)) : null;
+      const mob = mobiles.find(m => m.modelable_id === user.id && m.slug === 'mobile');
+      const wa = mobiles.find(m => m.modelable_id === user.id && m.slug === 'whatsapp');
+      const policy = policies.find(p => p.user_id === user.id) || null;
       return {
         ...user,
         role: role ? role.name : 'Agent',
-        role_id: role ? role.id.toString() : null
+        role_id: role ? role.id.toString() : null,
+        phone: mob?.mobile_number || '',
+        phone_country: mob ? iso2Of(mob.country_id) : '',
+        whatsapp: wa?.mobile_number || '',
+        whatsapp_country: wa ? iso2Of(wa.country_id) : '',
+        login_policy: policy,
+        systemFields: accessOf(user.id, 'App\\Models\\SystemField'),
+        customFields: accessOf(user.id, 'App\\Models\\CustomField'),
+        tags: accessOf(user.id, 'App\\Models\\Tag'),
+        agents: accessOf(user.id, 'App\\Models\\User'),
       };
     });
   }
@@ -198,11 +330,11 @@ export class WorkspacesService {
    * Add member to workspace (Invite logic)
    */
   async addMember(workspaceId: bigint, creatorId: bigint, data: any) {
-    const { email, first_name, last_name, role_id } = data;
-    
+    const { email, first_name, last_name, role_id, locale, tfa_required, mobile_access } = data;
+
     // Check if user already exists
-    let user = await this.prisma.users.findFirst({ 
-      where: { email, modelable_id: workspaceId, modelable_type: 'App\\Models\\Workspace' } 
+    let user = await this.prisma.users.findFirst({
+      where: { email, modelable_id: workspaceId, modelable_type: 'App\\Models\\Workspace' }
     });
 
     if (user) {
@@ -223,6 +355,11 @@ export class WorkspacesService {
         password: '', // Handled via invite link typically
         creator_id: creatorId,
         active_workspace_id: workspaceId,
+        locale: locale || 'en-US',
+        tfa_required: !!tfa_required,
+        mobile_access: mobile_access === false || mobile_access === 0 ? 0 : 1,
+        receive_sms_notification: !!data.receive_sms_notification,
+        receive_whatsapp_notification: !!data.receive_whatsapp_notification,
       },
     });
 
@@ -234,6 +371,26 @@ export class WorkspacesService {
           roleable_type: 'App\\Models\\User',
         },
       });
+    }
+
+    // Persist phone / whatsapp into contact_mobiles (replyagent parity)
+    try {
+      await this.upsertWorkspaceUserMobile(user.id, workspaceId, 'mobile', data.phone_country, data.phone);
+      await this.upsertWorkspaceUserMobile(user.id, workspaceId, 'whatsapp', data.whatsapp_country, data.whatsapp);
+    } catch (err: any) {
+      this.logger.warn(`Failed to save member contact numbers: ${err?.message ?? err}`);
+    }
+
+    try {
+      if (data.loginPolicy) await this.saveLoginPolicy(user.id, data.loginPolicy);
+    } catch (err: any) {
+      this.logger.warn(`Failed to save login policy: ${err?.message ?? err}`);
+    }
+
+    try {
+      await this.syncUserAccesses(user.id, data);
+    } catch (err: any) {
+      this.logger.warn(`Failed to save access scopes: ${err?.message ?? err}`);
     }
 
     return user;
@@ -264,8 +421,8 @@ export class WorkspacesService {
    * Update member
    */
   async updateMember(workspaceId: bigint, memberId: bigint, data: any) {
-    const { email, first_name, last_name, role_id } = data;
-    
+    const { email, first_name, last_name, role_id, locale, tfa_required, mobile_access } = data;
+
     // Convert to Prisma update data
     const updateData: any = {};
     if (email !== undefined) updateData.email = email;
@@ -274,6 +431,11 @@ export class WorkspacesService {
     if (first_name !== undefined || last_name !== undefined) {
       updateData.full_name = `${first_name || ''} ${last_name || ''}`.trim();
     }
+    if (locale !== undefined) updateData.locale = locale;
+    if (tfa_required !== undefined) updateData.tfa_required = !!tfa_required;
+    if (mobile_access !== undefined) updateData.mobile_access = mobile_access === false || mobile_access === 0 ? 0 : 1;
+    if (data.receive_sms_notification !== undefined) updateData.receive_sms_notification = !!data.receive_sms_notification;
+    if (data.receive_whatsapp_notification !== undefined) updateData.receive_whatsapp_notification = !!data.receive_whatsapp_notification;
 
     const updated = await this.prisma.users.updateMany({
       where: {
@@ -298,7 +460,142 @@ export class WorkspacesService {
       });
     }
 
+    // Persist phone / whatsapp into contact_mobiles (replyagent parity)
+    try {
+      await this.upsertWorkspaceUserMobile(memberId, workspaceId, 'mobile', data.phone_country, data.phone);
+      await this.upsertWorkspaceUserMobile(memberId, workspaceId, 'whatsapp', data.whatsapp_country, data.whatsapp);
+    } catch (err: any) {
+      this.logger.warn(`Failed to update member contact numbers: ${err?.message ?? err}`);
+    }
+
+    try {
+      if (data.loginPolicy) await this.saveLoginPolicy(memberId, data.loginPolicy);
+    } catch (err: any) {
+      this.logger.warn(`Failed to update login policy: ${err?.message ?? err}`);
+    }
+
+    try {
+      await this.syncUserAccesses(memberId, data);
+    } catch (err: any) {
+      this.logger.warn(`Failed to update access scopes: ${err?.message ?? err}`);
+    }
+
     return updated;
+  }
+
+  // Strip a phone number down to digits (mirrors replyagent ContactHelper::removeNumberFormating)
+  private cleanNumber(n: string): string {
+    return String(n ?? '').trim().replace(/^[0+]+/, '').replace(/[^0-9]/g, '');
+  }
+
+  /**
+   * Persist a workspace agent's mobile / whatsapp into contact_mobiles, polymorphic
+   * on the User, owned by the Workspace — mirrors replyagent ContactHelper::updateContactFields.
+   * One row per (user, slug). No value → nothing written.
+   */
+  private async upsertWorkspaceUserMobile(
+    userId: bigint,
+    workspaceId: bigint,
+    slug: 'mobile' | 'whatsapp',
+    iso2: string | undefined,
+    rawValue: string | undefined,
+  ) {
+    const digits = this.cleanNumber(rawValue ?? '');
+    if (!digits) return;
+
+    const country = iso2
+      ? await this.prisma.countries.findFirst({ where: { iso2: iso2.toUpperCase() } })
+      : null;
+    if (!country) return; // country_id is required on contact_mobiles
+
+    const phoneCode = String(country.phone_code ?? '').replace(/[^0-9]/g, '');
+    const national = `${phoneCode}${digits}`;
+    const full = `+${national}`;
+
+    const fields = {
+      country_id: country.id,
+      country_code: country.phone_code ?? null,
+      mobile_number: digits,
+      national_mobile_number: national,
+      full_mobile_number: full,
+      type: slug,
+      is_primary: 1,
+      updated_at: new Date(),
+    };
+
+    const existing = await this.prisma.contact_mobiles.findFirst({
+      where: { modelable_type: 'App\\Models\\User', modelable_id: userId, slug },
+    });
+
+    if (existing) {
+      await this.prisma.contact_mobiles.update({ where: { id: existing.id }, data: fields });
+    } else {
+      await this.prisma.contact_mobiles.create({
+        data: {
+          ...fields,
+          slug,
+          modelable_type: 'App\\Models\\User',
+          modelable_id: userId,
+          ownership_type: 'App\\Models\\Workspace',
+          ownership_id: workspaceId,
+        },
+      });
+    }
+  }
+
+  /**
+   * Upsert a user's login policy (allowed login hours per weekday + IP restriction).
+   * One row per user — mirrors replyagent user_login_policies / saveAccessParams.
+   */
+  private async saveLoginPolicy(userId: bigint, policy: any) {
+    if (!policy || typeof policy !== 'object') return;
+    const days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+    const data: any = {
+      limit_by_ip: !!policy.limit_by_ip,
+      ip: policy.ip || null,
+      updated_at: new Date(),
+    };
+    for (const d of days) {
+      data[`${d}_login`] = policy[`${d}_login`] || null;
+      data[`${d}_logout`] = policy[`${d}_logout`] || null;
+    }
+    const existing = await this.prisma.user_login_policies.findFirst({ where: { user_id: userId } });
+    if (existing) {
+      await this.prisma.user_login_policies.update({ where: { id: existing.id }, data });
+    } else {
+      await this.prisma.user_login_policies.create({ data: { ...data, user_id: userId } });
+    }
+  }
+
+  // Morph types for the agent access scopes (replyagent user_accesses)
+  private static ACCESS_TYPES: { key: string; type: string }[] = [
+    { key: 'systemFields', type: 'App\\Models\\SystemField' },
+    { key: 'customFields', type: 'App\\Models\\CustomField' },
+    { key: 'tags', type: 'App\\Models\\Tag' },
+    { key: 'agents', type: 'App\\Models\\User' },
+  ];
+
+  /**
+   * Sync an agent's access scopes (which system fields / custom fields / tags / agents
+   * they can see) into the polymorphic user_accesses table — mirrors replyagent saveAccessParams.
+   * Only the kinds actually present in `data` are touched, so other scopes (e.g. channels) survive.
+   */
+  private async syncUserAccesses(userId: bigint, data: any) {
+    const provided = WorkspacesService.ACCESS_TYPES.filter((m) => Array.isArray(data[m.key]));
+    if (provided.length === 0) return;
+    const types = provided.map((m) => m.type);
+    await this.prisma.user_accesses.deleteMany({
+      where: { user_id: userId, accessable_type: { in: types } },
+    });
+    const rows: any[] = [];
+    for (const m of provided) {
+      for (const x of data[m.key] as any[]) {
+        let id: bigint;
+        try { id = BigInt(x); } catch { continue; }
+        if (id > 0n) rows.push({ user_id: userId, accessable_type: m.type, accessable_id: id });
+      }
+    }
+    if (rows.length) await this.prisma.user_accesses.createMany({ data: rows });
   }
 
   /**
