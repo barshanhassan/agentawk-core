@@ -59,6 +59,7 @@ import { ConversationEventsModule } from './conversation-events/conversation-eve
 import { SupervisorChatStatisticsModule } from './supervisor-chat-statistics/supervisor-chat-statistics.module';
 import { QuickResponseModule } from './quick-response/quick-response.module';
 import { CompaniesModule } from './companies/companies.module';
+import { S3Module } from './s3/s3.module';
 import { ServeStaticModule } from '@nestjs/serve-static';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -132,6 +133,7 @@ import { PermissionsGuard } from './auth/permissions.guard';
     IntegrationsModule,
     QuickResponseModule,
     CompaniesModule,
+    S3Module,
     WidgetsModule,
     IframesModule,
     ZapiModule,

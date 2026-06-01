@@ -5,14 +5,19 @@ import {
   Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { S3Service } from '../s3/s3.service';
 import * as crypto from 'crypto';
 import * as bcrypt from 'bcrypt';
+import * as path from 'path';
 
 @Injectable()
 export class UsersService {
   private readonly logger = new Logger(UsersService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly s3: S3Service,
+  ) {}
 
   /**
    * Update User Name, Email, Profile details.
@@ -102,27 +107,94 @@ export class UsersService {
   }
 
   /**
-   * Profile Avatar Upload Logic (Stub matching Laravel's base64 logic or Multipart).
+   * Profile Avatar Upload — replyagent parity: avatar persists as a media_gallery row
+   * and users.gallery_media_id references it. Accepts a multipart file OR base64 data URL.
+   * Returns a 1h signed URL the frontend can render immediately.
    */
   async uploadProfileLogo(
     userId: bigint,
-    file: Express.Multer.File | any,
+    file: Express.Multer.File | string | any,
     isBase64 = false,
   ) {
-    // Implementation logic abstractly stores image
-    // In real NestJS implementation with Cloudflare/S3 - we push the buffer to bucket
-    const fileUrl = `https://dummy-bucket.s3.amazonaws.com/avatars/${userId}-${Date.now()}.png`;
+    const user = await this.prisma.users.findUnique({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
 
-    await this.prisma.users.update({
-      where: { id: userId },
+    // 1. Normalise input → { buffer, mime, ext, originalName }
+    let buffer: Buffer;
+    let mime = 'image/png';
+    let ext = 'png';
+    let originalName = 'avatar';
+
+    if (isBase64 && typeof file === 'string') {
+      const match = file.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
+      if (!match) throw new BadRequestException('Invalid base64 image');
+      mime = match[1];
+      buffer = Buffer.from(match[2], 'base64');
+      ext = mime.split('/')[1] || 'png';
+    } else if (file && typeof file === 'object' && (file as Express.Multer.File).buffer) {
+      const f = file as Express.Multer.File;
+      buffer = f.buffer;
+      mime = f.mimetype || 'image/png';
+      originalName = f.originalname || 'avatar';
+      ext = (path.extname(originalName).replace(/^\./, '') || mime.split('/')[1] || 'png').toLowerCase();
+    } else {
+      throw new BadRequestException('No file provided');
+    }
+
+    if (!mime.startsWith('image/')) {
+      throw new BadRequestException('Avatar must be an image');
+    }
+
+    // 2. Resolve scoped path (parity with GalleryHelper::getUserPath in replyagent).
+    let folderPath: string;
+    if (user.modelable_type === 'App\\Models\\Agency' && user.modelable_id) {
+      folderPath = S3Service.getAgencyPath(user.modelable_id.toString(), 'avatars');
+    } else if (user.modelable_type === 'App\\Models\\Workspace' && user.modelable_id) {
+      folderPath = S3Service.getWorkspacePath(user.modelable_id.toString(), 'avatars');
+    } else {
+      folderPath = `gallery/users/`;
+    }
+    const objectId = `${Math.floor(Date.now() / 1000)}_${crypto.randomBytes(8).toString('hex')}`;
+    const filePath = `${folderPath}u${userId}_${objectId}.${ext}`;
+
+    // 3. Upload to S3.
+    const uploaded = await this.s3.upload(buffer, filePath, mime);
+    if (!uploaded) throw new BadRequestException('Failed to upload avatar to storage');
+
+    // 4. Persist as media_gallery (replyagent stores avatars in gallery).
+    const media = await this.prisma.media_gallery.create({
       data: {
-        /* Add gallery mapping if image uploads */
+        workspace_id: user.modelable_type === 'App\\Models\\Workspace' ? user.modelable_id : null,
+        user_id: userId,
+        modelable_id: user.modelable_id ?? userId,
+        modelable_type: user.modelable_type ?? 'App\\Models\\User',
+        object_id: objectId,
+        object_name: originalName.slice(0, 100),
+        media_type: 'IMAGE',
+        file_url: filePath.slice(0, 500),
+        file_path: filePath.slice(0, 500),
+        mime_type: mime.slice(0, 50),
+        extension: ext.slice(0, 10),
+        file_size: buffer.length,
+        object_status: 'AVAILABLE',
+        privacy: 'PRIVATE',
       },
     });
 
+    // 5. Reference on user; best-effort delete the previous avatar file.
+    if (user.gallery_media_id && user.gallery_media_id !== media.id) {
+      const prev = await this.prisma.media_gallery.findUnique({ where: { id: user.gallery_media_id } });
+      if (prev?.file_path) await this.s3.delete(prev.file_path);
+    }
+    await this.prisma.users.update({
+      where: { id: userId },
+      data: { gallery_media_id: media.id },
+    });
+
+    const signed = (await this.s3.getSignedUrl(filePath, 3600)) || '';
     return {
       success: true,
-      logo: fileUrl,
+      logo: signed,
       message: 'Avatar updated successfully',
     };
   }

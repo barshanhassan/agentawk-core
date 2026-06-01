@@ -7,6 +7,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { ChargebeeService } from '../billing/chargebee.service';
 import { DomainsService } from '../domains/domains.service';
+import { S3Service } from '../s3/s3.service';
 import * as bcrypt from 'bcrypt';
 
 // Date-only strings (YYYY-MM-DD) need explicit start/end-of-day so a request
@@ -30,7 +31,16 @@ export class AgencyService {
     private readonly prisma: PrismaService,
     private readonly chargebee: ChargebeeService,
     private readonly domainsService: DomainsService,
+    private readonly s3: S3Service,
   ) { }
+
+  /** If the value looks like an S3 key (no scheme), return a 1h signed URL; otherwise pass-through. */
+  private async toDisplayUrl(value: string | null | undefined): Promise<string> {
+    if (!value) return '';
+    if (/^https?:\/\//i.test(value)) return value; // already an absolute URL
+    const signed = await this.s3.getSignedUrl(value, 3600);
+    return signed || '';
+  }
 
   // ─── Agency Profile & Branding ──────────────────────────────────────
 
@@ -51,18 +61,26 @@ export class AgencyService {
       },
     });
 
-    // Resolve media URLs
+    // Resolve all 4 logo URLs + favicon → signed URLs.
+    // Replyagent Branding accessor parity: logo_light, logo_light_small, logo_dark, logo_dark_small, favicon.
+    const resolveById = async (id: bigint | null | undefined): Promise<string> => {
+      if (!id) return '';
+      const m = await this.prisma.media_gallery.findUnique({ where: { id } });
+      return this.toDisplayUrl(m?.file_url);
+    };
     let logoUrl = '';
+    let logoSmallUrl = '';
+    let logoDarkUrl = '';
+    let logoDarkSmallUrl = '';
     let faviconUrl = '';
     if (branding) {
-      if (branding.mid_logo_light) {
-        const logo = await this.prisma.media_gallery.findUnique({ where: { id: branding.mid_logo_light } });
-        logoUrl = logo?.file_url || '';
-      }
-      if (branding.favicon_media_id) {
-        const fav = await this.prisma.media_gallery.findUnique({ where: { id: branding.favicon_media_id } });
-        faviconUrl = fav?.file_url || '';
-      }
+      [logoUrl, logoSmallUrl, logoDarkUrl, logoDarkSmallUrl, faviconUrl] = await Promise.all([
+        resolveById(branding.mid_logo_light),
+        resolveById(branding.mid_logo_light_small),
+        resolveById(branding.mid_logo_dark),
+        resolveById(branding.mid_logo_dark_small),
+        resolveById(branding.favicon_media_id),
+      ]);
     }
 
     return {
@@ -71,8 +89,14 @@ export class AgencyService {
         ...this.serialize(agency),
         branding: branding ? {
           ...this.serialize(branding),
-          logo: logoUrl,
-          favicon: faviconUrl
+          // Replyagent parity field names + legacy aliases for backward compatibility.
+          logo_light: logoUrl,
+          logo_light_small: logoSmallUrl,
+          logo_dark: logoDarkUrl,
+          logo_dark_small: logoDarkSmallUrl,
+          logo: logoUrl,            // legacy alias (= logo_light)
+          logo_small: logoSmallUrl, // legacy alias (= logo_light_small)
+          favicon: faviconUrl,
         } : null,
         address: address ? this.serialize(address) : null
       }
@@ -192,12 +216,32 @@ export class AgencyService {
     const updateData: any = {};
     if (data.color !== undefined) updateData.color = data.color;
 
-    // Helper to handle media URLs
-    const getMediaId = async (url: string, objectName: string) => {
-      if (!url) return null;
-      // Check if media already exists for this agency and url
+    // Resolve a media reference to a media_gallery.id (replyagent Branding parity).
+    // Accepts: explicit numeric/bigint media_id; S3 key (e.g. "gallery/a1/abc.jpg"); a signed URL
+    // whose URL.pathname is the S3 key. Returns null to clear the slot.
+    const resolveMediaId = async (
+      val: string | number | bigint | null | undefined,
+      objectName: string,
+    ): Promise<bigint | null> => {
+      if (val === null || val === undefined || val === '') return null;
+
+      // numeric id (id or bigint) → trust it
+      if (typeof val === 'number' || typeof val === 'bigint') return BigInt(val);
+      if (/^\d+$/.test(String(val))) return BigInt(String(val));
+
+      // Normalise: if it's a presigned URL, strip the query + scheme to the bucket path.
+      let key = String(val);
+      try {
+        if (/^https?:\/\//i.test(key)) {
+          const u = new URL(key);
+          key = u.pathname.replace(/^\//, '');
+        }
+      } catch {
+        /* leave as-is */
+      }
+
       let media = await this.prisma.media_gallery.findFirst({
-        where: { modelable_id: agencyId, modelable_type: 'App\\Models\\Agency', file_url: url }
+        where: { OR: [{ file_url: key }, { file_path: key }] },
       });
 
       if (!media) {
@@ -205,24 +249,40 @@ export class AgencyService {
           data: {
             modelable_id: agencyId,
             modelable_type: 'App\\Models\\Agency',
-            file_url: url,
-            object_name: objectName,
+            file_url: key,
+            file_path: key,
+            object_name: objectName.slice(0, 100),
             media_type: 'IMAGE',
-            object_status: 'AVAILABLE'
-          }
+            object_status: 'AVAILABLE',
+          },
         });
       }
       return media.id;
     };
 
-    if (data.logo !== undefined) {
-      const mediaId = await getMediaId(data.logo, 'Agency Logo');
-      updateData.mid_logo_light = mediaId;
+    // Accept both replyagent-parity field names and legacy aliases.
+    if (data.logo_light !== undefined) {
+      updateData.mid_logo_light = await resolveMediaId(data.logo_light, 'Agency Logo Light');
+    } else if (data.logo !== undefined) {
+      updateData.mid_logo_light = await resolveMediaId(data.logo, 'Agency Logo Light');
+    }
+
+    if (data.logo_light_small !== undefined) {
+      updateData.mid_logo_light_small = await resolveMediaId(data.logo_light_small, 'Agency App Icon Light');
+    } else if (data.logo_small !== undefined) {
+      updateData.mid_logo_light_small = await resolveMediaId(data.logo_small, 'Agency App Icon Light');
+    }
+
+    if (data.logo_dark !== undefined) {
+      updateData.mid_logo_dark = await resolveMediaId(data.logo_dark, 'Agency Logo Dark');
+    }
+
+    if (data.logo_dark_small !== undefined) {
+      updateData.mid_logo_dark_small = await resolveMediaId(data.logo_dark_small, 'Agency App Icon Dark');
     }
 
     if (data.favicon !== undefined) {
-      const mediaId = await getMediaId(data.favicon, 'Agency Favicon');
-      updateData.favicon_media_id = mediaId;
+      updateData.favicon_media_id = await resolveMediaId(data.favicon, 'Agency Favicon');
     }
 
     const updatedBranding = await this.prisma.brandings.update({

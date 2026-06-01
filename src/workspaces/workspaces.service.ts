@@ -6,12 +6,24 @@ import {
   Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { S3Service } from '../s3/s3.service';
 
 @Injectable()
 export class WorkspacesService {
   private readonly logger = new Logger(WorkspacesService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly s3: S3Service,
+  ) {}
+
+  /** S3 key → 1h signed URL (pass-through for absolute URLs / empty). */
+  private async toDisplayUrl(value: string | null | undefined): Promise<string> {
+    if (!value) return '';
+    if (/^https?:\/\//i.test(value)) return value;
+    const signed = await this.s3.getSignedUrl(value, 3600);
+    return signed || '';
+  }
 
   /**
    * Workspaces the logged-in user can switch to (mirrors replyagent's
@@ -193,7 +205,9 @@ export class WorkspacesService {
   }
 
   /**
-   * Get formatting/branding settings for White Label 
+   * Get formatting/branding settings for White Label.
+   * Resolves mid_logo_* and favicon_media_id FK → media_gallery.file_url → signed URL
+   * (replyagent Branding model accessor parity — logo/favicon getters).
    */
   async getWorkspaceBranding(workspaceId: bigint) {
     let branding = await this.prisma.brandings.findFirst({
@@ -215,12 +229,102 @@ export class WorkspacesService {
       });
     }
 
-    return branding;
+    const resolve = async (id: bigint | null | undefined): Promise<string> => {
+      if (!id) return '';
+      const m = await this.prisma.media_gallery.findUnique({ where: { id } });
+      return this.toDisplayUrl(m?.file_url);
+    };
+
+    const [logo_light_url, logo_light_small_url, logo_dark_url, logo_dark_small_url, favicon_url] =
+      await Promise.all([
+        resolve(branding.mid_logo_light),
+        resolve(branding.mid_logo_light_small),
+        resolve(branding.mid_logo_dark),
+        resolve(branding.mid_logo_dark_small),
+        resolve(branding.favicon_media_id),
+      ]);
+
+    // Replyagent fallback parity: when a workspace logo slot is empty, fall back to the
+    // parent agency's branding logo so the agency's brand identity carries through.
+    const workspace = await this.prisma.workspaces.findUnique({
+      where: { id: workspaceId },
+      select: { agency_id: true },
+    });
+    let agencyBranding: any = null;
+    if (workspace?.agency_id) {
+      agencyBranding = await this.prisma.brandings.findFirst({
+        where: { brandable_id: workspace.agency_id, brandable_type: 'App\\Models\\Agency' },
+      });
+    }
+    let agencyLogoLight = '', agencyLogoLightSmall = '', agencyLogoDark = '', agencyLogoDarkSmall = '', agencyFavicon = '';
+    if (agencyBranding) {
+      [agencyLogoLight, agencyLogoLightSmall, agencyLogoDark, agencyLogoDarkSmall, agencyFavicon] = await Promise.all([
+        resolve(agencyBranding.mid_logo_light),
+        resolve(agencyBranding.mid_logo_light_small),
+        resolve(agencyBranding.mid_logo_dark),
+        resolve(agencyBranding.mid_logo_dark_small),
+        resolve(agencyBranding.favicon_media_id),
+      ]);
+    }
+
+    return {
+      ...branding,
+      // Effective URLs (workspace's own → fall back to parent agency's).
+      logo_light_url: logo_light_url || agencyLogoLight,
+      logo_light_small_url: logo_light_small_url || agencyLogoLightSmall,
+      logo_dark_url: logo_dark_url || agencyLogoDark,
+      logo_dark_small_url: logo_dark_small_url || agencyLogoDarkSmall,
+      favicon_url: favicon_url || agencyFavicon,
+    };
+  }
+
+  /**
+   * Accepts a media reference (numeric id, raw S3 key, or signed URL) and resolves it
+   * to media_gallery.id. Mirrors agency.service resolver for parity.
+   */
+  private async resolveBrandingMediaId(
+    val: string | number | bigint | null | undefined,
+    workspaceId: bigint,
+    objectName: string,
+  ): Promise<bigint | null> {
+    if (val === null || val === undefined || val === '') return null;
+    if (typeof val === 'number' || typeof val === 'bigint') return BigInt(val);
+    if (/^\d+$/.test(String(val))) return BigInt(String(val));
+
+    let key = String(val);
+    try {
+      if (/^https?:\/\//i.test(key)) {
+        const u = new URL(key);
+        key = u.pathname.replace(/^\//, '');
+      }
+    } catch {
+      /* leave as-is */
+    }
+
+    let media = await this.prisma.media_gallery.findFirst({
+      where: { OR: [{ file_url: key }, { file_path: key }] },
+    });
+
+    if (!media) {
+      media = await this.prisma.media_gallery.create({
+        data: {
+          workspace_id: workspaceId,
+          modelable_id: workspaceId,
+          modelable_type: 'App\\Models\\Workspace',
+          file_url: key,
+          file_path: key,
+          object_name: objectName.slice(0, 100),
+          media_type: 'IMAGE',
+          object_status: 'AVAILABLE',
+        },
+      });
+    }
+    return media.id;
   }
 
   async updateWorkspaceBranding(workspaceId: bigint, data: any) {
     const branding = await this.getWorkspaceBranding(workspaceId);
-    
+
     const updateData: any = {};
     if (data.mainTheme !== undefined) updateData.color = data.mainTheme;
     if (data.links !== undefined) updateData.link_color = data.links;
@@ -228,18 +332,40 @@ export class WorkspacesService {
     if (data.incomingText !== undefined) updateData.incoming_chat_text_color = data.incomingText;
     if (data.outgoingBubble !== undefined) updateData.outgoing_chat_color = data.outgoingBubble;
     if (data.outgoingText !== undefined) updateData.outgoing_chat_text_color = data.outgoingText;
-    
-    // Logo and Favicon IDs
-    if (data.logoLightId !== undefined) updateData.mid_logo_light = BigInt(data.logoLightId);
-    if (data.logoLightSmallId !== undefined) updateData.mid_logo_light_small = BigInt(data.logoLightSmallId);
-    if (data.logoDarkId !== undefined) updateData.mid_logo_dark = BigInt(data.logoDarkId);
-    if (data.logoDarkSmallId !== undefined) updateData.mid_logo_dark_small = BigInt(data.logoDarkSmallId);
-    if (data.faviconId !== undefined) updateData.favicon_media_id = BigInt(data.faviconId);
 
-    return this.prisma.brandings.update({
+    // Logo / Favicon — accept id OR file_url OR signed URL OR null (to clear).
+    if (data.logoLight !== undefined)
+      updateData.mid_logo_light = await this.resolveBrandingMediaId(data.logoLight, workspaceId, 'Workspace Logo Light');
+    if (data.logoLightId !== undefined)
+      updateData.mid_logo_light = data.logoLightId === null ? null : BigInt(data.logoLightId);
+
+    if (data.logoLightSmall !== undefined)
+      updateData.mid_logo_light_small = await this.resolveBrandingMediaId(data.logoLightSmall, workspaceId, 'Workspace Logo Light Small');
+    if (data.logoLightSmallId !== undefined)
+      updateData.mid_logo_light_small = data.logoLightSmallId === null ? null : BigInt(data.logoLightSmallId);
+
+    if (data.logoDark !== undefined)
+      updateData.mid_logo_dark = await this.resolveBrandingMediaId(data.logoDark, workspaceId, 'Workspace Logo Dark');
+    if (data.logoDarkId !== undefined)
+      updateData.mid_logo_dark = data.logoDarkId === null ? null : BigInt(data.logoDarkId);
+
+    if (data.logoDarkSmall !== undefined)
+      updateData.mid_logo_dark_small = await this.resolveBrandingMediaId(data.logoDarkSmall, workspaceId, 'Workspace Logo Dark Small');
+    if (data.logoDarkSmallId !== undefined)
+      updateData.mid_logo_dark_small = data.logoDarkSmallId === null ? null : BigInt(data.logoDarkSmallId);
+
+    if (data.favicon !== undefined)
+      updateData.favicon_media_id = await this.resolveBrandingMediaId(data.favicon, workspaceId, 'Workspace Favicon');
+    if (data.faviconId !== undefined)
+      updateData.favicon_media_id = data.faviconId === null ? null : BigInt(data.faviconId);
+
+    await this.prisma.brandings.update({
       where: { id: branding.id },
       data: updateData,
     });
+
+    // Return the freshly-resolved view (signed URLs included).
+    return this.getWorkspaceBranding(workspaceId);
   }
 
   /**

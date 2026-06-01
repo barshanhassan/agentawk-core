@@ -1,25 +1,21 @@
 // @ts-nocheck
 import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import * as fs from 'fs';
 import * as path from 'path';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
 import * as crypto from 'crypto';
+import { S3Service } from '../s3/s3.service';
 
 @Injectable()
 export class GalleryService {
   private readonly logger = new Logger(GalleryService.name);
-  private readonly uploadPath = path.join(process.cwd(), 'uploads');
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly httpService: HttpService,
-  ) {
-    if (!fs.existsSync(this.uploadPath)) {
-      fs.mkdirSync(this.uploadPath, { recursive: true });
-    }
-  }
+    private readonly s3: S3Service,
+  ) {}
 
   private generateObjectId(): string {
     return (
@@ -61,25 +57,25 @@ export class GalleryService {
     const uploadedMedia = [];
     for (const file of files) {
       const objectId = this.generateObjectId();
-      let fileUrl = '';
-      let filePath = '';
-
-      // Local Upload Logic (replacing S3/CF for development)
       const extension = path.extname(file.originalname);
-      const fileName = `${objectId}${extension}`;
-      const fullFilePath = path.join(this.uploadPath, fileName);
 
-      try {
-        fs.writeFileSync(fullFilePath, file.buffer);
-        fileUrl = `/uploads/${fileName}`;
-        filePath = fileName;
-        this.logger.log(
-          `Saved ${file.originalname} locally to ${fullFilePath}`,
+      // S3 upload — replyagent parity: gallery/w{workspaceId}/{objectId}{ext}
+      const filePath =
+        S3Service.getWorkspacePath(workspaceId.toString()) +
+        `${objectId}${extension}`;
+
+      const uploaded = await this.s3.upload(
+        file.buffer,
+        filePath,
+        file.mimetype,
+      );
+      if (!uploaded) {
+        throw new BadRequestException(
+          `Failed to upload ${file.originalname} to storage`,
         );
-      } catch (error) {
-        this.logger.error(`Failed to save file: ${error.message}`);
-        throw new BadRequestException('Failed to save file locally');
       }
+      // file_url stores S3 key; getMediaListings rewrites it to a signed URL on read.
+      const fileUrl = filePath;
 
       const mime = file.mimetype.toLowerCase();
       let mediaType: 'IMAGE' | 'VIDEO' | 'AUDIO' | 'DOCUMENT' | 'FILE' = 'FILE';
@@ -93,6 +89,8 @@ export class GalleryService {
       )
         mediaType = 'DOCUMENT';
 
+      // Defensive truncation — schema columns are bounded (mime_type 50, extension 10, object_name 100,
+      // file_path 500) and real-world office mimes (xlsx/docx/pptx) exceed 70 chars.
       const media = await this.prisma.media_gallery.create({
         data: {
           workspace_id: workspaceId,
@@ -101,11 +99,12 @@ export class GalleryService {
           modelable_type: modelableType,
           parent_id: folder ? folder.id : null,
           object_id: objectId,
-          object_name: file.originalname,
+          object_name: file.originalname.slice(0, 100),
           media_type: mediaType,
-          file_url: fileUrl,
-          file_path: filePath,
-          mime_type: file.mimetype,
+          file_url: fileUrl.slice(0, 500),
+          file_path: filePath.slice(0, 500),
+          mime_type: file.mimetype ? file.mimetype.slice(0, 50) : null,
+          extension: extension ? extension.replace(/^\./, '').slice(0, 10) : null,
           file_size: file.size,
           object_status: 'AVAILABLE',
           privacy: 'PRIVATE',
@@ -249,10 +248,21 @@ export class GalleryService {
       this.prisma.media_gallery.count({ where: filesWhere }),
     ]);
 
+    // Replace stored S3 key in file_url with a fresh 1h signed URL
+    const filesWithSignedUrls = await Promise.all(
+      files.map(async (f) => {
+        if (f.file_path && f.media_type !== 'FOLDER') {
+          const signed = await this.s3.getSignedUrl(f.file_path, 3600);
+          if (signed) return { ...f, file_url: signed };
+        }
+        return f;
+      }),
+    );
+
     return {
       folders,
       file_folders: {
-        data: files,
+        data: filesWithSignedUrls,
         total: totalFiles,
         current_page: page,
         last_page: Math.ceil(totalFiles / limit),
@@ -297,6 +307,11 @@ export class GalleryService {
 
     if (!media || media.user_id !== userId) {
       throw new BadRequestException('Invalid request or access denied');
+    }
+
+    // Best-effort S3 cleanup before DB delete (folders have no file_path)
+    if (media.file_path && media.media_type !== 'FOLDER') {
+      await this.s3.delete(media.file_path);
     }
 
     // Perform hard delete from database
