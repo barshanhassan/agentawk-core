@@ -70,8 +70,11 @@ export class GalleryService {
         file.mimetype,
       );
       if (!uploaded) {
+        // Include the S3 SDK error so the frontend toast surfaces the root cause
+        // (e.g. InvalidAccessKeyId, AccessDenied) — easier than scraping Cloud Run logs.
+        const detail = this.s3.lastError ? ` — ${this.s3.lastError}` : '';
         throw new BadRequestException(
-          `Failed to upload ${file.originalname} to storage`,
+          `Failed to upload ${file.originalname} to storage${detail}`,
         );
       }
       // file_url stores S3 key; getMediaListings rewrites it to a signed URL on read.

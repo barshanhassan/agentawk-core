@@ -46,12 +46,16 @@ export class S3Service {
 
   // ──────────────────────────── Core operations ────────────────────────────
 
+  /** Last upload error (set by upload() on failure, used by callers to surface root cause). */
+  public lastError: string | null = null;
+
   /** Upload a buffer/string to S3 at filePath. Returns the S3 key on success, null on failure. */
   async upload(
     content: Buffer | Uint8Array | string,
     filePath: string,
     contentType?: string,
   ): Promise<string | null> {
+    this.lastError = null;
     try {
       await this.client.send(
         new PutObjectCommand({
@@ -64,7 +68,12 @@ export class S3Service {
       );
       return filePath;
     } catch (e: any) {
-      this.logger.error(`upload failed (${filePath}): ${e?.message || e}`);
+      // Surface the AWS SDK error code + message so the caller can include it in the
+      // API response — much easier to debug than digging through Cloud Run logs.
+      const code = e?.Code || e?.name || 'UnknownError';
+      const msg = e?.message || String(e);
+      this.lastError = `[${code}] ${msg}`;
+      this.logger.error(`upload failed (${filePath}): ${this.lastError}`);
       return null;
     }
   }

@@ -159,7 +159,10 @@ export class UsersService {
 
     // 3. Upload to S3.
     const uploaded = await this.s3.upload(buffer, filePath, mime);
-    if (!uploaded) throw new BadRequestException('Failed to upload avatar to storage');
+    if (!uploaded) {
+      const detail = this.s3.lastError ? ` — ${this.s3.lastError}` : '';
+      throw new BadRequestException(`Failed to upload avatar to storage${detail}`);
+    }
 
     // 4. Persist as media_gallery (replyagent stores avatars in gallery).
     const media = await this.prisma.media_gallery.create({
