@@ -6,6 +6,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import * as crypto from 'crypto';
 
 @Injectable()
 export class AutomationsService {
@@ -13,16 +14,49 @@ export class AutomationsService {
 
   constructor(private readonly prisma: PrismaService) {}
 
+  // Replyagent parity: Str::random(50) for slugs. Used for sharing (import-by-slug)
+  // and for connection routing (step/activity slugs travel between version clones).
+  private generateSlug(bytes = 20): string {
+    return crypto.randomBytes(bytes).toString('hex'); // 40 chars hex, fits VARCHAR(50)
+  }
+
   /**
-   * Get list of automations with folder information
+   * Get list of automations + folders — replyagent parity for filters.
+   *   - folder_id: ALL | <id> | null (root)
+   *   - search:    LIKE %name%
+   *   - users:     whereIn(creator_id) — for filtering by creator
+   *   - status:    by default exclude draft+unpublished+archive unless include_unpublished
+   *   - excludes soft-deleted (deleted_at IS NULL)
+   *   - excludes moduleable (sub-automations attached to bundles, etc.)
+   * Also enriches each row with `created_by` info so the page can render creator avatars
+   * without a separate users fetch.
    */
   async getAutomations(workspaceId: bigint, filters: any) {
-    const where: any = { workspace_id: workspaceId };
+    const where: any = {
+      workspace_id: workspaceId,
+      deleted_at: null,
+      moduleable_id: null,
+    };
 
     if (filters.folder_id && filters.folder_id !== 'ALL') {
       where.folder_id = BigInt(filters.folder_id);
-    } else if (filters.folder_id === undefined || filters.folder_id === null) {
-      // where.folder_id = null; // Laravel seems to show root if null
+    }
+
+    if (filters.search) {
+      where.name = { contains: String(filters.search) };
+    }
+
+    if (filters.users) {
+      const userIds = Array.isArray(filters.users)
+        ? filters.users
+        : String(filters.users).split(',').filter(Boolean);
+      if (userIds.length) {
+        where.creator_id = { in: userIds.map((u: any) => BigInt(u)) };
+      }
+    }
+
+    if (!filters.include_unpublished) {
+      where.status = { in: ['draft', 'active', 'error', 'archive'] };
     }
 
     const automations = await this.prisma.automations.findMany({
@@ -30,52 +64,117 @@ export class AutomationsService {
       orderBy: { id: 'desc' },
     });
 
+    // Resolve creator details (only the IDs we actually need)
+    const creatorIds = [...new Set(automations.map((a: any) => a.creator_id).filter(Boolean))];
+    const creators = creatorIds.length
+      ? await this.prisma.users.findMany({
+          where: { id: { in: creatorIds as any } },
+          select: { id: true, first_name: true, last_name: true, email: true },
+        })
+      : [];
+    const creatorMap = new Map(creators.map((c: any) => [c.id.toString(), c]));
+
+    const enriched = automations.map((a: any) => ({
+      ...a,
+      created_by: creatorMap.get(a.creator_id?.toString()) || null,
+      last_updated: a.updated_at,
+    }));
+
     const folders = await this.prisma.automation_folders.findMany({
       where: { workspace_id: workspaceId },
     });
 
-    return { success: true, automations, folders };
+    return { success: true, automations: enriched, folders };
   }
 
   /**
-   * Get full automation data including versions and steps
+   * Get full automation data including the requested version's steps + activities.
+   * Replyagent: ?mode=published falls back to draft if no published version exists.
    */
-  async getAutomation(workspaceId: bigint, automationId: bigint) {
+  async getAutomation(workspaceId: bigint, automationId: bigint, mode: string = 'draft') {
     const automation = await this.prisma.automations.findFirst({
-      where: { id: automationId, workspace_id: workspaceId },
-      include: {
-        automation_versions: {
-          include: {
-            automation_steps: {
-              orderBy: { id: 'asc' },
-            },
-          },
-        },
-      },
+      where: { id: automationId, workspace_id: workspaceId, deleted_at: null },
     });
-
     if (!automation) throw new NotFoundException('Automation not found');
 
-    return { success: true, automation };
+    // Mode resolution (replyagent parity)
+    let versionId: bigint | null = null;
+    let resolvedMode = 'draft';
+    if (mode === 'published' && automation.published_version_id) {
+      versionId = automation.published_version_id as any;
+      resolvedMode = 'published';
+    } else {
+      versionId = automation.draft_version_id as any;
+    }
+
+    // Schema has no Prisma `relation` between automation_versions and automation_steps,
+    // and no relation between automation_steps and automation_step_activities. We can't
+    // `include` them — fetch separately by FK and stitch.
+    let version: any = null;
+    if (versionId) {
+      const versionRow = await this.prisma.automation_versions.findUnique({
+        where: { id: versionId },
+      });
+      if (versionRow) {
+        const steps = await this.prisma.automation_steps.findMany({
+          where: { automation_version_id: versionRow.id, deleted_at: null },
+          orderBy: { id: 'asc' },
+        });
+        const stepIds = steps.map((s: any) => s.id);
+        const activities = stepIds.length
+          ? await this.prisma.automation_step_activities.findMany({
+              where: { step_id: { in: stepIds }, deleted_at: null },
+              orderBy: { order: 'asc' },
+            })
+          : [];
+        const activitiesByStep = new Map<string, any[]>();
+        for (const a of activities) {
+          const key = a.step_id.toString();
+          if (!activitiesByStep.has(key)) activitiesByStep.set(key, []);
+          activitiesByStep.get(key)!.push(a);
+        }
+        version = {
+          ...versionRow,
+          automation_steps: steps.map((s: any) => ({
+            ...s,
+            automation_step_activities: activitiesByStep.get(s.id.toString()) || [],
+          })),
+        };
+      }
+    }
+
+    return { success: true, automation: { ...automation, version }, mode: resolvedMode };
   }
 
   /**
-   * Create a new automation
+   * Create a new automation — replyagent parity (AutomationsController::createAutomation).
+   * Sets creator_id + updater_id, generates slug, and seeds the draft version with a
+   * non-deletable "Starting step" (trigger) + a default activity, so the builder canvas
+   * isn't blank on open.
    */
-  async createAutomation(workspaceId: bigint, data: any) {
-    const { name, folder_id } = data;
+  async createAutomation(workspaceId: bigint, userId: bigint, data: any) {
+    const { name, folder_id, trigger_step_name } = data;
     if (!name) throw new BadRequestException('Name is required');
 
+    // 1. Create automation row with creator/updater + slug.
+    // Prisma schema lacks @updatedAt/@default(now()) on these timestamps — set them
+    // explicitly so frontend's Last Updated column doesn't show "-" right after create.
+    const now = new Date();
     const automation = await this.prisma.automations.create({
       data: {
         workspace_id: workspaceId,
         name,
         folder_id: folder_id ? BigInt(folder_id) : null,
         status: 'draft',
+        slug: this.generateSlug(),
+        creator_id: userId,
+        updater_id: userId,
+        created_at: now,
+        updated_at: now,
       },
     });
 
-    // Create initial draft version
+    // 2. Create draft version
     const version = await this.prisma.automation_versions.create({
       data: {
         automation_id: automation.id,
@@ -84,77 +183,315 @@ export class AutomationsService {
       },
     });
 
-    await this.prisma.automations.update({
+    // 3. Seed trigger step (non-deletable, non-cloneable — replyagent parity)
+    const triggerStep = await this.prisma.automation_steps.create({
+      data: {
+        automation_version_id: version.id,
+        slug: this.generateSlug(),
+        type: 'trigger',
+        title: trigger_step_name || 'Starting step',
+        cloneable: false,
+        deletable: false,
+        linkable: true,
+        properties: JSON.stringify({}),
+      },
+    });
+
+    // 4. Default activity on trigger step (event=default, linkable so user can wire it)
+    await this.prisma.automation_step_activities.create({
+      data: {
+        slug: this.generateSlug(),
+        step_id: triggerStep.id,
+        parent_id: null,
+        event: 'default',
+        properties: JSON.stringify({ event: 'default' }),
+        order: 1,
+        linkable: true,
+      },
+    });
+
+    // 5. Point automation at the draft version
+    const updated = await this.prisma.automations.update({
       where: { id: automation.id },
       data: { draft_version_id: version.id },
     });
 
     return {
       success: true,
-      automation: { ...automation, draft_version_id: version.id },
+      automation: updated,
+      message: 'Automation created',
     };
   }
 
   /**
-   * Duplicate an automation
+   * Update automation (rename / move folder) — replyagent parity.
+   * Sets updater_id only (creator_id stays immutable).
    */
-  async duplicateAutomation(workspaceId: bigint, automationId: bigint) {
-    const original = await this.prisma.automations.findFirst({
+  async updateAutomation(
+    workspaceId: bigint,
+    userId: bigint,
+    automationId: bigint,
+    data: any,
+  ) {
+    const automation = await this.prisma.automations.findFirst({
       where: { id: automationId, workspace_id: workspaceId },
-      include: {
-        automation_versions: {
-          where: { status: 'published' },
-          include: { automation_steps: true },
-        },
+    });
+    if (!automation) throw new NotFoundException('Automation not found');
+
+    const updateData: any = { updater_id: userId, updated_at: new Date() };
+    if (typeof data.name !== 'undefined') updateData.name = data.name;
+    if (typeof data.folder_id !== 'undefined') {
+      updateData.folder_id = data.folder_id ? BigInt(data.folder_id) : null;
+    }
+
+    const updated = await this.prisma.automations.update({
+      where: { id: automation.id },
+      data: updateData,
+    });
+
+    return { success: true, automation: updated, message: 'Automation updated' };
+  }
+
+  /**
+   * Activate automation — replyagent parity.
+   */
+  async activateAutomation(workspaceId: bigint, userId: bigint, automationId: bigint) {
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId },
+    });
+    if (!automation) throw new NotFoundException('Automation not found');
+
+    const updated = await this.prisma.automations.update({
+      where: { id: automation.id },
+      data: { status: 'active', updater_id: userId, updated_at: new Date() },
+    });
+
+    return { success: true, automation: updated };
+  }
+
+  /**
+   * Unpublish automation — replyagent parity (Automation::unPublishIt).
+   * - Sets status = 'unpublished'
+   * - Clears published_version_id (this is the critical step we were missing — the
+   *   live version pointer must go to null so channels stop dispatching to it)
+   * - Unlinks any channel auto-reply that points at this automation (replyagent's
+   *   removeAutomationConnection call from unPublishAutomation)
+   */
+  async unPublishAutomation(workspaceId: bigint, userId: bigint, automationId: bigint) {
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId },
+    });
+    if (!automation) throw new NotFoundException('Automation not found');
+
+    const updated = await this.prisma.automations.update({
+      where: { id: automation.id },
+      data: {
+        status: 'unpublished',
+        published_version_id: null,
+        updater_id: userId,
+        updated_at: new Date(),
       },
     });
 
+    await this.removeChannelAutoReply(automation.id);
+
+    return { success: true, automation: updated };
+  }
+
+  /**
+   * Soft delete automation — replyagent parity (Automation::deleteIt).
+   * - Sets status = 'delete' (so any cached/in-flight reads see the terminal state)
+   * - Sets deleted_at (Eloquent SoftDeletes equivalent)
+   * - Unlinks any channel auto-reply pointing at this automation
+   */
+  async deleteAutomation(workspaceId: bigint, automationId: bigint) {
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId },
+    });
+    if (!automation) throw new NotFoundException('Automation not found');
+
+    const now = new Date();
+    await this.prisma.automations.update({
+      where: { id: automation.id },
+      data: {
+        status: 'delete',
+        deleted_at: now,
+        updated_at: now,
+      },
+    });
+
+    await this.removeChannelAutoReply(automation.id);
+
+    return { success: true, message: 'Automation deleted' };
+  }
+
+  /**
+   * Unlink this automation from every channel's auto-reply slot.
+   * Replyagent's Automation::removeAutomationConnection does this across:
+   * - instagram_features / facebook_features (morph) — not present in EZCONN schema, skipped
+   * - telegram_bots.auto_reply_automation_id
+   * - whatsapp_numbers.auto_reply_automation_id (replyagent's name; EZCONN splits into
+   *   wa_accounts + wa_phone_numbers + zapi_instances + evolution_instances)
+   *
+   * Also covers fb_pages and insta_pages, since EZCONN exposes those columns directly.
+   * Each updateMany is independent — silently skips if 0 rows match.
+   */
+  private async removeChannelAutoReply(automationId: bigint) {
+    const data = { auto_reply_automation_id: null };
+    await Promise.all([
+      this.prisma.telegram_bots.updateMany({
+        where: { auto_reply_automation_id: automationId },
+        data,
+      }),
+      this.prisma.fb_pages.updateMany({
+        where: { auto_reply_automation_id: automationId },
+        data,
+      }),
+      this.prisma.insta_pages.updateMany({
+        where: { auto_reply_automation_id: automationId },
+        data,
+      }),
+      this.prisma.wa_accounts.updateMany({
+        where: { auto_reply_automation_id: automationId },
+        data,
+      }),
+      this.prisma.wa_phone_numbers.updateMany({
+        where: { auto_reply_automation_id: automationId },
+        data,
+      }),
+      this.prisma.zapi_instances.updateMany({
+        where: { auto_reply_automation_id: automationId },
+        data,
+      }),
+      this.prisma.evolution_instances.updateMany({
+        where: { auto_reply_automation_id: automationId },
+        data,
+      }),
+    ]);
+  }
+
+  /**
+   * Duplicate automation — replyagent parity. Source is published version if available,
+   * else draft. Steps + activities are cloned with fresh slugs (so connections in the
+   * source don't collide with the copy). NOTE: automation_flows (connections) table
+   * doesn't exist in the schema yet, so connections aren't cloned — manual wiring
+   * needed in the copy until that's added.
+   */
+  async duplicateAutomation(
+    workspaceId: bigint,
+    userId: bigint,
+    automationId: bigint,
+    data: any = {},
+  ) {
+    const original = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId },
+    });
     if (!original) throw new NotFoundException('Original automation not found');
 
+    // Prefer published version as source (replyagent parity); fall back to draft
+    let sourceVersionId = original.published_version_id || original.draft_version_id;
+    if (!sourceVersionId) {
+      throw new BadRequestException('Original has no version to clone');
+    }
+
+    const sourceVersion = await this.prisma.automation_versions.findUnique({
+      where: { id: sourceVersionId },
+    });
+    if (!sourceVersion) throw new NotFoundException('Source version not found');
+
+    // Fetch source steps + activities separately (no Prisma relation defined)
+    const sourceSteps = await this.prisma.automation_steps.findMany({
+      where: { automation_version_id: sourceVersion.id, deleted_at: null },
+      orderBy: { id: 'asc' },
+    });
+    const sourceStepIds = sourceSteps.map((s: any) => s.id);
+    const sourceActivities = sourceStepIds.length
+      ? await this.prisma.automation_step_activities.findMany({
+          where: { step_id: { in: sourceStepIds }, deleted_at: null },
+          orderBy: { order: 'asc' },
+        })
+      : [];
+    const activitiesByStep = new Map<string, any[]>();
+    for (const a of sourceActivities) {
+      const key = a.step_id.toString();
+      if (!activitiesByStep.has(key)) activitiesByStep.set(key, []);
+      activitiesByStep.get(key)!.push(a);
+    }
+
+    // 1. Create new automation with creator/updater + slug + timestamps
+    const newName = data.name?.trim() || `${original.name} (Copy)`;
+    const now = new Date();
     const copy = await this.prisma.automations.create({
       data: {
         workspace_id: workspaceId,
-        name: `${original.name} (Copy)`,
+        name: newName,
         folder_id: original.folder_id,
+        status: 'draft',
+        slug: this.generateSlug(),
+        creator_id: userId,
+        updater_id: userId,
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    // 2. New draft version
+    const newVersion = await this.prisma.automation_versions.create({
+      data: {
+        automation_id: copy.id,
+        number: 1,
         status: 'draft',
       },
     });
 
-    const publishedVersion = original.automation_versions[0];
-    if (publishedVersion) {
-      const newVersion = await this.prisma.automation_versions.create({
+    // 3. Clone each step + its activities with FRESH slugs
+    for (const step of sourceSteps as any[]) {
+      const newStep = await this.prisma.automation_steps.create({
         data: {
-          automation_id: copy.id,
-          number: 1,
-          status: 'draft',
+          automation_version_id: newVersion.id,
+          slug: this.generateSlug(),
+          title: step.title,
+          type: step.type,
+          properties: step.properties,
+          cloneable: step.cloneable,
+          deletable: step.deletable,
+          linkable: step.linkable,
+          comment: step.comment,
         },
       });
 
-      for (const step of publishedVersion.automation_steps) {
-        await this.prisma.automation_steps.create({
+      // Clone activities (flat — parent_id remap requires 2-pass; skipped here since
+      // step builder UI lets users re-nest. TODO when automation_flows lands.)
+      const sourceStepActivities = activitiesByStep.get(step.id.toString()) || [];
+      for (const activity of sourceStepActivities) {
+        await this.prisma.automation_step_activities.create({
           data: {
-            automation_version_id: newVersion.id,
-            title: step.title,
-            type: step.type,
-            properties: step.properties,
-            slug: step.slug,
+            slug: this.generateSlug(),
+            step_id: newStep.id,
+            parent_id: null,
+            event: activity.event,
+            properties: activity.properties,
+            order: activity.order,
+            linkable: activity.linkable,
           },
         });
       }
-
-      await this.prisma.automations.update({
-        where: { id: copy.id },
-        data: { draft_version_id: newVersion.id },
-      });
     }
 
-    return { success: true, automation: copy };
+    const updated = await this.prisma.automations.update({
+      where: { id: copy.id },
+      data: { draft_version_id: newVersion.id },
+    });
+
+    return { success: true, automation: updated };
   }
 
   /**
-   * Publish an automation
+   * Publish automation — replyagent parity. Clones draft version → new published version
+   * (with its own step copies and fresh slugs), points automation at it, sets
+   * publisher_id + published_at on the new version + updater_id on the automation.
    */
-  async publishAutomation(workspaceId: bigint, automationId: bigint) {
+  async publishAutomation(workspaceId: bigint, userId: bigint, automationId: bigint) {
     const automation = await this.prisma.automations.findFirst({
       where: { id: automationId, workspace_id: workspaceId },
     });
@@ -165,12 +502,29 @@ export class AutomationsService {
 
     const draftVersion = await this.prisma.automation_versions.findUnique({
       where: { id: BigInt(automation.draft_version_id) },
-      include: { automation_steps: true },
     });
-
     if (!draftVersion) throw new NotFoundException('Draft version not found');
 
-    // Create live version
+    // Fetch draft steps + activities separately (no Prisma relation defined)
+    const draftSteps = await this.prisma.automation_steps.findMany({
+      where: { automation_version_id: draftVersion.id, deleted_at: null },
+      orderBy: { id: 'asc' },
+    });
+    const draftStepIds = draftSteps.map((s: any) => s.id);
+    const draftActivities = draftStepIds.length
+      ? await this.prisma.automation_step_activities.findMany({
+          where: { step_id: { in: draftStepIds }, deleted_at: null },
+          orderBy: { order: 'asc' },
+        })
+      : [];
+    const activitiesByStep = new Map<string, any[]>();
+    for (const a of draftActivities) {
+      const key = a.step_id.toString();
+      if (!activitiesByStep.has(key)) activitiesByStep.set(key, []);
+      activitiesByStep.get(key)!.push(a);
+    }
+
+    // New published version
     const liveVersion = await this.prisma.automation_versions.create({
       data: {
         automation_id: automation.id,
@@ -179,28 +533,50 @@ export class AutomationsService {
             where: { automation_id: automation.id },
           })) + 1,
         status: 'published',
+        publisher_id: userId,
         published_at: new Date(),
       },
     });
 
-    // Clone steps
-    for (const step of draftVersion.automation_steps) {
-      await this.prisma.automation_steps.create({
+    // Clone each step + activities with fresh slugs (parity with duplicateAutomation)
+    for (const step of draftSteps as any[]) {
+      const newStep = await this.prisma.automation_steps.create({
         data: {
           automation_version_id: liveVersion.id,
+          slug: this.generateSlug(),
           title: step.title,
           type: step.type,
           properties: step.properties,
-          slug: step.slug,
+          cloneable: step.cloneable,
+          deletable: step.deletable,
+          linkable: step.linkable,
+          comment: step.comment,
         },
       });
+
+      const stepActivitiesToClone = activitiesByStep.get(step.id.toString()) || [];
+      for (const activity of stepActivitiesToClone) {
+        await this.prisma.automation_step_activities.create({
+          data: {
+            slug: this.generateSlug(),
+            step_id: newStep.id,
+            parent_id: null, // see duplicateAutomation note on parent remap
+            event: activity.event,
+            properties: activity.properties,
+            order: activity.order,
+            linkable: activity.linkable,
+          },
+        });
+      }
     }
 
     await this.prisma.automations.update({
       where: { id: automation.id },
       data: {
         published_version_id: liveVersion.id,
-        status: 'published',
+        status: 'active',
+        updater_id: userId,
+        updated_at: new Date(),
       },
     });
 
@@ -208,35 +584,1439 @@ export class AutomationsService {
   }
 
   /**
-   * Step management
+   * Step management — replyagent parity (AutomationsController::createStep).
+   * Each step type has its own cloneable/deletable/linkable defaults + auto-seeded
+   * activities (e.g. randomizer gets 50/50 A/B activities, condition gets if-clause,
+   * delay gets duration template, etc.).
    */
   async createStep(versionId: bigint, data: any) {
+    if (!data?.type) throw new BadRequestException('type is required');
+    if (!data?.title) throw new BadRequestException('title is required');
+
+    // Resolve type-specific defaults (mirror of replyagent's switch)
+    let cloneable = true;
+    let deletable = true;
+    let linkable = true;
+    const activities: any[] = [];
+
+    switch (data.type) {
+      case 'trigger':
+        cloneable = false;
+        deletable = false;
+        linkable = true;
+        break;
+
+      case 'randomizer':
+        linkable = false;
+        activities.push(
+          { properties: { label: 'A', value: 50 }, linkable: true },
+          { properties: { label: 'B', value: 50 }, linkable: true },
+        );
+        break;
+
+      case 'condition':
+        linkable = false;
+        activities.push({
+          order: 9999,
+          properties: {
+            action: null,
+            check: 'if',
+            matches: 'none',
+            conditions: [],
+          },
+          linkable: true,
+        });
+        break;
+
+      case 'delay':
+        linkable = true;
+        activities.push({
+          properties: {
+            type: 'duration',
+            duration: {
+              value: '1',
+              unit: 'minutes',
+              set_time_limit: false,
+              between_from: '08:00',
+              between_to: '18:00',
+              days: [
+                { day: 'monday', selected: true },
+                { day: 'tuesday', selected: true },
+                { day: 'wednesday', selected: true },
+                { day: 'thursday', selected: true },
+                { day: 'friday', selected: true },
+                { day: 'saturday', selected: false },
+                { day: 'sunday', selected: false },
+              ],
+            },
+            date: { date_time: '' },
+          },
+          linkable: false,
+        });
+        break;
+
+      case 'splitter':
+        linkable = false;
+        activities.push(
+          { properties: { label: 'A', value: 'a' }, linkable: true },
+          { properties: { label: 'B', value: 'b' }, linkable: true },
+        );
+        break;
+
+      case 'twilio_voice':
+        linkable = false;
+        activities.push(
+          { order: 1, properties: { type: 'completed' }, linkable: true },
+          { order: 2, properties: { type: 'failed' }, linkable: true },
+        );
+        break;
+
+      case 'start_automation':
+        cloneable = false;
+        deletable = true;
+        linkable = true;
+        activities.push({
+          order: 1,
+          properties: { automation_id: null, automation_name: null },
+          linkable: false,
+        });
+        break;
+
+      // action / telegram / whatsapp / messenger / instagram / twilio_sms / twilio_call
+      // default: cloneable=true, deletable=true, linkable=true, no auto-activities
+      default:
+        break;
+    }
+
     const step = await this.prisma.automation_steps.create({
       data: {
         automation_version_id: versionId,
-        title: data.title || 'New Step',
-        type: data.type || 'action',
-        properties: data.properties ? JSON.stringify(data.properties) : null,
+        slug: this.generateSlug(),
+        type: data.type,
+        title: data.title,
+        cloneable,
+        deletable,
+        linkable,
+        properties: data.properties ? JSON.stringify(data.properties) : JSON.stringify({}),
       },
     });
-    return { success: true, step };
+
+    // Seed activities
+    for (const activity of activities) {
+      await this.prisma.automation_step_activities.create({
+        data: {
+          slug: this.generateSlug(),
+          step_id: step.id,
+          parent_id: null,
+          event: activity.event ?? null,
+          properties: JSON.stringify(activity.properties || {}),
+          order: activity.order ?? 0,
+          linkable: !!activity.linkable,
+        },
+      });
+    }
+
+    // Re-fetch with activities (no Prisma relation — separate query)
+    const fresh = await this.prisma.automation_steps.findUnique({
+      where: { id: step.id },
+    });
+    const freshActivities = await this.prisma.automation_step_activities.findMany({
+      where: { step_id: step.id, deleted_at: null },
+      orderBy: { order: 'asc' },
+    });
+
+    return {
+      success: true,
+      step: { ...fresh, automation_step_activities: freshActivities },
+    };
   }
 
   async updateStep(stepId: bigint, data: any) {
+    const updateData: any = {};
+    if (typeof data.title !== 'undefined') updateData.title = data.title;
+    if (typeof data.linkable !== 'undefined') updateData.linkable = !!data.linkable;
+    if (typeof data.properties !== 'undefined') {
+      updateData.properties =
+        typeof data.properties === 'string'
+          ? data.properties
+          : JSON.stringify(data.properties);
+    }
+    if (typeof data.comment !== 'undefined') updateData.comment = data.comment;
+
     const step = await this.prisma.automation_steps.update({
       where: { id: stepId },
-      data: {
-        title: data.title,
-        properties: data.properties
-          ? JSON.stringify(data.properties)
-          : undefined,
-      },
+      data: updateData,
     });
     return { success: true, step };
   }
 
+  /**
+   * Soft delete a step — replyagent's AutomationStep::deleteIt cascades to:
+   * - All activities (and their descendants + their flow connectors)
+   * - All quick replies (and their flow connectors)
+   * - All flows where this step is the connector (TO) or the next step (FROM)
+   * Without these cascades the canvas is left with dangling edges + ghost activities.
+   */
   async deleteStep(stepId: bigint) {
-    await this.prisma.automation_steps.delete({ where: { id: stepId } });
+    const step = await this.prisma.automation_steps.findUnique({
+      where: { id: stepId },
+    });
+    if (!step) throw new BadRequestException('Invalid request');
+
+    const now = new Date();
+
+    // 1. Soft delete every activity under this step (and any descendants)
+    const rootActivities = await this.prisma.automation_step_activities.findMany({
+      where: { step_id: stepId, parent_id: null, deleted_at: null },
+      select: { id: true },
+    });
+    for (const root of rootActivities) {
+      const tree = await this.collectActivityTreeIds(root.id as any);
+      await this.prisma.automation_step_activities.updateMany({
+        where: { id: { in: tree } },
+        data: { deleted_at: now },
+      });
+    }
+
+    // 2. Soft delete quick replies on this step + their flow connectors
+    const qrIds = (
+      await this.prisma.automation_quick_replies.findMany({
+        where: { automation_step_id: stepId, deleted_at: null },
+        select: { id: true },
+      })
+    ).map((q: any) => q.id);
+    if (qrIds.length > 0) {
+      await this.prisma.automation_quick_replies.updateMany({
+        where: { id: { in: qrIds } },
+        data: { deleted_at: now },
+      });
+      await this.prisma.automation_flow.updateMany({
+        where: {
+          connector_id: { in: qrIds },
+          connector_type: 'App\\Models\\Automations\\AutomationQuickReply',
+          deleted_at: null,
+        },
+        data: { deleted_at: now },
+      });
+    }
+
+    // 3. Soft delete flows where this step is the connector (TO) or next_step (FROM)
+    await this.prisma.automation_flow.updateMany({
+      where: {
+        OR: [
+          {
+            connector_id: stepId,
+            connector_type: 'App\\Models\\Automations\\AutomationStep',
+          },
+          { next_step_id: stepId },
+        ],
+        deleted_at: null,
+      },
+      data: { deleted_at: now },
+    });
+
+    // 4. Soft delete the step itself
+    await this.prisma.automation_steps.update({
+      where: { id: stepId },
+      data: { deleted_at: now },
+    });
+
+    return { success: true };
+  }
+
+  // ─── Folder Management ───────────────────────────────────────────────
+  // Replyagent parity (AutomationsController::createFolder / getFolders /
+  // changeFolder / deleteFolder). Folders are workspace-scoped.
+
+  async getFolders(workspaceId: bigint) {
+    const folders = await this.prisma.automation_folders.findMany({
+      where: { workspace_id: workspaceId },
+      orderBy: { id: 'asc' },
+    });
+    return { success: true, folders };
+  }
+
+  /**
+   * Create OR update folder — replyagent uses one endpoint for both. If `id` is
+   * provided in the body, it's an update; otherwise create.
+   */
+  async createOrUpdateFolder(workspaceId: bigint, data: any) {
+    const name = data?.name?.trim();
+    if (!name) throw new BadRequestException('Folder name is required');
+
+    if (data.id) {
+      const existing = await this.prisma.automation_folders.findFirst({
+        where: { id: BigInt(data.id), workspace_id: workspaceId },
+      });
+      if (!existing) throw new NotFoundException('Folder not found');
+
+      const updated = await this.prisma.automation_folders.update({
+        where: { id: existing.id },
+        data: { name },
+      });
+      return { success: true, folder: updated };
+    }
+
+    const folder = await this.prisma.automation_folders.create({
+      data: {
+        workspace_id: workspaceId,
+        name,
+      },
+    });
+    return { success: true, folder };
+  }
+
+  /**
+   * Move an automation to a different folder — replyagent parity (changeFolder).
+   */
+  async changeFolder(workspaceId: bigint, userId: bigint, data: any) {
+    if (!data?.folder_id || !data?.automation_id) {
+      throw new BadRequestException('folder_id and automation_id are required');
+    }
+
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: BigInt(data.automation_id), workspace_id: workspaceId },
+    });
+    if (!automation) throw new NotFoundException('Automation not found');
+
+    const folder = await this.prisma.automation_folders.findFirst({
+      where: { id: BigInt(data.folder_id), workspace_id: workspaceId },
+    });
+    if (!folder) throw new NotFoundException('Folder not found');
+
+    const updated = await this.prisma.automations.update({
+      where: { id: automation.id },
+      data: { folder_id: folder.id, updater_id: userId, updated_at: new Date() },
+    });
+
+    return { success: true, automation: updated };
+  }
+
+  /**
+   * Delete folder — replyagent parity: only allowed if no automations point at it.
+   */
+  async deleteFolder(workspaceId: bigint, folderId: bigint) {
+    const folder = await this.prisma.automation_folders.findFirst({
+      where: { id: folderId, workspace_id: workspaceId },
+    });
+    if (!folder) throw new NotFoundException('Folder not found');
+
+    const automationsInFolder = await this.prisma.automations.findMany({
+      where: { folder_id: folderId, deleted_at: null },
+      select: { id: true, name: true, status: true },
+    });
+    if (automationsInFolder.length > 0) {
+      throw new BadRequestException({
+        code: 'HAS_AUTOMATIONS',
+        message: 'Folder contains automations',
+        automations: automationsInFolder,
+      });
+    }
+
+    await this.prisma.automation_folders.delete({ where: { id: folder.id } });
+    return { success: true };
+  }
+
+  // ─── Connection (AutomationFlow) Management ─────────────────────────
+  // Replyagent parity (AutomationsController::saveConnection / deleteConnection).
+  // connector_type matches replyagent's stored PHP class names for cross-system
+  // compatibility. Frontend can send short keys ("step"/"activity"/"quick_reply"); we
+  // normalize them.
+
+  private resolveConnectorType(input: string): string {
+    switch (input) {
+      case 'activity':
+        return 'App\\Models\\Automations\\AutomationStepActivity';
+      case 'quick_reply':
+        return 'App\\Models\\Automations\\AutomationQuickReply';
+      default:
+        return 'App\\Models\\Automations\\AutomationStep';
+    }
+  }
+
+  /**
+   * Create or update a connection (visual edge) between connector → next step.
+   * Replyagent upserts on (connector_id, next_step_id, automation_version_id, connector_type).
+   */
+  async saveConnection(versionId: bigint, data: any) {
+    if (!data?.connector_id || !data?.next_step_id || !data?.connector_type) {
+      throw new BadRequestException('connector_id, next_step_id, connector_type are required');
+    }
+
+    const connectorType = this.resolveConnectorType(data.connector_type);
+    const connectorId = BigInt(data.connector_id);
+    const nextStepId = BigInt(data.next_step_id);
+
+    // Verify the connector exists (replyagent does this in line 1617-1619)
+    let exists = false;
+    if (connectorType.endsWith('AutomationStepActivity')) {
+      exists = !!(await this.prisma.automation_step_activities.findUnique({
+        where: { id: connectorId },
+      }));
+    } else if (connectorType.endsWith('AutomationQuickReply')) {
+      exists = !!(await this.prisma.automation_quick_replies.findUnique({
+        where: { id: connectorId },
+      }));
+    } else {
+      exists = !!(await this.prisma.automation_steps.findUnique({
+        where: { id: connectorId },
+      }));
+    }
+    if (!exists) throw new BadRequestException('Invalid connector');
+
+    const existing = await this.prisma.automation_flow.findFirst({
+      where: {
+        connector_id: connectorId,
+        next_step_id: nextStepId,
+        automation_version_id: versionId,
+        connector_type: connectorType,
+        deleted_at: null,
+      },
+    });
+
+    let connection: any;
+    if (existing) {
+      connection = await this.prisma.automation_flow.update({
+        where: { id: existing.id },
+        data: {
+          connector_id: connectorId,
+          next_step_id: nextStepId,
+          connector_type: connectorType,
+        },
+      });
+    } else {
+      connection = await this.prisma.automation_flow.create({
+        data: {
+          slug: this.generateSlug(),
+          connector_id: connectorId,
+          next_step_id: nextStepId,
+          automation_version_id: versionId,
+          connector_type: connectorType,
+        },
+      });
+    }
+
+    // Replyagent returns connector_step + connection + next_step (deeply loaded).
+    // Without Prisma relations we just return what we have; frontend can re-fetch the
+    // automation if it needs the full tree.
+    return { success: true, connection };
+  }
+
+  async deleteConnection(versionId: bigint, flowId: bigint) {
+    const flow = await this.prisma.automation_flow.findFirst({
+      where: { id: flowId, automation_version_id: versionId },
+    });
+    if (!flow) throw new BadRequestException('Invalid request');
+    await this.prisma.automation_flow.delete({ where: { id: flow.id } });
+    return { success: true };
+  }
+
+  /**
+   * Replyagent's getAutomationConnections returns the automation with related
+   * channel-features (instagramFeatures, facebookFeatures, etc.). Those features
+   * aren't wired into NestJS yet — we return the automation + its automation_flow
+   * rows for the published or draft version so the frontend can show connections.
+   */
+  async getAutomationConnections(workspaceId: bigint, automationId: bigint) {
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!automation) throw new BadRequestException('Invalid request');
+
+    const versionId = automation.published_version_id || automation.draft_version_id;
+    const flows = versionId
+      ? await this.prisma.automation_flow.findMany({
+          where: { automation_version_id: versionId, deleted_at: null },
+        })
+      : [];
+
+    return { success: true, data: { ...automation, flows } };
+  }
+
+  // ─── Step Activities CRUD ──────────────────────────────────────────
+  // Replyagent: createStepActivity (single, with type-specific child seeding),
+  // createStepActivities (batch with nesting), updateStepActivity, deleteActivity,
+  // deleteStepActivities, saveActivitiesOrder, restoreActivity.
+
+  /**
+   * Create a single step activity — mirrors replyagent's createStepActivity which
+   * auto-seeds child activities for certain `properties.type` values (input,
+   * chatgpt_question, dify_question, twilio_recorded_call, twilio_live_call, otn).
+   */
+  async createStepActivity(data: any) {
+    if (!data?.step_id) throw new BadRequestException('step_id is required');
+    if (!data?.properties) throw new BadRequestException('properties is required');
+
+    const step = await this.prisma.automation_steps.findUnique({
+      where: { id: BigInt(data.step_id) },
+    });
+    if (!step) throw new BadRequestException('Invalid request');
+
+    const properties = data.properties || {};
+    const event =
+      data.event ?? (typeof properties === 'object' ? properties.event ?? null : null);
+
+    const activity = await this.prisma.automation_step_activities.create({
+      data: {
+        slug: this.generateSlug(),
+        step_id: BigInt(data.step_id),
+        parent_id: data.parent_id ? BigInt(data.parent_id) : null,
+        event: event ?? null,
+        properties: JSON.stringify(properties),
+        order: data.order ? Number(data.order) : 0,
+        linkable: data.linkable ? true : false,
+      },
+    });
+
+    // Type-specific child activity seeding (replyagent parity, lines 1253-1404)
+    const type = typeof properties === 'object' ? properties.type : null;
+    const childSeeds: any[] = [];
+    if (type === 'input') {
+      childSeeds.push(
+        { event: null, props: { type: 'input_options', event: 'responded' }, order: 1, linkable: true },
+        { event: null, props: { type: 'input_options', event: 'no_response' }, order: 2, linkable: true },
+      );
+    } else if (type === 'chatgpt_question' || type === 'dify_question') {
+      childSeeds.push(
+        { event: null, props: { type: 'input_options', event: 'answer_failed' }, order: 1, linkable: true },
+        { event: null, props: { type: 'input_options', event: 'no_further_question' }, order: 1, linkable: true },
+      );
+    } else if (type === 'chatgpt_action') {
+      childSeeds.push({
+        event: 'gpt_answer_failed',
+        props: { type: 'gpt_answer_failed', event: 'answer_failed' },
+        order: 1,
+        linkable: true,
+      });
+    } else if (type === 'twilio_recorded_call') {
+      for (const status of ['completed', 'failed']) {
+        childSeeds.push({
+          event: `call_${status}`,
+          props: { type: `call_${status}` },
+          order: 1,
+          linkable: true,
+        });
+      }
+    } else if (type === 'twilio_live_call') {
+      for (const status of ['completed', 'canceled', 'busy', 'no-answer', 'failed']) {
+        childSeeds.push({
+          event: `call_${status}`,
+          props: { type: `call_${status}` },
+          order: 1,
+          linkable: true,
+        });
+      }
+    } else if (type === 'otn') {
+      childSeeds.push(
+        { event: 'fb_topic_subscribed', props: { type: 'fb_topic_options', event: 'fb_topic_subscribed' }, order: 1, linkable: true },
+        { event: 'fb_topic_sent', props: { type: 'fb_topic_options', event: 'fb_topic_sent' }, order: 2, linkable: true },
+        { event: 'fb_topic_limit_reach', props: { type: 'fb_topic_options', event: 'fb_topic_limit_reach' }, order: 2, linkable: true },
+      );
+    }
+
+    for (const seed of childSeeds) {
+      await this.prisma.automation_step_activities.create({
+        data: {
+          slug: this.generateSlug(),
+          step_id: activity.step_id,
+          parent_id: activity.id,
+          event: seed.event,
+          properties: JSON.stringify(seed.props),
+          order: seed.order,
+          linkable: seed.linkable,
+        },
+      });
+    }
+
+    // Recursively create children if provided in the request (replyagent line 1409-1430)
+    if (Array.isArray(data.children) && data.children.length > 0) {
+      await this.createChildActivities(data.children, activity);
+    }
+
+    // Re-fetch with children
+    const children = await this.prisma.automation_step_activities.findMany({
+      where: { parent_id: activity.id, deleted_at: null },
+      orderBy: { order: 'asc' },
+    });
+
+    return { ...activity, children };
+  }
+
+  private async createChildActivities(children: any[], parent: any) {
+    for (const child of children) {
+      const created = await this.prisma.automation_step_activities.create({
+        data: {
+          slug: this.generateSlug(),
+          step_id: parent.step_id,
+          parent_id: parent.id,
+          event: child.event || null,
+          properties: JSON.stringify(child.properties || {}),
+          order: child.order ? Number(child.order) : 0,
+          linkable: !!child.linkable,
+        },
+      });
+      if (Array.isArray(child.children) && child.children.length > 0) {
+        await this.createChildActivities(child.children, created);
+      }
+    }
+  }
+
+  /**
+   * Bulk create activities on a step (with nesting) — replyagent createStepActivities.
+   */
+  async createStepActivities(stepId: bigint, activities: any[]) {
+    const step = await this.prisma.automation_steps.findUnique({ where: { id: stepId } });
+    if (!step) throw new BadRequestException('Invalid request');
+    if (!Array.isArray(activities)) {
+      throw new BadRequestException('activities array required');
+    }
+
+    const createRecursive = async (items: any[], parentId: bigint | null) => {
+      for (const item of items) {
+        const created = await this.prisma.automation_step_activities.create({
+          data: {
+            slug: item.slug || this.generateSlug(),
+            step_id: stepId,
+            parent_id: parentId,
+            event: item.event || null,
+            properties: JSON.stringify(item.properties || {}),
+            order: item.order ? Number(item.order) : 0,
+            linkable: !!item.linkable,
+          },
+        });
+        if (Array.isArray(item.children) && item.children.length > 0) {
+          await createRecursive(item.children, created.id);
+        }
+      }
+    };
+    await createRecursive(activities, null);
+
+    const allActivities = await this.prisma.automation_step_activities.findMany({
+      where: { step_id: stepId, deleted_at: null },
+      orderBy: { order: 'asc' },
+    });
+    return { success: true, step: { ...step, automation_step_activities: allActivities } };
+  }
+
+  /**
+   * Update an activity's properties / linkable + optionally rewrite its children tree.
+   * Replyagent's updateStepActivity supports adding/updating/deleting children in one call.
+   */
+  async updateStepActivity(activityId: bigint, data: any) {
+    const activity = await this.prisma.automation_step_activities.findUnique({
+      where: { id: activityId },
+    });
+    if (!activity) throw new BadRequestException('Invalid request');
+
+    const updateData: any = {};
+    if (typeof data.properties !== 'undefined') {
+      updateData.properties =
+        typeof data.properties === 'string'
+          ? data.properties
+          : JSON.stringify(data.properties);
+    }
+    if (typeof data.linkable !== 'undefined') updateData.linkable = !!data.linkable;
+    if (typeof data.event !== 'undefined') updateData.event = data.event;
+    if (typeof data.order !== 'undefined') updateData.order = Number(data.order);
+
+    await this.prisma.automation_step_activities.update({
+      where: { id: activity.id },
+      data: updateData,
+    });
+
+    // Children rewrite (replyagent line 1483-1532)
+    if (Array.isArray(data.children)) {
+      await this.rewriteChildren(activity.id, activity.step_id, data.children);
+    }
+
+    const fresh = await this.prisma.automation_step_activities.findUnique({
+      where: { id: activity.id },
+    });
+    const children = await this.prisma.automation_step_activities.findMany({
+      where: { parent_id: activity.id, deleted_at: null },
+      orderBy: { order: 'asc' },
+    });
+    return { ...fresh, children };
+  }
+
+  private async rewriteChildren(parentId: bigint, stepId: bigint, incoming: any[]) {
+    const keptIds: bigint[] = [];
+    for (const child of incoming) {
+      let childRow: any;
+      if (child.id) {
+        // Update existing
+        const existing = await this.prisma.automation_step_activities.findUnique({
+          where: { id: BigInt(child.id) },
+        });
+        if (!existing) continue;
+        childRow = await this.prisma.automation_step_activities.update({
+          where: { id: existing.id },
+          data: {
+            properties:
+              typeof child.properties !== 'undefined'
+                ? typeof child.properties === 'string'
+                  ? child.properties
+                  : JSON.stringify(child.properties)
+                : existing.properties,
+          },
+        });
+      } else {
+        // Create new
+        childRow = await this.prisma.automation_step_activities.create({
+          data: {
+            slug: this.generateSlug(),
+            step_id: stepId,
+            parent_id: parentId,
+            event: child.event || null,
+            properties: JSON.stringify(child.properties || {}),
+            order: child.order ? Number(child.order) : 0,
+            linkable: !!child.linkable,
+          },
+        });
+      }
+      keptIds.push(childRow.id);
+      if (Array.isArray(child.children) && child.children.length > 0) {
+        await this.rewriteChildren(childRow.id, stepId, child.children);
+      }
+    }
+
+    // Soft-delete any children that weren't in `incoming`
+    const toDelete = await this.prisma.automation_step_activities.findMany({
+      where: {
+        parent_id: parentId,
+        deleted_at: null,
+        ...(keptIds.length > 0 ? { id: { notIn: keptIds } } : {}),
+      },
+      select: { id: true },
+    });
+    if (toDelete.length > 0) {
+      await this.prisma.automation_step_activities.updateMany({
+        where: { id: { in: toDelete.map((a: any) => a.id) } },
+        data: { deleted_at: new Date() },
+      });
+    }
+  }
+
+  /**
+   * Soft delete activity (and descendants) — replyagent parity.
+   * @param reorder when true, the surviving siblings of this activity are renumbered
+   *                1..N (replyagent's AutomationStepActivity::reorderChildren). Frontend
+   *                passes ?reorder=1 when removing a node from an ordered list (e.g.
+   *                quick-reply options) so display order stays contiguous.
+   */
+  async deleteActivity(activityId: bigint, reorder = false) {
+    const activity = await this.prisma.automation_step_activities.findUnique({
+      where: { id: activityId },
+    });
+    if (!activity) throw new BadRequestException('Invalid request');
+
+    const now = new Date();
+
+    // Delete its connection flows (replyagent line 1741-1743)
+    await this.prisma.automation_flow.updateMany({
+      where: {
+        connector_id: activity.id,
+        connector_type: 'App\\Models\\Automations\\AutomationStepActivity',
+        deleted_at: null,
+      },
+      data: { deleted_at: now },
+    });
+
+    // Soft delete activity + its descendants (collect tree iteratively)
+    const allIds = await this.collectActivityTreeIds(activity.id);
+    await this.prisma.automation_step_activities.updateMany({
+      where: { id: { in: allIds } },
+      data: { deleted_at: now },
+    });
+
+    // Optional sibling reorder (replyagent's reorderChildren — renumbers 1..N)
+    if (reorder) {
+      const siblings = await this.prisma.automation_step_activities.findMany({
+        where: {
+          step_id: activity.step_id,
+          parent_id: activity.parent_id,
+          id: { not: activity.id },
+          deleted_at: null,
+        },
+        orderBy: { order: 'asc' },
+        select: { id: true },
+      });
+      let nextOrder = 1;
+      for (const sibling of siblings) {
+        await this.prisma.automation_step_activities.update({
+          where: { id: sibling.id },
+          data: { order: nextOrder++ },
+        });
+      }
+    }
+
+    return { success: true };
+  }
+
+  private async collectActivityTreeIds(rootId: bigint): Promise<bigint[]> {
+    const ids: bigint[] = [rootId];
+    let frontier: bigint[] = [rootId];
+    while (frontier.length > 0) {
+      const children = await this.prisma.automation_step_activities.findMany({
+        where: { parent_id: { in: frontier }, deleted_at: null },
+        select: { id: true },
+      });
+      const childIds = children.map((c: any) => c.id);
+      ids.push(...childIds);
+      frontier = childIds;
+    }
+    return ids;
+  }
+
+  async deleteStepActivities(stepId: bigint) {
+    const rootActivities = await this.prisma.automation_step_activities.findMany({
+      where: { step_id: stepId, parent_id: null, deleted_at: null },
+      select: { id: true },
+    });
+    for (const root of rootActivities) {
+      await this.deleteActivity(root.id as any);
+    }
+    return { success: true };
+  }
+
+  async saveActivitiesOrder(activities: any[]) {
+    if (!Array.isArray(activities)) {
+      throw new BadRequestException('activities array required');
+    }
+    for (const row of activities) {
+      if (row?.id && typeof row.order !== 'undefined') {
+        await this.prisma.automation_step_activities.update({
+          where: { id: BigInt(row.id) },
+          data: { order: Number(row.order) },
+        });
+      }
+    }
+    return { success: true, message: 'successfully updated' };
+  }
+
+  async restoreActivity(activityId: bigint) {
+    const activity = await this.prisma.automation_step_activities.findFirst({
+      where: { id: activityId },
+    });
+    if (!activity) throw new BadRequestException('Invalid request');
+
+    await this.prisma.automation_step_activities.update({
+      where: { id: activity.id },
+      data: { deleted_at: null },
+    });
+    const fresh = await this.prisma.automation_step_activities.findUnique({
+      where: { id: activity.id },
+    });
+    return fresh;
+  }
+
+  // ─── Multi-step Operations ─────────────────────────────────────────
+
+  async deleteSteps(stepIds: any[]) {
+    if (!Array.isArray(stepIds) || stepIds.length === 0) {
+      throw new BadRequestException('steps array required');
+    }
+    const ids = stepIds.map((id) => BigInt(id));
+    // Soft delete steps + their activities + their flow connections
+    await this.prisma.automation_steps.updateMany({
+      where: { id: { in: ids } },
+      data: { deleted_at: new Date() },
+    });
+    await this.prisma.automation_step_activities.updateMany({
+      where: { step_id: { in: ids } },
+      data: { deleted_at: new Date() },
+    });
+    await this.prisma.automation_flow.updateMany({
+      where: {
+        OR: [
+          { connector_id: { in: ids }, connector_type: 'App\\Models\\Automations\\AutomationStep' },
+          { next_step_id: { in: ids } },
+        ],
+        deleted_at: null,
+      },
+      data: { deleted_at: new Date() },
+    });
+    return { success: true };
+  }
+
+  async restoreSteps(stepIds: any[], withActivities: boolean) {
+    if (!Array.isArray(stepIds) || stepIds.length === 0) {
+      throw new BadRequestException('steps array required');
+    }
+    const ids = stepIds.map((id) => BigInt(id));
+    await this.prisma.automation_steps.updateMany({
+      where: { id: { in: ids } },
+      data: { deleted_at: null },
+    });
+    if (withActivities) {
+      await this.prisma.automation_step_activities.updateMany({
+        where: { step_id: { in: ids } },
+        data: { deleted_at: null },
+      });
+    }
+    const steps = await this.prisma.automation_steps.findMany({
+      where: { id: { in: ids } },
+    });
+    return { steps };
+  }
+
+  /**
+   * Clone multiple steps within a version — replyagent's cloneSteps. Source steps +
+   * their activities + their flows (between cloned steps) are duplicated with fresh
+   * slugs. Cross-version connections are not remapped (replyagent's pattern too).
+   */
+  async cloneSteps(versionId: bigint, stepIds: any[]) {
+    if (!Array.isArray(stepIds) || stepIds.length === 0) {
+      throw new BadRequestException('steps array required');
+    }
+    const sourceIds = stepIds.map((id) => BigInt(id));
+    const sourceSteps = await this.prisma.automation_steps.findMany({
+      where: { id: { in: sourceIds } },
+    });
+    if (sourceSteps.length === 0) {
+      throw new BadRequestException('No steps to clone');
+    }
+
+    const stepsMapping = new Map<string, bigint>();
+    const activitiesMapping = new Map<string, bigint>();
+
+    for (const step of sourceSteps as any[]) {
+      const props = this.parseProperties(step.properties);
+      const newProps = {
+        ...props,
+        x: (typeof props?.x === 'number' ? props.x : 200) + Math.floor(Math.random() * 100) + 320,
+        y: (typeof props?.y === 'number' ? props.y : 200) + Math.floor(Math.random() * 200),
+      };
+
+      const newStep = await this.prisma.automation_steps.create({
+        data: {
+          automation_version_id: versionId,
+          slug: this.generateSlug(),
+          title: step.title,
+          type: step.type,
+          properties: JSON.stringify(newProps),
+          cloneable: step.cloneable,
+          deletable: step.deletable,
+          linkable: step.linkable,
+          comment: step.comment,
+        },
+      });
+      stepsMapping.set(step.id.toString(), newStep.id);
+
+      // Clone activities preserving parent relationships
+      const sourceActivities = await this.prisma.automation_step_activities.findMany({
+        where: { step_id: step.id, deleted_at: null },
+        orderBy: { id: 'asc' },
+      });
+
+      // 2-pass: first create all activities, then fix parent_id
+      const localActMap = new Map<string, bigint>();
+      for (const act of sourceActivities as any[]) {
+        const newAct = await this.prisma.automation_step_activities.create({
+          data: {
+            slug: this.generateSlug(),
+            step_id: newStep.id,
+            parent_id: null, // pass 1
+            event: act.event,
+            properties: act.properties,
+            order: act.order,
+            linkable: act.linkable,
+          },
+        });
+        localActMap.set(act.id.toString(), newAct.id);
+        activitiesMapping.set(act.id.toString(), newAct.id);
+      }
+      // Pass 2: remap parent_id
+      for (const act of sourceActivities as any[]) {
+        if (act.parent_id) {
+          const newParentId = localActMap.get(act.parent_id.toString());
+          if (newParentId) {
+            await this.prisma.automation_step_activities.update({
+              where: { id: localActMap.get(act.id.toString()) },
+              data: { parent_id: newParentId },
+            });
+          }
+        }
+      }
+    }
+
+    // Clone flows that fully live within the cloned set
+    const sourceFlows = await this.prisma.automation_flow.findMany({
+      where: {
+        OR: [
+          {
+            connector_id: { in: sourceIds },
+            connector_type: 'App\\Models\\Automations\\AutomationStep',
+          },
+          {
+            connector_id: { in: [...activitiesMapping.keys()].map((k) => BigInt(k)) },
+            connector_type: 'App\\Models\\Automations\\AutomationStepActivity',
+          },
+        ],
+        next_step_id: { in: sourceIds },
+        deleted_at: null,
+      },
+    });
+
+    for (const flow of sourceFlows as any[]) {
+      let newConnectorId: bigint | undefined;
+      if (flow.connector_type === 'App\\Models\\Automations\\AutomationStep') {
+        newConnectorId = stepsMapping.get(flow.connector_id.toString());
+      } else if (flow.connector_type === 'App\\Models\\Automations\\AutomationStepActivity') {
+        newConnectorId = activitiesMapping.get(flow.connector_id.toString());
+      }
+      const newNextStepId = stepsMapping.get(flow.next_step_id.toString());
+      if (!newConnectorId || !newNextStepId) continue;
+
+      await this.prisma.automation_flow.create({
+        data: {
+          automation_version_id: versionId,
+          slug: this.generateSlug(),
+          connector_id: newConnectorId,
+          next_step_id: newNextStepId,
+          connector_type: flow.connector_type,
+        },
+      });
+    }
+
+    const newStepIds = [...stepsMapping.values()];
+    const steps = await this.prisma.automation_steps.findMany({
+      where: { id: { in: newStepIds } },
+    });
+    return { steps };
+  }
+
+  private parseProperties(raw: any): any {
+    if (!raw) return {};
+    if (typeof raw === 'object') return raw;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+
+  // ─── Quick Replies CRUD ────────────────────────────────────────────
+
+  async addQuickReply(stepId: bigint, data: any) {
+    const step = await this.prisma.automation_steps.findUnique({ where: { id: stepId } });
+    if (!step) throw new BadRequestException('Invalid request');
+
+    const qr = await this.prisma.automation_quick_replies.create({
+      data: {
+        automation_step_id: stepId,
+        slug: this.generateSlug(),
+        title: data?.title || '',
+        order: data?.order ? Number(data.order) : 0,
+      },
+    });
+    return qr;
+  }
+
+  async updateQuickReply(stepId: bigint, qrId: bigint, data: any) {
+    const qr = await this.prisma.automation_quick_replies.findFirst({
+      where: { id: qrId, automation_step_id: stepId },
+    });
+    if (!qr) throw new BadRequestException('Invalid request');
+
+    const updated = await this.prisma.automation_quick_replies.update({
+      where: { id: qr.id },
+      data: {
+        ...(typeof data.title !== 'undefined' ? { title: data.title } : {}),
+        ...(typeof data.order !== 'undefined' ? { order: Number(data.order) } : {}),
+      },
+    });
+    return updated;
+  }
+
+  async deleteQuickReply(stepId: bigint, qrId: bigint) {
+    const qr = await this.prisma.automation_quick_replies.findFirst({
+      where: { id: qrId, automation_step_id: stepId },
+    });
+    if (!qr) throw new BadRequestException('Invalid request');
+
+    // Also clean up flow connections rooted at this QR
+    await this.prisma.automation_flow.updateMany({
+      where: {
+        connector_id: qr.id,
+        connector_type: 'App\\Models\\Automations\\AutomationQuickReply',
+        deleted_at: null,
+      },
+      data: { deleted_at: new Date() },
+    });
+    await this.prisma.automation_quick_replies.delete({ where: { id: qr.id } });
+    return { success: true };
+  }
+
+  // ─── Misc: toggleFeeder, checkTriggerText, validateKeywords ────────
+
+  /**
+   * Create a fresh draft from the published version — replyagent's "Edit" button on
+   * an active flow. Live (published) version stays untouched until the new draft is
+   * published, so contacts in-flight on the live version aren't broken.
+   *
+   * Mirrors the clone-version-data pattern used by duplicate/publish: fresh slugs
+   * everywhere, 2-pass parent_id remap for activities, intra-set flow remap.
+   */
+  async createDraftFromPublished(
+    workspaceId: bigint,
+    userId: bigint,
+    automationId: bigint,
+  ) {
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!automation) throw new NotFoundException('Automation not found');
+    if (!automation.published_version_id) {
+      throw new BadRequestException('Automation has no published version to edit');
+    }
+
+    const publishedVersion = await this.prisma.automation_versions.findUnique({
+      where: { id: automation.published_version_id as any },
+    });
+    if (!publishedVersion) throw new NotFoundException('Published version not found');
+
+    // Fetch published source state
+    const sourceSteps = await this.prisma.automation_steps.findMany({
+      where: { automation_version_id: publishedVersion.id, deleted_at: null },
+      orderBy: { id: 'asc' },
+    });
+    const sourceStepIds = sourceSteps.map((s: any) => s.id);
+    const sourceActivities = sourceStepIds.length
+      ? await this.prisma.automation_step_activities.findMany({
+          where: { step_id: { in: sourceStepIds }, deleted_at: null },
+          orderBy: { id: 'asc' },
+        })
+      : [];
+    const sourceFlows = sourceStepIds.length
+      ? await this.prisma.automation_flow.findMany({
+          where: {
+            automation_version_id: publishedVersion.id,
+            deleted_at: null,
+          },
+        })
+      : [];
+
+    // 1. New draft version (number = (last version + 1))
+    const lastNumber = await this.prisma.automation_versions.aggregate({
+      where: { automation_id: automation.id },
+      _max: { number: true },
+    });
+    const nextNumber = (lastNumber._max?.number ?? 0n) + 1n;
+    const newVersion = await this.prisma.automation_versions.create({
+      data: {
+        automation_id: automation.id,
+        number: nextNumber as any,
+        status: 'draft',
+      },
+    });
+
+    // 2. Clone steps (id remap)
+    const stepIdMap = new Map<string, bigint>();
+    for (const step of sourceSteps as any[]) {
+      const newStep = await this.prisma.automation_steps.create({
+        data: {
+          automation_version_id: newVersion.id,
+          slug: this.generateSlug(),
+          title: step.title,
+          type: step.type,
+          properties: step.properties,
+          cloneable: step.cloneable,
+          deletable: step.deletable,
+          linkable: step.linkable,
+          comment: step.comment,
+        },
+      });
+      stepIdMap.set(step.id.toString(), newStep.id);
+    }
+
+    // 3. Clone activities — pass 1 create flat, pass 2 remap parent_id
+    const activityIdMap = new Map<string, bigint>();
+    for (const act of sourceActivities as any[]) {
+      const newStepId = stepIdMap.get(act.step_id.toString());
+      if (!newStepId) continue;
+      const newAct = await this.prisma.automation_step_activities.create({
+        data: {
+          slug: this.generateSlug(),
+          step_id: newStepId,
+          parent_id: null,
+          event: act.event,
+          properties: act.properties,
+          order: act.order,
+          linkable: act.linkable,
+        },
+      });
+      activityIdMap.set(act.id.toString(), newAct.id);
+    }
+    for (const act of sourceActivities as any[]) {
+      if (!act.parent_id) continue;
+      const newId = activityIdMap.get(act.id.toString());
+      const newParentId = activityIdMap.get(act.parent_id.toString());
+      if (newId && newParentId) {
+        await this.prisma.automation_step_activities.update({
+          where: { id: newId },
+          data: { parent_id: newParentId },
+        });
+      }
+    }
+
+    // 4. Clone flows with connector_id + next_step_id remap
+    for (const flow of sourceFlows as any[]) {
+      let newConnectorId: bigint | undefined;
+      if (flow.connector_type === 'App\\Models\\Automations\\AutomationStep') {
+        newConnectorId = stepIdMap.get(flow.connector_id.toString());
+      } else if (flow.connector_type === 'App\\Models\\Automations\\AutomationStepActivity') {
+        newConnectorId = activityIdMap.get(flow.connector_id.toString());
+      }
+      // (QuickReply remap omitted — quick replies aren't cloned here yet)
+      const newNextStepId = stepIdMap.get(flow.next_step_id.toString());
+      if (!newConnectorId || !newNextStepId) continue;
+
+      await this.prisma.automation_flow.create({
+        data: {
+          automation_version_id: newVersion.id,
+          slug: this.generateSlug(),
+          connector_id: newConnectorId,
+          next_step_id: newNextStepId,
+          connector_type: flow.connector_type,
+        },
+      });
+    }
+
+    // 5. Point automation at new draft + bump updater
+    const updated = await this.prisma.automations.update({
+      where: { id: automation.id },
+      data: {
+        draft_version_id: newVersion.id,
+        updater_id: userId,
+        updated_at: new Date(),
+      },
+    });
+
+    return {
+      success: true,
+      automation: updated,
+      draft_version_id: newVersion.id,
+      message: 'Editable draft created',
+    };
+  }
+
+  /**
+   * Clear all in-flight execution state for an automation — replyagent's
+   * flushAutomationQueue. Deletes:
+   *  - automation_queue rows pointing through this automation's steps
+   *  - automation_runs rows for this automation
+   *  - automation_activity_iterations rows for this automation's activities
+   *  - ai_messages rows for this automation's activities
+   *
+   * Schema lacks Prisma relations on these tables — we fetch step/activity ids
+   * first, then delete by `step_id IN (...)` / `activity_id IN (...)`.
+   */
+  async flushAutomationQueue(workspaceId: bigint, automationId: bigint) {
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!automation) throw new NotFoundException('Automation not found');
+
+    // 1. Collect all version IDs for this automation
+    const versions = await this.prisma.automation_versions.findMany({
+      where: { automation_id: automation.id },
+      select: { id: true },
+    });
+    const versionIds = versions.map((v: any) => v.id);
+    if (versionIds.length === 0) {
+      // No versions → nothing in queue. Still wipe runs to be safe.
+      await this.prisma.automation_runs.deleteMany({
+        where: { automation_id: automation.id },
+      });
+      return { success: true, message: 'Queue cleared' };
+    }
+
+    // 2. Collect all step IDs (including soft-deleted, because queue may still
+    //    reference them)
+    const steps = await this.prisma.automation_steps.findMany({
+      where: { automation_version_id: { in: versionIds } },
+      select: { id: true },
+    });
+    const stepIds = steps.map((s: any) => s.id);
+
+    // 3. Collect all activity IDs
+    const activities = stepIds.length
+      ? await this.prisma.automation_step_activities.findMany({
+          where: { step_id: { in: stepIds } },
+          select: { id: true },
+        })
+      : [];
+    const activityIds = activities.map((a: any) => a.id);
+
+    // 4. Execute the 4 deletes concurrently
+    const ops: Promise<any>[] = [
+      this.prisma.automation_runs.deleteMany({
+        where: { automation_id: automation.id },
+      }),
+    ];
+    if (stepIds.length > 0) {
+      ops.push(
+        this.prisma.automation_queue.deleteMany({
+          where: { step_id: { in: stepIds } },
+        }),
+      );
+    }
+    if (activityIds.length > 0) {
+      ops.push(
+        this.prisma.automation_activity_iterations.deleteMany({
+          where: { activity_id: { in: activityIds } },
+        }),
+        this.prisma.ai_messages.deleteMany({
+          where: { activity_id: { in: activityIds } },
+        }),
+      );
+    }
+    const results = await Promise.all(ops);
+    const totalDeleted = results.reduce(
+      (sum: number, r: any) => sum + (r?.count ?? 0),
+      0,
+    );
+
+    return { success: true, message: 'Queue cleared', cleared: totalDeleted };
+  }
+
+  async toggleFeeder(workspaceId: bigint, automationId: bigint) {
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!automation) throw new NotFoundException('Automation not found');
+
+    const updated = await this.prisma.automations.update({
+      where: { id: automation.id },
+      data: { allow_in_feeder: !automation.allow_in_feeder, updated_at: new Date() },
+    });
+    return { success: true, allow_in_feeder: updated.allow_in_feeder };
+  }
+
+  /**
+   * Check whether another PUBLISHED activity in this workspace already uses the same
+   * trigger_text for the same event (so the user gets a duplicate-warning before save).
+   * Mirrors replyagent's checkTriggerText exactly (only flags duplicates in OTHER
+   * automations' published versions; excludes the current activity by id).
+   */
+  async checkTriggerText(
+    workspaceId: bigint,
+    automationId: bigint,
+    activityId: bigint,
+    data: any,
+  ) {
+    if (!data?.trigger_text || !data?.event) {
+      throw new BadRequestException('trigger_text and event are required');
+    }
+
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!automation) throw new BadRequestException('Invalid request');
+
+    // Raw query mirrors replyagent's join logic. We use Prisma raw for the JSON path.
+    const rows = await this.prisma.$queryRawUnsafe<any[]>(
+      `
+      SELECT asa.id, asa.step_id, asa.properties
+      FROM automation_step_activities asa
+      JOIN automation_steps as_ ON asa.step_id = as_.id
+      JOIN automation_versions av ON av.id = as_.automation_version_id
+      JOIN automations a ON av.automation_id = a.id
+      WHERE a.workspace_id = ?
+        AND asa.deleted_at IS NULL
+        AND a.published_version_id IS NOT NULL
+        AND av.id <> ?
+        AND asa.event = ?
+        AND JSON_UNQUOTE(JSON_EXTRACT(asa.properties, '$.triggerText')) = ?
+        AND asa.id <> ?
+      LIMIT 1
+      `,
+      workspaceId.toString(),
+      (automation.published_version_id || 0n).toString(),
+      data.event,
+      data.trigger_text,
+      activityId.toString(),
+    );
+
+    const duplicate = rows && rows.length > 0 ? rows[0] : null;
+    return {
+      duplicate: !!duplicate,
+      duplicate_activity_id: duplicate?.id ? duplicate.id.toString() : null,
+    };
+  }
+
+  /**
+   * Validate that none of the given keywords are already used by a `trigger` step's
+   * activity for the same channel + modelable across this workspace. Replyagent uses
+   * this to prevent two automations responding to the same keyword.
+   */
+  async validateKeywords(activityId: bigint, data: any) {
+    const activity = await this.prisma.automation_step_activities.findUnique({
+      where: { id: activityId },
+    });
+    if (!activity) throw new NotFoundException('Activity not found');
+
+    const automationId = data?.automation_id;
+    const automation = automationId
+      ? await this.prisma.automations.findUnique({ where: { id: BigInt(automationId) } })
+      : null;
+    if (!automation) throw new BadRequestException('automation_id required');
+
+    const keywords: string[] = Array.isArray(data?.keywords) ? data.keywords : [];
+    const modelableId = data?.channel_id;
+    const channel = (data?.channel || '').toUpperCase();
+
+    const eventByChannel: Record<string, { event: string; jsonField: string }> = {
+      TELEGRAM: { event: 'telegram_keyword', jsonField: 'telegram_bot_id' },
+      MESSENGER: { event: 'facebook_keyword', jsonField: 'fb_page_id' },
+      WHATSAPP: { event: 'whatsapp_keyword', jsonField: 'wa_account_id' },
+      ZAPI: { event: 'zapi_keyword', jsonField: 'instance_id' },
+      INSTAGRAM: { event: 'instagram_keyword', jsonField: 'insta_page_id' },
+      TWILIO: { event: 'twilio_keyword', jsonField: 'twilio_number_id' },
+      WEBCHAT: { event: 'webchat_keyword', jsonField: 'instance_id' },
+    };
+    const channelCfg = eventByChannel[channel];
+    if (!channelCfg) {
+      return { success: true }; // Unknown channel — nothing to validate
+    }
+
+    const rows = await this.prisma.$queryRawUnsafe<any[]>(
+      `
+      SELECT asa.id, asa.properties, a.name AS automation_name
+      FROM automation_step_activities asa
+      JOIN automation_steps as_ ON asa.step_id = as_.id
+      JOIN automations a ON (
+        as_.automation_version_id = a.published_version_id
+        OR as_.automation_version_id = a.draft_version_id
+      )
+      WHERE a.workspace_id = ?
+        AND a.deleted_at IS NULL
+        AND as_.type = 'trigger'
+        AND asa.slug <> ?
+        AND asa.deleted_at IS NULL
+        AND asa.event = ?
+        AND JSON_UNQUOTE(JSON_EXTRACT(asa.properties, '$.${channelCfg.jsonField}')) = ?
+      `,
+      automation.workspace_id.toString(),
+      activity.slug || '',
+      channelCfg.event,
+      String(modelableId ?? ''),
+    );
+
+    for (const row of rows || []) {
+      const props = this.parseProperties(row.properties);
+      const dbKeywords: string[] = Array.isArray(props?.keywords) ? props.keywords : [];
+      const matches = dbKeywords.filter((k) => keywords.includes(k));
+      if (matches.length > 0) {
+        throw new BadRequestException({
+          code: 'DUPLICATE_KEYWORD',
+          keyword: matches.join(','),
+          automation_name: row.automation_name,
+        });
+      }
+    }
+
     return { success: true };
   }
 }
