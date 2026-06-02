@@ -187,6 +187,31 @@ export class ContactsService {
   }
 
   /**
+   * Enforce the workspace's contacts cap — replyagent parity.
+   * Only blocks when `limited_contacts` is on AND active count >= maximum_contacts.
+   * Called before any NEW contact insert (single add + CSV import). Throws so the
+   * upstream controller bubbles a 400 to the UI as a toast.
+   */
+  private async enforceContactsLimit(workspaceId: bigint): Promise<void> {
+    const ws = await this.prisma.workspaces.findUnique({
+      where: { id: workspaceId },
+      select: { limited_contacts: true, maximum_contacts: true },
+    });
+    if (!ws?.limited_contacts) return;
+    const max = Number(ws.maximum_contacts ?? 0);
+    if (max <= 0) return;
+    const current = await this.prisma.contacts.count({
+      where: {
+        workspace_id: workspaceId,
+        status: { not: 'DELETED' as any },
+      },
+    });
+    if (current >= max) {
+      throw new BadRequestException('Reached the limit');
+    }
+  }
+
+  /**
    * Add or Update a contact
    */
   async addContact(workspaceId: bigint, data: any, existingId?: bigint) {
@@ -227,9 +252,12 @@ export class ContactsService {
         data: payload,
       });
     } else {
-      // Identity Check
+      // Identity Check — reuse existing contact if email/phone already exists.
+      // The limit only blocks NEW contacts, so this must come BEFORE enforceContactsLimit.
       const existing = await this.findExistingContact(workspaceId, data.email, data.phone);
       if (existing) return await this.getContact(workspaceId, existing.id);
+
+      await this.enforceContactsLimit(workspaceId);
 
       contact = await this.prisma.contacts.create({
         data: {
@@ -547,6 +575,13 @@ export class ContactsService {
         });
         updated++;
       } else {
+        // Bulk import stops as soon as the cap is hit; already-created rows are kept.
+        // Returning early lets the controller surface "Reached the limit" + the partial counts.
+        try {
+          await this.enforceContactsLimit(workspaceId);
+        } catch {
+          break;
+        }
         const c = await this.prisma.contacts.create({
           data: {
             workspace_id: workspaceId,

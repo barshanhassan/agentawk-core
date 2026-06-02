@@ -67,8 +67,17 @@ export class WorkspacesService {
 
     let wsList;
     if (isAgencyOwner) {
+      // Agency-owner impersonation path — replyagent parity.
+      // The workspace's "Allow Support" toggle (allow_support) lets the workspace
+      // refuse agency access. When OFF the agency owner must not see / switch into it.
+      // Workspace members are unaffected (they hit the else branch via agency_user_id).
       wsList = await this.prisma.workspaces.findMany({
-        where: { agency_id: agencyId, deleted_at: null, status: 'ACTIVE' },
+        where: {
+          agency_id: agencyId,
+          deleted_at: null,
+          status: 'ACTIVE',
+          allow_support: true,
+        },
         orderBy: { created_at: 'desc' },
       });
     } else {
@@ -457,6 +466,30 @@ export class WorkspacesService {
    */
   async addMember(workspaceId: bigint, creatorId: bigint, data: any) {
     const { email, first_name, last_name, role_id, locale, tfa_required, mobile_access } = data;
+
+    // Enforce workspace agents_limit — replyagent parity.
+    // gateway/app/Http/Controllers/Api/WorkspacesController.php:337-341:
+    //   if ($total_members >= $request->site->agents_limit) {
+    //     return $this->respondError("Reached the limit", 'LIMIT_REACHED', 400);
+    //   }
+    // Active members only — exclude soft-deleted users so reusing a freed slot works.
+    const workspace = await this.prisma.workspaces.findUnique({
+      where: { id: workspaceId },
+      select: { agents_limit: true },
+    });
+    const limit = Number(workspace?.agents_limit ?? 0);
+    if (limit > 0) {
+      const totalMembers = await this.prisma.users.count({
+        where: {
+          modelable_id: workspaceId,
+          modelable_type: 'App\\Models\\Workspace',
+          status: { not: 'DELETED' },
+        },
+      });
+      if (totalMembers >= limit) {
+        throw new BadRequestException('Reached the limit');
+      }
+    }
 
     // Check if user already exists
     let user = await this.prisma.users.findFirst({
