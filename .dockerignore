@@ -5,6 +5,7 @@ dist
 .gitignore
 *.log
 scratch
+scripts
 scratch_user.js
 seed_users.js
 delete_other_users.js
