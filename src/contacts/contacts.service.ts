@@ -200,10 +200,13 @@ export class ContactsService {
     if (!ws?.limited_contacts) return;
     const max = Number(ws.maximum_contacts ?? 0);
     if (max <= 0) return;
+    // EZCONN soft-deletes contacts via `deleted_at` (deleteContact above:413-417),
+    // not via the contacts_status enum. Excluding deleted rows keeps freed slots
+    // available for new contacts — same intent as replyagent's billing checks.
     const current = await this.prisma.contacts.count({
       where: {
         workspace_id: workspaceId,
-        status: { not: 'DELETED' as any },
+        deleted_at: null,
       },
     });
     if (current >= max) {

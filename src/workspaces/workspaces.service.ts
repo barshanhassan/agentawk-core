@@ -472,7 +472,11 @@ export class WorkspacesService {
     //   if ($total_members >= $request->site->agents_limit) {
     //     return $this->respondError("Reached the limit", 'LIMIT_REACHED', 400);
     //   }
-    // Active members only — exclude soft-deleted users so reusing a freed slot works.
+    // Replyagent's Workspace::members() (Workspace.php:128-131) is a plain
+    // morphMany without scopes, and User does NOT use SoftDeletes. The EZCONN
+    // deleteMember below also performs a hard delete (prisma.users.deleteMany).
+    // So a simple count of all rows for this workspace = active member count.
+    // (users_status enum has no DELETED variant — earlier filter was invalid.)
     const workspace = await this.prisma.workspaces.findUnique({
       where: { id: workspaceId },
       select: { agents_limit: true },
@@ -483,7 +487,6 @@ export class WorkspacesService {
         where: {
           modelable_id: workspaceId,
           modelable_type: 'App\\Models\\Workspace',
-          status: { not: 'DELETED' },
         },
       });
       if (totalMembers >= limit) {
