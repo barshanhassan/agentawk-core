@@ -3780,6 +3780,7 @@ model wa_chats {
   created_at                DateTime? @db.Timestamp(0)
   updated_at                DateTime? @db.Timestamp(0)
 
+  @@unique([wa_account_id, wa_number_id, wa_id], map: "uk_wa_chats_account_number_waid")
   @@index([contact_id], map: "idx_wa_chats_on_contact_id")
   @@index([user_id], map: "idx_wa_chats_on_user_id")
   @@index([wa_account_id], map: "idx_wa_chats_on_wa_account_id")

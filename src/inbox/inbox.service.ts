@@ -48,10 +48,15 @@ export class InboxService {
       where.status = 'UNASSIGNED';
     } else if (status === 'active') {
       where.status = 'ACTIVE';
-    } else if (status === 'all') {
+    } else if (status === 'all' || !status) {
+      // "All" tab on the frontend sends status=undefined; treat that the same as
+      // an explicit 'all' — every non-deleted thread regardless of assignment.
+      // Without this branch, undefined would fall through to the ACTIVE default
+      // and UNASSIGNED rows (every newly-arrived WhatsApp chat) would vanish from
+      // the inbox list.
       where.status = { not: 'DELETED' };
     } else {
-      // Default to ACTIVE for "open" conversations
+      // Unknown explicit status value — fall back to ACTIVE for safety.
       where.status = 'ACTIVE';
     }
 
@@ -113,7 +118,51 @@ export class InboxService {
             item.contacts = await this.prisma.contacts.findUnique({
               where: { id: chat.contact_id },
             });
+
+            // Pull the contact's mobile number so the inbox card has something to
+            // show next to the name (Conversation.phoneNumber in the frontend).
+            // Workspace-scoped + matching the chat's channel (e.g. type='whatsapp').
+            const channelType = mType?.toLowerCase().includes('whatsapp')
+              ? 'whatsapp'
+              : mType?.toLowerCase().includes('telegram')
+              ? 'telegram'
+              : mType?.toLowerCase().includes('insta')
+              ? 'instagram'
+              : null;
+            if (channelType) {
+              const mobile = await this.prisma.contact_mobiles.findFirst({
+                where: {
+                  modelable_type: 'App\\Models\\Contact',
+                  modelable_id: chat.contact_id,
+                  ownership_type: 'App\\Models\\Workspace',
+                  ownership_id: inbox.workspace_id,
+                  type: channelType,
+                },
+                orderBy: { is_primary: 'desc' },
+              });
+              if (mobile && item.contacts) {
+                item.contacts.mobile_number = mobile.full_mobile_number ?? null;
+              }
+            }
           }
+
+          // Last message snippet for the inbox card. contact_last_messages is
+          // already keyed by (chatable_type, chatable_id) so a single query
+          // gives us the most recent line of the conversation.
+          if (mType && mId) {
+            const lastMsg = await this.prisma.contact_last_messages.findFirst({
+              where: { chatable_type: mType, chatable_id: mId },
+              orderBy: { created_at: 'desc' },
+              select: { message: true, message_type: true, created_at: true },
+            });
+            item.last_message_text = lastMsg?.message ?? null;
+            item.last_message_type = lastMsg?.message_type ?? null;
+          }
+
+          // Unread count proxy: inbox.is_read is 0 when an inbound message has
+          // landed since the user last opened the thread. A precise per-message
+          // read tracker ships in a later phase.
+          item.unread_count = inbox.is_read === 0 ? 1 : 0;
         } catch (err) {
           console.error(`Error fetching polymorphic data for inbox ${inbox.id}:`, err.message);
         }
@@ -535,21 +584,62 @@ export class InboxService {
 
   async assignConversation(data: any, workspaceId: bigint, userId: bigint) {
     const { inbox_id, assigned_to } = data;
-    const assignedToId = assigned_to ? BigInt(assigned_to) : null;
+
+    // Defensive coercion — `inbox_id` arrives from req.params (string) and
+    // `assigned_to` arrives from req.body (could be string, number, or even
+    // the literal "Me" sentinel the frontend sends when picking the current
+    // user). `BigInt()` on any non-numeric value throws, so we stringify-then-
+    // try once and treat anything we can't parse as "assign to me".
+    const inboxIdBig = this.toBigIntOrNull(inbox_id);
+    if (inboxIdBig === null) {
+      throw new BadRequestException(`Invalid inbox_id: ${inbox_id}`);
+    }
+
+    let assignedToId: bigint | null;
+    if (assigned_to === null || assigned_to === undefined || assigned_to === '') {
+      assignedToId = null;
+    } else if (typeof assigned_to === 'string' && assigned_to.toLowerCase() === 'me') {
+      // Frontend "Assign to Me" sends the literal — resolve to the caller.
+      assignedToId = userId;
+    } else {
+      const parsed = this.toBigIntOrNull(assigned_to);
+      assignedToId = parsed ?? userId; // fall back to the caller if the value isn't a valid user id
+    }
 
     const inbox = await this.prisma.inbox.findFirst({
-      where: { id: BigInt(inbox_id), workspace_id: workspaceId },
+      where: { id: inboxIdBig, workspace_id: workspaceId },
     });
     if (!inbox) throw new NotFoundException('Inbox not found');
 
     return this.prisma.inbox.update({
       where: { id: inbox.id },
       data: {
-        assigned_to: assignedToId,
+        // Use `user_id` (the schema field) — `assigned_to` doesn't exist on the inbox row.
+        user_id: assignedToId,
         assigned_by: userId,
         assigned_on: new Date(),
+        is_assigned: assignedToId ? 1 : 0,
+        status: assignedToId ? 'ACTIVE' : 'UNASSIGNED',
+        updated_at: new Date(),
       },
     });
+  }
+
+  /**
+   * Try to convert an unknown value to a BigInt. Returns null on anything
+   * non-numeric (including objects, NaN, empty strings, the literal "Me",
+   * or already-BigInt values that re-coerce cleanly).
+   */
+  private toBigIntOrNull(v: any): bigint | null {
+    if (v === null || v === undefined || v === '') return null;
+    if (typeof v === 'bigint') return v;
+    try {
+      const str = String(v).trim();
+      if (!/^-?\d+$/.test(str)) return null;
+      return BigInt(str);
+    } catch {
+      return null;
+    }
   }
 
   /**

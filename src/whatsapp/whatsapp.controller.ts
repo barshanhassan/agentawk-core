@@ -2,7 +2,10 @@ import { Controller, Get, Patch, Post, Body, UseGuards, Request } from '@nestjs/
 import { WhatsappService } from './whatsapp.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
 
-@Controller('api/whatsapp')
+// Vite dev proxy strips `/api` before hitting the backend, and the frontend's
+// apiRequest helper does the same in production (when VITE_API_BASE_URL is set).
+// Mirror the convention used by every other controller — bare path, no `api/` prefix.
+@Controller('whatsapp')
 @UseGuards(JwtAuthGuard)
 export class WhatsappController {
   constructor(private readonly whatsappService: WhatsappService) {}
@@ -46,5 +49,18 @@ export class WhatsappController {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     const userId = BigInt(req.user.sub || req.user.id || 0);
     return this.whatsappService.onboard(workspaceId, userId, body);
+  }
+
+  /**
+   * Manual onboarding (no Meta Embedded Signup). Frontend posts a form with
+   * { waba_id, access_token, name, phone_number_id, display_phone_number, verified_name? }.
+   * Backend persists wa_accounts + wa_phone_numbers (PENDING) and tells the
+   * WhatsApp microservice to register the account via WA_REGISTER.
+   */
+  @Post('onboard-manual')
+  async onboardManual(@Request() req, @Body() body) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    const userId = BigInt(req.user.sub || req.user.id || 0);
+    return this.whatsappService.onboardManual(workspaceId, userId, body);
   }
 }

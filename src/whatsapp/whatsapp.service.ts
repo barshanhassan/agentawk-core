@@ -1,13 +1,161 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { MetaGraphApiClient } from './meta-graph-api.client';
+import { RabbitMqService } from '../rabbitmq/rabbitmq.service';
 
 @Injectable()
 export class WhatsappService {
+  private readonly logger = new Logger(WhatsappService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly meta: MetaGraphApiClient,
+    private readonly rabbit: RabbitMqService,
+    private readonly config: ConfigService,
   ) {}
+
+  /**
+   * Manual onboarding — user types in WABA ID + access token + phone number ID
+   * (or pastes them from Meta dashboard). Skips Meta Embedded Signup entirely.
+   *
+   * Flow:
+   *   1. Validate payload and check ownership conflicts (no other workspace owns this WABA).
+   *   2. Upsert wa_accounts + wa_phone_numbers in PENDING status.
+   *   3. Publish WA_REGISTER to ra/whatsapp — microservice will create its MongoDB
+   *      account, generate a webhookToken, and subscribe the WABA to Meta's webhook.
+   *      We tag the payload's `meta.backend_wa_account_id` so when the microservice
+   *      echoes back WA_VERIFICATION_RESULT we can match it to our row.
+   *
+   * Status flips to ACTIVE only when WA_VERIFICATION_RESULT lands (handled in
+   * WhatsappEventsConsumer). Until then the row stays PENDING.
+   */
+  async onboardManual(
+    workspaceId: bigint,
+    userId: bigint,
+    payload: {
+      waba_id: string;
+      access_token: string;
+      name: string;
+      phone_number_id: string;
+      display_phone_number: string;
+      verified_name?: string;
+    },
+  ) {
+    const required = ['waba_id', 'access_token', 'name', 'phone_number_id', 'display_phone_number'] as const;
+    for (const k of required) {
+      if (!payload?.[k] || String(payload[k]).trim() === '') {
+        throw new BadRequestException(`${k} is required`);
+      }
+    }
+
+    // No cross-workspace WABA conflicts
+    const existingDifferentWs = await this.prisma.wa_accounts.findFirst({
+      where: { waba_id: payload.waba_id, deleted_at: null, workspace_id: { not: workspaceId } },
+    });
+    if (existingDifferentWs) {
+      throw new BadRequestException('This WABA is already connected to another workspace');
+    }
+
+    // No cross-account phone number conflicts (a phone number lives on a single WABA)
+    const existingPhoneOnOther = await this.prisma.wa_phone_numbers.findFirst({
+      where: { wa_number_id: payload.phone_number_id },
+      select: { id: true, wa_account_id: true },
+    });
+
+    const now = new Date();
+    const accountData: any = {
+      workspace_id: workspaceId,
+      user_id: userId,
+      waba_id: payload.waba_id,
+      name: payload.name,
+      currency: 'USD',
+      timezone_id: '0',
+      message_template_namespace: '',
+      access_token: payload.access_token,
+      status: 'PENDING',
+      service_account_id: '',
+      onboard_platform: 'whatsapp_business',
+      is_migrated: 0,
+      updated_at: now,
+    };
+
+    let account = await this.prisma.wa_accounts.findFirst({
+      where: { workspace_id: workspaceId, waba_id: payload.waba_id, deleted_at: null },
+    });
+    if (account) {
+      account = await this.prisma.wa_accounts.update({
+        where: { id: account.id },
+        data: accountData,
+      });
+    } else {
+      account = await this.prisma.wa_accounts.create({
+        data: { ...accountData, created_at: now },
+      });
+    }
+
+    if (existingPhoneOnOther && existingPhoneOnOther.wa_account_id !== account.id) {
+      throw new BadRequestException('Phone number is connected to another account');
+    }
+
+    const phoneData: any = {
+      wa_account_id: account.id,
+      wa_number_id: payload.phone_number_id,
+      display_phone_number: payload.display_phone_number,
+      phone_number: payload.display_phone_number.replace(/[^0-9]/g, ''),
+      pin_code: '',
+      verified_name: payload.verified_name ?? payload.name,
+      name_status: 'PENDING',
+      code_verification_status: 'NOT_VERIFIED',
+      status: 'PENDING',
+      quality_rating: 'UNKNOWN',
+      auto_reply_interval: '247',
+      platform_type: 'CLOUD_API',
+      smb_app_data: 0,
+      updated_at: now,
+    };
+    const existingPhone = await this.prisma.wa_phone_numbers.findFirst({
+      where: { wa_account_id: account.id, wa_number_id: payload.phone_number_id },
+    });
+    if (existingPhone) {
+      await this.prisma.wa_phone_numbers.update({ where: { id: existingPhone.id }, data: phoneData });
+    } else {
+      await this.prisma.wa_phone_numbers.create({ data: { ...phoneData, created_at: now } });
+    }
+
+    // Publish WA_REGISTER — microservice creates its MongoDB account, subscribes Meta
+    // webhook, then echoes WA_VERIFICATION_RESULT back to ra/gateway. We rely on the
+    // `meta.backend_wa_account_id` round-trip to flip status to ACTIVE.
+    const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
+    const whatsappQueue = this.config.get<string>('RABBITMQ_WHATSAPP_QUEUE') || 'whatsapp';
+    try {
+      await this.rabbit.publish(exchange, whatsappQueue, {
+        event: 'WA_REGISTER',
+        payload: {
+          whatsappAccountId: payload.waba_id,
+          accessToken: payload.access_token,
+          name: payload.name,
+          meta: {
+            backend_wa_account_id: account.id.toString(),
+            phone_number_id: payload.phone_number_id,
+            workspace_id: workspaceId.toString(),
+          },
+        },
+      });
+      this.logger.log(`WA_REGISTER published for wa_account_id=${account.id} waba_id=${payload.waba_id}`);
+    } catch (err: any) {
+      this.logger.error(`Failed to publish WA_REGISTER for wa_account_id=${account.id}: ${err?.message ?? err}`);
+      // Don't roll back the DB row — the user can retry registration without losing data,
+      // and the microservice may catch up once RabbitMQ recovers.
+    }
+
+    return {
+      success: true,
+      account_id: account.id.toString(),
+      status: account.status,
+      message: 'Account saved as PENDING. Will flip to ACTIVE once the WhatsApp microservice confirms registration.',
+    };
+  }
 
   /**
    * Meta Embedded Signup callback. The frontend popup completes the user-side

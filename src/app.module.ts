@@ -38,6 +38,7 @@ import { ChatStatisticsModule } from './chat-statistics/chat-statistics.module';
 import { EventLogsModule } from './event-logs/event-logs.module';
 import { LegalModule } from './legal/legal.module';
 import { QueueModule } from './queue/queue.module';
+import { RabbitMqModule } from './rabbitmq/rabbitmq.module';
 import { EvolutionModule } from './evolution/evolution.module';
 import { LogsModule } from './logs/logs.module';
 import { ReportsModule } from './reports/reports.module';
@@ -81,6 +82,7 @@ import { PermissionsGuard } from './auth/permissions.guard';
     EventEmitterModule.forRoot(),
     ScheduleModule.forRoot(),
     QueueModule.forRoot(),
+    RabbitMqModule,
     AuthModule,
     UsersModule,
     WorkspacesModule,
