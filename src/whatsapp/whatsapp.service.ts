@@ -49,6 +49,18 @@ export class WhatsappService {
       }
     }
 
+    // Fail fast on a bad / expired token — otherwise the user only finds out
+    // when the first outbound send returns 401 from Meta. This also catches
+    // mismatched (token, phone_number_id) pairs at form-submit time.
+    const probe = await this.meta.validatePhoneNumberAccess(payload.phone_number_id, payload.access_token);
+    if (!probe.ok) {
+      throw new BadRequestException(
+        `Meta rejected the access token / phone number ID: ${probe.error ?? 'unknown error'}. ` +
+          `Generate a fresh token from the Meta developer dashboard (WhatsApp → API Setup → Generate access token), ` +
+          `or use a System User token for long-lived access.`,
+      );
+    }
+
     // No cross-workspace WABA conflicts
     const existingDifferentWs = await this.prisma.wa_accounts.findFirst({
       where: { waba_id: payload.waba_id, deleted_at: null, workspace_id: { not: workspaceId } },
@@ -438,5 +450,61 @@ export class WhatsappService {
     }
 
     return { success: true, wamid, message };
+  }
+
+  /**
+   * Token health check for the workspace's WhatsApp account. Used by the UI to
+   * show a banner like "Token expires in 4 hours — refresh now" or "Using
+   * System User token (no expiry)".
+   *
+   * Token types Meta returns:
+   *   - USER         : 24-hour temp token, expires_at > 0
+   *   - SYSTEM_USER  : long-lived, expires_at == 0 (recommended for production)
+   *   - PAGE         : page-scoped, varies
+   *
+   * Response also includes a derived `recommendation` so the FE doesn't need
+   * to interpret expiry math.
+   */
+  async tokenStatus(workspaceId: bigint) {
+    const account = await this.prisma.wa_accounts.findFirst({
+      where: { workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!account) throw new NotFoundException('WhatsApp account not connected');
+
+    const debug = await this.meta.debugToken(account.access_token);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const expiresAt = debug.expiresAt && debug.expiresAt > 0 ? debug.expiresAt : null;
+    const secondsToExpiry = expiresAt ? Math.max(0, expiresAt - nowSec) : null;
+    const hoursToExpiry = secondsToExpiry != null ? Math.round(secondsToExpiry / 3600) : null;
+
+    let recommendation: 'OK' | 'REFRESH_SOON' | 'EXPIRED' | 'INVALID' | 'UPGRADE_TO_SYSTEM_USER';
+    if (!debug.isValid) {
+      recommendation = expiresAt && expiresAt < nowSec ? 'EXPIRED' : 'INVALID';
+    } else if (debug.type === 'SYSTEM_USER' || expiresAt == null) {
+      recommendation = 'OK';
+    } else if (secondsToExpiry != null && secondsToExpiry < 3600 * 4) {
+      recommendation = 'REFRESH_SOON';
+    } else if (debug.type === 'USER') {
+      // Working but temp — nudge to long-lived.
+      recommendation = 'UPGRADE_TO_SYSTEM_USER';
+    } else {
+      recommendation = 'OK';
+    }
+
+    return {
+      isValid: debug.isValid,
+      tokenType: debug.type ?? 'unknown',
+      expiresAt,
+      hoursToExpiry,
+      scopes: debug.scopes ?? [],
+      application: debug.application,
+      recommendation,
+      error: debug.error,
+      account: {
+        id: account.id.toString(),
+        waba_id: account.waba_id,
+        status: account.status,
+      },
+    };
   }
 }

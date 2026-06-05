@@ -5,9 +5,11 @@ import {
   NotFoundException,
   Logger,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChatGateway } from './chat.gateway';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import { RabbitMqService } from '../rabbitmq/rabbitmq.service';
 
 @Injectable()
 export class InboxService {
@@ -17,6 +19,8 @@ export class InboxService {
     private readonly prisma: PrismaService,
     private readonly chatGateway: ChatGateway,
     private readonly eventEmitter: EventEmitter2,
+    private readonly rabbit: RabbitMqService,
+    private readonly config: ConfigService,
   ) {}
 
   /**
@@ -420,34 +424,111 @@ export class InboxService {
 
     const type = inbox.modelable_type || '';
     const modelableId = inbox.modelable_id;
-    const text = data.text || data.message || '';
+    // Frontend (ConversationsInbox.tsx) sends `message_text`; older callers
+    // used `text` / `message`. Accept all three so the body never silently
+    // empties out.
+    const text = data.message_text ?? data.text ?? data.message ?? '';
 
     this.logger.log(`Processing outgoing message for inbox ${inboxId} (Type: ${type}, ID: ${modelableId})`);
+
+    if (!String(text).trim()) {
+      throw new BadRequestException('Message body is empty — provide message_text/text');
+    }
 
     let savedMessage = null;
 
     try {
       const lowerType = type.toLowerCase();
       if (lowerType.includes('whatsappchat')) {
+        // Replyagent-mirror flow:
+        //   1. wa_chats → wa_phone_numbers → wa_accounts (need wa_id + Meta phone_number_id + Mongo meta_account_id)
+        //   2. wa_messages row at status='pending' (so the chat UI shows the bubble immediately)
+        //   3. Publish WA_OUTBOUND_MESSAGE on ra/whatsapp — microservice calls Meta
+        //   4. Microservice echoes WA_OUTBOUND_MESSAGE_STATUS → consumer updates row to sent/failed
         const chat = await this.prisma.wa_chats.findUnique({
           where: { id: modelableId },
         });
-        if (chat) {
-          this.logger.log(`Found chat for WhatsApp. ID: ${chat.id.toString()}, WA_ID: ${chat.wa_id}`);
-          savedMessage = await this.prisma.wa_messages.create({
-            data: {
-              wa_chat_id: modelableId,
-              wa_number_id: chat.wa_number_id,
-              sender_id: userId,
-              text: text,
-              direction: 'OUTGOING',
-              type: 'text',
-              mobile_number: chat.wa_id || '',
-              status: 'sent',
+        if (!chat) {
+          this.logger.error(`No wa_chats record found for ID ${modelableId}`);
+          throw new NotFoundException('WhatsApp chat not found');
+        }
+        const phone = await this.prisma.wa_phone_numbers.findUnique({
+          where: { id: chat.wa_number_id },
+        });
+        if (!phone) {
+          throw new NotFoundException('WhatsApp phone number not found for this chat');
+        }
+        const account = await this.prisma.wa_accounts.findUnique({
+          where: { id: chat.wa_account_id },
+        });
+        if (!account) {
+          throw new NotFoundException('WhatsApp account not found for this chat');
+        }
+        if (!account.meta_account_id) {
+          throw new BadRequestException(
+            'WhatsApp account is not registered with the microservice yet (meta_account_id missing). Re-run "Connect Manually" on the WhatsApp settings page so registration completes.',
+          );
+        }
+
+        this.logger.log(
+          `Found chat for WhatsApp. chat_id=${chat.id.toString()}, wa_id=${chat.wa_id}, meta_account_id=${account.meta_account_id}`,
+        );
+
+        const sentAt = new Date();
+        savedMessage = await this.prisma.wa_messages.create({
+          data: {
+            wa_chat_id: modelableId,
+            wa_number_id: chat.wa_number_id,
+            sender_id: userId,
+            text: text,
+            direction: 'OUTGOING',
+            type: 'text',
+            mobile_number: chat.wa_id || '',
+            status: 'pending',
+            // Schema has created_at/updated_at as nullable with NO default. If we
+            // skip them, the chat list (which sorts by created_at ASC) treats
+            // these rows as NULL and renders them at the TOP instead of the
+            // bottom — outbound messages appear above the recipient's reply.
+            created_at: sentAt,
+            updated_at: sentAt,
+          },
+        });
+
+        const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
+        const whatsappQueue = this.config.get<string>('RABBITMQ_WHATSAPP_QUEUE') || 'whatsapp';
+        try {
+          await this.rabbit.publish(exchange, whatsappQueue, {
+            event: 'WA_OUTBOUND_MESSAGE',
+            payload: {
+              accountId: account.meta_account_id,
+              phoneNumberId: phone.wa_number_id,
+              context: {
+                messaging_product: 'whatsapp',
+                to: chat.wa_id,
+                type: 'text',
+                text: { body: text },
+              },
+              // Correlation tag — comes back via WA_OUTBOUND_MESSAGE_STATUS so the
+              // consumer can flip THIS row to sent/failed instead of guessing.
+              meta: {
+                backend_wa_message_id: savedMessage.id.toString(),
+                backend_inbox_id: inboxId.toString(),
+                workspace_id: account.workspace_id.toString(),
+              },
             },
           });
-        } else {
-          this.logger.error(`No wa_chats record found for ID ${modelableId}`);
+          this.logger.log(
+            `WA_OUTBOUND_MESSAGE published for wa_message_id=${savedMessage.id} inbox=${inboxId}`,
+          );
+        } catch (err: any) {
+          // Don't lose the row — mark it failed locally so the user sees a ❌.
+          await this.prisma.wa_messages.update({
+            where: { id: savedMessage.id },
+            data: { status: 'failed', error_data: String(err?.message ?? err) },
+          });
+          throw new BadRequestException(
+            `Could not queue WhatsApp message: ${err?.message ?? err}`,
+          );
         }
       } else if (type.includes('TelegramChat')) {
         savedMessage = await this.prisma.telegram_messages.create({
@@ -518,9 +599,10 @@ export class InboxService {
         },
       });
 
-      this.logger.log(`Message saved to DB for inbox ${inboxId}. API routing pending.`);
+      this.logger.log(`Message persisted for inbox ${inboxId} (channel: ${type})`);
 
-      // Real-time emission
+      // Real-time emission so the open chat updates instantly. For WhatsApp the
+      // bubble shows status='pending' until WA_OUTBOUND_MESSAGE_STATUS flips it.
       this.chatGateway.emitToWorkspace(inbox.workspace_id, 'new_message', {
         inbox_id: inboxId.toString(),
         message: savedMessage,
@@ -528,7 +610,7 @@ export class InboxService {
 
       return {
         success: true,
-        status: 'sent',
+        status: savedMessage?.status ?? 'sent',
         message: 'Message saved and queued for delivery',
         data: savedMessage,
       };

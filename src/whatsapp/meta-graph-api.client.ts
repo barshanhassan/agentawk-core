@@ -120,6 +120,71 @@ export class MetaGraphApiClient {
     return this.request('POST', `/${wabaId}/subscribed_apps`, accessToken);
   }
 
+  /**
+   * Debug the token — returns Meta's introspection result. Requires the app's
+   * own access token (built as `app_id|app_secret`) so the call is authorized
+   * to inspect arbitrary user tokens.
+   *
+   * Response shape (relevant fields):
+   *   data: { is_valid, type: 'USER' | 'SYSTEM_USER' | 'PAGE',
+   *           expires_at: 0 | <unix-seconds>, // 0 means no expiry (System User)
+   *           data_access_expires_at, scopes, app_id, application, user_id }
+   *
+   * Throws BadRequestException when META_APP_ID/SECRET are not configured.
+   */
+  async debugToken(token: string): Promise<{
+    isValid: boolean;
+    type?: string;
+    expiresAt?: number;
+    dataAccessExpiresAt?: number;
+    scopes?: string[];
+    appId?: string;
+    application?: string;
+    error?: string;
+  }> {
+    const appId = process.env.META_APP_ID;
+    const appSecret = process.env.META_APP_SECRET;
+    if (!appId || !appSecret) {
+      throw new BadRequestException('META_APP_ID and META_APP_SECRET must be set to debug tokens');
+    }
+    const appToken = `${appId}|${appSecret}`;
+    const url = `${this.base}/debug_token?input_token=${encodeURIComponent(token)}&access_token=${encodeURIComponent(appToken)}`;
+    const res = await fetch(url);
+    const json: any = await res.json().catch(() => ({}));
+
+    if (!res.ok || !json?.data) {
+      return {
+        isValid: false,
+        error: json?.error?.message ?? `HTTP ${res.status}`,
+      };
+    }
+    const d = json.data;
+    return {
+      isValid: d.is_valid === true,
+      type: d.type,
+      expiresAt: d.expires_at ?? undefined,
+      dataAccessExpiresAt: d.data_access_expires_at ?? undefined,
+      scopes: d.scopes ?? [],
+      appId: d.app_id,
+      application: d.application,
+      error: d.error?.message,
+    };
+  }
+
+  /**
+   * Quick validation used at onboard time — fetch the phone number details.
+   * Returns true if the (access_token, phone_number_id) pair works against
+   * Meta. Used to fail fast in onboardManual before persisting/publishing.
+   */
+  async validatePhoneNumberAccess(phoneNumberId: string, accessToken: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await this.fetchPhoneNumberDetails(phoneNumberId, accessToken);
+      return { ok: true };
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e) };
+    }
+  }
+
   // ─── Instagram / Messenger (Pages API) ──────────────────────────────
 
   /** Send DM via Instagram/Messenger using the Page's `me/messages` endpoint. */

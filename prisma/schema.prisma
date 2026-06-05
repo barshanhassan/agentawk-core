@@ -3747,11 +3747,13 @@ model wa_accounts {
   updated_at                   DateTime? @db.Timestamp(0)
   is_migrated                  Int       @default(0) @db.TinyInt
   onboard_platform             String?   @default("whatsapp_business") @db.VarChar(255)
+  meta_account_id              String?   @db.VarChar(64)
 
   @@index([status], map: "idx_wa_accounts_on_status")
   @@index([user_id], map: "idx_wa_accounts_on_user_id")
   @@index([waba_id], map: "idx_wa_accounts_on_waba_id")
   @@index([workspace_id], map: "idx_wa_accounts_on_workspace_id")
+  @@index([meta_account_id], map: "idx_wa_accounts_on_meta_account_id")
 }
 
 model wa_chats {

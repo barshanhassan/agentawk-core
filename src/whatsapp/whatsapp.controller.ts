@@ -63,4 +63,16 @@ export class WhatsappController {
     const userId = BigInt(req.user.sub || req.user.id || 0);
     return this.whatsappService.onboardManual(workspaceId, userId, body);
   }
+
+  /**
+   * Token health check — hits Meta's /debug_token to confirm the stored
+   * access_token is valid and report expiry. Used by the WhatsApp settings
+   * page to render a banner ("Token expires in 4 hours") or to nudge the
+   * user toward a System User token.
+   */
+  @Get('token-status')
+  async tokenStatus(@Request() req) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.whatsappService.tokenStatus(workspaceId);
+  }
 }

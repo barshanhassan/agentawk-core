@@ -52,10 +52,105 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       case 'WA_VERIFICATION_RESULT':
         await this.onVerificationResult(envelope.payload);
         return;
+      case 'WA_OUTBOUND_MESSAGE_STATUS':
+        await this.onOutboundMessageStatus(envelope.payload);
+        return;
+      case 'WA_MESSAGE_STATUS':
+        await this.onMessageStatus(envelope.payload);
+        return;
       default:
         // Defer other events to later phases. Log so we can see what's being skipped.
         this.logger.debug(`Skipping event ${event} (not handled yet)`);
         return;
+    }
+  }
+
+  /**
+   * Status progression for outbound WhatsApp messages, from earliest to
+   * latest. Used to prevent out-of-order webhooks from downgrading a row
+   * (e.g. a delayed "delivered" arriving AFTER "read" must not overwrite).
+   * 'failed' is a terminal terminal-status that can land at any point.
+   */
+  private static readonly OUTBOUND_STATUS_RANK: Record<string, number> = {
+    pending: 0,
+    sent: 1,
+    delivered: 2,
+    read: 3,
+  };
+
+  /**
+   * Meta webhook → microservice → ra/gateway as `WA_MESSAGE_STATUS`.
+   * Payload shape (from MessageService.processMessage statuses branch):
+   *   { messageId (wamid), status: 'sent'|'delivered'|'read'|'failed',
+   *     timestamp, recipient_id, errors?, phone, account }
+   *
+   * We correlate by wamid (set on wa_messages when WA_OUTBOUND_MESSAGE_STATUS
+   * came back from the immediate API call), apply a no-downgrade update, and
+   * broadcast to the workspace so the UI flips the tick marks.
+   */
+  private async onMessageStatus(payload: any): Promise<void> {
+    const wamid = payload?.messageId;
+    const newStatus = payload?.status;
+    if (!wamid || !newStatus) {
+      this.logger.warn(
+        `WA_MESSAGE_STATUS missing messageId or status — dropping. Payload keys: ${Object.keys(payload ?? {}).join(',')}`,
+      );
+      return;
+    }
+
+    const msg = await this.prisma.wa_messages.findFirst({ where: { wamid } });
+    if (!msg) {
+      // Most likely the row was created by a different backend instance or
+      // wamid persistence is lagging behind. Log and bail — the next status
+      // event will likely succeed once the row catches up.
+      this.logger.warn(`WA_MESSAGE_STATUS for unknown wamid=${wamid} (status=${newStatus})`);
+      return;
+    }
+
+    const currentRank = WhatsappEventsConsumer.OUTBOUND_STATUS_RANK[msg.status] ?? 0;
+    const newRank = WhatsappEventsConsumer.OUTBOUND_STATUS_RANK[newStatus] ?? 0;
+    const isTerminalFailure = newStatus === 'failed';
+
+    // Allow only forward progression OR a failed-state takeover. This protects
+    // against late "delivered" webhooks overwriting a confirmed "read".
+    if (!isTerminalFailure && newRank <= currentRank) {
+      this.logger.debug(
+        `WA_MESSAGE_STATUS no-op for wa_message ${msg.id}: ${msg.status}(${currentRank}) >= ${newStatus}(${newRank})`,
+      );
+      return;
+    }
+
+    const now = new Date();
+    const errorData =
+      Array.isArray(payload.errors) && payload.errors[0]
+        ? JSON.stringify(payload.errors[0])
+        : null;
+
+    await this.prisma.wa_messages.update({
+      where: { id: msg.id },
+      data: {
+        status: newStatus,
+        updated_at: now,
+        ...(errorData ? { error_data: errorData } : {}),
+      },
+    });
+
+    this.logger.log(
+      `wa_message ${msg.id} status ${msg.status} → ${newStatus} (wamid=${wamid})`,
+    );
+
+    // Broadcast a status delta to the workspace so the open chat re-renders ticks.
+    const chat = await this.prisma.wa_chats.findUnique({ where: { id: msg.wa_chat_id } });
+    if (chat) {
+      const account = await this.prisma.wa_accounts.findUnique({ where: { id: chat.wa_account_id } });
+      if (account) {
+        this.chatGateway.emitToWorkspace(account.workspace_id, 'message_status', {
+          wa_message_id: msg.id.toString(),
+          wamid,
+          status: newStatus,
+          error: errorData,
+        });
+      }
     }
   }
 
@@ -89,25 +184,120 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       return;
     }
 
+    // Capture the microservice's Mongo _id so the outbound flow can address the
+    // account when publishing WA_OUTBOUND_MESSAGE. The microservice (post-patch)
+    // returns the existing doc on ACCOUNT_EXIST too, so this value is reliable
+    // whether registration created a fresh doc or re-used one.
+    const metaAccountId =
+      payload?.account?.id != null ? String(payload.account.id) : null;
+
     const now = new Date();
     if (payload.status === 'VERIFIED') {
       await this.prisma.wa_accounts.update({
         where: { id: account.id },
-        data: { status: 'ACTIVE', updated_at: now },
+        data: {
+          status: 'ACTIVE',
+          updated_at: now,
+          ...(metaAccountId ? { meta_account_id: metaAccountId } : {}),
+        },
       });
       // Flip the linked phone number too so the UI shows it as live.
       await this.prisma.wa_phone_numbers.updateMany({
         where: { wa_account_id: account.id, status: 'PENDING' },
         data: { status: 'ACTIVE', last_onboarded_time: now, updated_at: now },
       });
-      this.logger.log(`wa_account ${account.id} (waba=${account.waba_id}) verified — status=ACTIVE`);
+      this.logger.log(
+        `wa_account ${account.id} (waba=${account.waba_id}) verified — status=ACTIVE, meta_account_id=${metaAccountId ?? '(none)'}`,
+      );
     } else {
       const errorCode = typeof payload.status === 'string' ? payload.status : 'REGISTRATION_FAILED';
       await this.prisma.wa_accounts.update({
         where: { id: account.id },
-        data: { status: 'FAILED', error_code: errorCode, updated_at: now },
+        data: {
+          status: 'FAILED',
+          error_code: errorCode,
+          updated_at: now,
+          ...(metaAccountId ? { meta_account_id: metaAccountId } : {}),
+        },
       });
       this.logger.warn(`wa_account ${account.id} registration FAILED — code=${errorCode}`);
+    }
+  }
+
+  /**
+   * Microservice publishes this after attempting an outbound Meta API call:
+   *   { meta: { backend_wa_message_id }, status: 'sent' | 'failed', messageId?, error? }
+   *
+   * We tagged the outbound payload with `meta.backend_wa_message_id` (the
+   * wa_messages.id we created at PENDING). On status arrival we flip the row
+   * to `sent` (storing the Meta wamid for future webhook correlation) or
+   * `failed` (with the error payload), then broadcast a delta to the workspace
+   * so the chat UI updates its delivery tick.
+   *
+   * Mirrors gateway PHP's WhatsappMessageBroker → outboundMessageStatus().
+   */
+  private async onOutboundMessageStatus(payload: any): Promise<void> {
+    const backendMsgId = payload?.meta?.backend_wa_message_id;
+    if (!backendMsgId) {
+      this.logger.warn(
+        `WA_OUTBOUND_MESSAGE_STATUS missing meta.backend_wa_message_id — cannot correlate. Status was: ${payload?.status}`,
+      );
+      return;
+    }
+
+    let waMessageId: bigint;
+    try {
+      waMessageId = BigInt(backendMsgId);
+    } catch {
+      this.logger.warn(`WA_OUTBOUND_MESSAGE_STATUS unparseable backend_wa_message_id=${backendMsgId}`);
+      return;
+    }
+
+    const msg = await this.prisma.wa_messages.findUnique({ where: { id: waMessageId } });
+    if (!msg) {
+      this.logger.warn(`WA_OUTBOUND_MESSAGE_STATUS for missing wa_message_id=${waMessageId}`);
+      return;
+    }
+
+    const now = new Date();
+    const status = String(payload?.status ?? '').toLowerCase();
+    const wamid = payload?.messageId ?? null;
+    const errorPayload = payload?.error ? JSON.stringify(payload.error) : null;
+
+    if (status === 'sent') {
+      await this.prisma.wa_messages.update({
+        where: { id: msg.id },
+        data: {
+          status: 'sent',
+          wamid: wamid ?? undefined,
+          updated_at: now,
+        },
+      });
+      this.logger.log(`wa_message ${msg.id} → sent (wamid=${wamid ?? 'unknown'})`);
+    } else {
+      await this.prisma.wa_messages.update({
+        where: { id: msg.id },
+        data: {
+          status: 'failed',
+          error_data: errorPayload,
+          updated_at: now,
+        },
+      });
+      this.logger.warn(`wa_message ${msg.id} → failed (${errorPayload ?? 'no error data'})`);
+    }
+
+    // Broadcast a status delta to the workspace so the open chat updates its tick.
+    const chat = await this.prisma.wa_chats.findUnique({ where: { id: msg.wa_chat_id } });
+    if (chat) {
+      const account = await this.prisma.wa_accounts.findUnique({ where: { id: chat.wa_account_id } });
+      if (account) {
+        this.chatGateway.emitToWorkspace(account.workspace_id, 'message_status', {
+          wa_message_id: msg.id.toString(),
+          status: status === 'sent' ? 'sent' : 'failed',
+          wamid: wamid ?? null,
+          error: errorPayload,
+        });
+      }
     }
   }
 

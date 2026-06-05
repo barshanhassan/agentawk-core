@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { RabbitMqService } from './rabbitmq.service';
 import { WhatsappEventsConsumer } from './whatsapp-events.consumer';
 import { PrismaModule } from '../prisma/prisma.module';
@@ -11,11 +11,12 @@ import { InboxModule } from '../inbox/inbox.module';
  * Microservice publishes WA events to exchange "ra" / queue "gateway".
  * Backend subscribes here and turns them into Prisma writes + WebSocket events.
  *
- * Outbound (backend → microservice → Meta) will reuse RabbitMqService.publish()
- * to push onto the "whatsapp" queue when Phase 5B wires the send path.
+ * Outbound (backend → microservice → Meta) reuses RabbitMqService.publish()
+ * from InboxService — InboxModule imports us via forwardRef to break the
+ * cycle (we need its ChatGateway; it needs our RabbitMqService).
  */
 @Module({
-  imports: [PrismaModule, InboxModule],
+  imports: [PrismaModule, forwardRef(() => InboxModule)],
   providers: [RabbitMqService, WhatsappEventsConsumer],
   exports: [RabbitMqService],
 })
