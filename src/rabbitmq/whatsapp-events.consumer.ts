@@ -194,8 +194,10 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       payload?.account?.id != null ? String(payload.account.id) : null;
 
     const now = new Date();
+    let updatedAccount: any = null;
+    let updatedNumbers: any[] = [];
     if (payload.status === 'VERIFIED') {
-      await this.prisma.wa_accounts.update({
+      updatedAccount = await this.prisma.wa_accounts.update({
         where: { id: account.id },
         data: {
           status: 'ACTIVE',
@@ -208,12 +210,15 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
         where: { wa_account_id: account.id, status: 'PENDING' },
         data: { status: 'ACTIVE', last_onboarded_time: now, updated_at: now },
       });
+      updatedNumbers = await this.prisma.wa_phone_numbers.findMany({
+        where: { wa_account_id: account.id },
+      });
       this.logger.log(
         `wa_account ${account.id} (waba=${account.waba_id}) verified — status=ACTIVE, meta_account_id=${metaAccountId ?? '(none)'}`,
       );
     } else {
       const errorCode = typeof payload.status === 'string' ? payload.status : 'REGISTRATION_FAILED';
-      await this.prisma.wa_accounts.update({
+      updatedAccount = await this.prisma.wa_accounts.update({
         where: { id: account.id },
         data: {
           status: 'FAILED',
@@ -223,6 +228,35 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
         },
       });
       this.logger.warn(`wa_account ${account.id} registration FAILED — code=${errorCode}`);
+    }
+
+    // Notify the workspace's connected clients so the WhatsApp settings page
+    // (and any other listener) re-fetches the channels list and flips the
+    // status badge from PENDING → ACTIVE / FAILED in real time. Without this
+    // the user has to refresh the page to see the result.
+    try {
+      const serialize = (row: any) => ({
+        ...row,
+        id: row.id?.toString(),
+        workspace_id: row.workspace_id?.toString(),
+        user_id: row.user_id?.toString?.(),
+        wa_account_id: row.wa_account_id?.toString?.(),
+        auto_reply_automation_id: row.auto_reply_automation_id?.toString?.() ?? null,
+      });
+      this.chatGateway.emitToWorkspace(
+        account.workspace_id,
+        'whatsapp.account_updated',
+        serialize(updatedAccount),
+      );
+      for (const n of updatedNumbers) {
+        this.chatGateway.emitToWorkspace(
+          account.workspace_id,
+          'whatsapp.number_updated',
+          serialize(n),
+        );
+      }
+    } catch (e: any) {
+      this.logger.debug(`onVerificationResult emit failed: ${e?.message ?? e}`);
     }
   }
 
