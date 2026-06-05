@@ -693,7 +693,7 @@ export class InboxService {
     });
     if (!inbox) throw new NotFoundException('Inbox not found');
 
-    return this.prisma.inbox.update({
+    const updated = await this.prisma.inbox.update({
       where: { id: inbox.id },
       data: {
         // Use `user_id` (the schema field) — `assigned_to` doesn't exist on the inbox row.
@@ -705,6 +705,58 @@ export class InboxService {
         updated_at: new Date(),
       },
     });
+
+    // Fire conversation.assigned for any matching `conversation_assigned`
+    // trigger activities. Contact resolution is best-effort — channel chat
+    // tables hold the contact_id mapping.
+    const contactId = await this.resolveInboxContact(updated);
+    if (contactId) {
+      this.eventEmitter.emit('conversation.assigned', {
+        contactId,
+        workspaceId,
+        userId: assignedToId,
+        inboxId: updated.id,
+      });
+    }
+
+    return updated;
+  }
+
+  /**
+   * Resolve the contact behind an inbox row. Walks the channel-specific chat
+   * tables based on `modelable_type`. Centralised here so all the inbox
+   * service methods that emit contact-scoped events resolve the same way.
+   */
+  private async resolveInboxContact(inbox: { modelable_type: string | null; modelable_id: bigint }): Promise<bigint | null> {
+    const mType = inbox.modelable_type ?? '';
+    const mId = inbox.modelable_id;
+    if (!mId) return null;
+    try {
+      if (mType.includes('WhatsappChat')) {
+        const chat = await this.prisma.wa_chats.findUnique({ where: { id: mId } });
+        return chat?.contact_id ?? null;
+      }
+      if (mType.includes('TelegramChat')) {
+        const chat = await this.prisma.telegram_chats.findUnique({ where: { id: mId } });
+        return chat?.contact_id ?? null;
+      }
+      if (mType.includes('FacebookChat')) {
+        const chat = await this.prisma.fb_chats.findUnique({ where: { id: mId } });
+        return chat?.contact_id ?? null;
+      }
+      if (mType.includes('InstagramChat') || mType.includes('InstaChat')) {
+        const chat = await this.prisma.insta_chats.findUnique({ where: { id: mId } });
+        return chat?.contact_id ?? null;
+      }
+      if (mType.includes('WebchatChat') || mType.includes('WcChat')) {
+        const chat = await this.prisma.wc_chats.findUnique({ where: { id: mId } });
+        return chat?.contact_id ?? null;
+      }
+      if (mType.includes('App\\Models\\Contact')) {
+        return mId;
+      }
+    } catch {}
+    return null;
   }
 
   /**
@@ -750,10 +802,25 @@ export class InboxService {
     status: string,
     workspaceId: bigint,
   ) {
-    return this.prisma.inbox.update({
+    const updated = await this.prisma.inbox.update({
       where: { id: inboxId, workspace_id: workspaceId },
       data: { status },
     });
+
+    // When a conversation is marked done, fire the trigger event so any
+    // `conversation_marked_as_done` automation activities can dispatch.
+    if (status === 'COMPLETED') {
+      const contactId = await this.resolveInboxContact(updated);
+      if (contactId) {
+        this.eventEmitter.emit('conversation.marked_as_done', {
+          contactId,
+          workspaceId,
+          inboxId: updated.id,
+        });
+      }
+    }
+
+    return updated;
   }
 
   /** List conversation folders for a workspace (does NOT create — mirrors replyagent's getSettings folders). */

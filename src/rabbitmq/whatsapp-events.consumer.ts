@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChatGateway } from '../inbox/chat.gateway';
 import { RabbitMqService } from './rabbitmq.service';
@@ -29,6 +30,7 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     private readonly prisma: PrismaService,
     private readonly chatGateway: ChatGateway,
     private readonly config: ConfigService,
+    private readonly events: EventEmitter2,
   ) {}
 
   onApplicationBootstrap() {
@@ -487,6 +489,46 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       text,
       timestamp: msg.timestamp ?? null,
     });
+
+    // Automation trigger events — `message.inbound` is the catch-all that
+    // AutomationTriggerService listens on. Channel-specific specialisations
+    // (wa_ref_start, wa_ad_clicked) come from the same Meta payload shape:
+    //   - Ref-link starts:   the inbound text body opens with a `ref_<code>`
+    //     token because the user clicked a wa.me link with `?text=ref_<code>`.
+    //   - Ad-click inbounds: Meta attaches a `referral` object with
+    //     `source_type === 'ad'` and the ad/post identifiers.
+    // Both shapes are documented at
+    //   https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/
+    this.events.emit('message.inbound', {
+      workspaceId: account.workspace_id,
+      inboxId: inboxRow.id,
+      contactId: contact.id,
+      channel: 'whatsapp',
+      text,
+    });
+
+    const refMatch = typeof text === 'string' ? text.match(/^\s*ref[_:\-]([A-Za-z0-9_\-.]+)/i) : null;
+    if (refMatch) {
+      this.events.emit('message.wa_ref_start', {
+        contactId: contact.id,
+        workspaceId: account.workspace_id,
+        refCode: refMatch[1],
+      });
+    }
+
+    const referral = msg?.referral;
+    if (referral && (referral.source_type === 'ad' || referral.source_type === 'ctwa_ad')) {
+      this.events.emit('message.wa_ad_clicked', {
+        contactId: contact.id,
+        workspaceId: account.workspace_id,
+        adId:
+          referral.source_id ??
+          referral.source?.id ??
+          referral.ad_id ??
+          null,
+        referral,
+      });
+    }
 
     this.logger.log(`WA inbound saved: chat=${chat.id} message=${insertedMessage.id} from=${fullMobile}`);
   }

@@ -132,13 +132,28 @@ export class ContactsService {
    * Helper to sync tags for a contact
    */
   private async syncTags(workspaceId: bigint, contactId: bigint, tagNames: string[]) {
-    // 1. Remove existing tag links for this contact
+    // 1. Capture-then-remove so we can emit tag_removed for each detached tag.
+    //    Skipping this would silently miss every `tag_removed` automation trigger.
+    const existingLinks = await this.prisma.tag_links.findMany({
+      where: {
+        linkable_type: 'App\\Models\\Contact',
+        linkable_id: contactId,
+      },
+      select: { tag_id: true },
+    });
     await this.prisma.tag_links.deleteMany({
       where: {
         linkable_type: 'App\\Models\\Contact',
         linkable_id: contactId
       }
     });
+    for (const link of existingLinks) {
+      this.eventEmitter.emit('contact.tag_removed', {
+        contactId,
+        tagId: link.tag_id,
+        workspaceId,
+      });
+    }
 
     if (!tagNames || tagNames.length === 0) return;
 
@@ -315,6 +330,16 @@ export class ContactsService {
       }
     }
 
+    // Fire the contact.created event so AutomationTriggerService can match any
+    // `contact_added` trigger activities. Per replyagent parity this fires
+    // exactly once, after the contact + mobiles + emails + tags + custom fields
+    // are all persisted (avoids partial-state races during automation execution).
+    this.eventEmitter.emit('contact.created', {
+      contactId: contact.id,
+      workspaceId,
+      source: 'MANUAL',
+    });
+
     return await this.getContact(workspaceId, contact.id);
   }
 
@@ -338,15 +363,47 @@ export class ContactsService {
           where: { id: contactId },
           data: updatePayload,
         });
+        // Trigger emission: any `system_field_changed` automation can react.
+        // We also flag the special date-field case so `date_field_changed`
+        // listeners fire too (replyagent parity — date-field triggers are a
+        // distinct event so flows can schedule on them).
+        this.eventEmitter.emit('contact.system_field_changed', {
+          contactId,
+          field: field.slug,
+          value: field.value,
+          workspaceId,
+        });
+        if (this.isLikelyDateField(field?.slug, field?.value)) {
+          this.eventEmitter.emit('contact.date_field_changed', {
+            contactId,
+            field: field.slug,
+            value: field.value,
+            workspaceId,
+          });
+        }
       } else if (field_type === 'CUSTOM_FIELD') {
         const cf = await this.prisma.custom_fields.findFirst({
           where: { workspace_id: workspaceId, slug: field.slug }
         });
         if (cf) {
           await this.customFieldsService.upsertFieldValue('Contact', contactId, cf.id, String(field.value));
+          this.eventEmitter.emit('contact.custom_field_changed', {
+            contactId,
+            fieldId: cf.id,
+            value: field.value,
+            workspaceId,
+          });
+          if (this.isCustomDateField(cf)) {
+            this.eventEmitter.emit('contact.date_field_changed', {
+              contactId,
+              field: cf.slug,
+              value: field.value,
+              workspaceId,
+            });
+          }
         }
       }
-    } 
+    }
     // Handle direct object update (from edit modal or bulk edit)
     else {
       const payload: any = {};
@@ -356,12 +413,22 @@ export class ContactsService {
          payload.full_name = `${data.first_name || contact.first_name || ''} ${data.last_name || contact.last_name || ''}`.trim();
       }
       if (data.title !== undefined) payload.title = data.title;
-      
+
       if (Object.keys(payload).length > 0) {
         await this.prisma.contacts.update({
           where: { id: contactId },
           data: payload
         });
+        // Fire one emission per touched system column so individual
+        // triggers (system_field_changed with `field` filter) can react.
+        for (const k of Object.keys(payload)) {
+          this.eventEmitter.emit('contact.system_field_changed', {
+            contactId,
+            field: k,
+            value: payload[k],
+            workspaceId,
+          });
+        }
       }
 
       if (data.tags && Array.isArray(data.tags)) {
@@ -375,12 +442,50 @@ export class ContactsService {
           });
           if (cf) {
             await this.customFieldsService.upsertFieldValue('Contact', contactId, cf.id, String(value));
+            this.eventEmitter.emit('contact.custom_field_changed', {
+              contactId,
+              fieldId: cf.id,
+              value,
+              workspaceId,
+            });
+            if (this.isCustomDateField(cf)) {
+              this.eventEmitter.emit('contact.date_field_changed', {
+                contactId,
+                field: cf.slug,
+                value,
+                workspaceId,
+              });
+            }
           }
         }
       }
     }
 
     return await this.getContact(workspaceId, contactId);
+  }
+
+  /**
+   * Coarse heuristic — system fields whose slug looks like a date column,
+   * OR whose stored value already parses as an ISO date string. Used to
+   * decide whether to fire `contact.date_field_changed` alongside the
+   * normal system_field_changed emission.
+   */
+  private isLikelyDateField(slug: string | undefined, value: any): boolean {
+    if (!slug) return false;
+    if (/(date|birth|anniversary|expires|expiry|due|scheduled)/i.test(slug)) return true;
+    if (typeof value === 'string' && /\d{4}-\d{2}-\d{2}/.test(value)) return true;
+    return false;
+  }
+
+  /**
+   * Whether a custom_fields row represents a date input. Mirrors the
+   * `content_type` / `input_type` enums set when a workspace owner creates
+   * a date-typed custom field.
+   */
+  private isCustomDateField(cf: any): boolean {
+    const inputType = String(cf?.input_type ?? '').toLowerCase();
+    const contentType = String(cf?.content_type ?? '').toLowerCase();
+    return inputType.includes('date') || contentType.includes('date');
   }
 
   private serialize(obj: any) {
@@ -470,13 +575,33 @@ export class ContactsService {
       where: { id: { in: contactIds }, workspace_id: workspaceId },
       select: { id: true },
     });
+    const validIds = valid.map((c) => c.id);
+
+    // Capture-then-delete so we can fire `contact.tag_removed` for each
+    // (contact, tag) pair — required for AutomationTriggerService's
+    // tag_removed listener to dispatch matching trigger activities.
+    const linksToRemove = await this.prisma.tag_links.findMany({
+      where: {
+        linkable_type: 'App\\Models\\Contact',
+        linkable_id: { in: validIds },
+        tag_id: { in: tagIds },
+      },
+      select: { linkable_id: true, tag_id: true },
+    });
     const result = await this.prisma.tag_links.deleteMany({
       where: {
         linkable_type: 'App\\Models\\Contact',
-        linkable_id: { in: valid.map((c) => c.id) },
+        linkable_id: { in: validIds },
         tag_id: { in: tagIds },
       },
     });
+    for (const link of linksToRemove) {
+      this.eventEmitter.emit('contact.tag_removed', {
+        contactId: link.linkable_id,
+        tagId: link.tag_id,
+        workspaceId,
+      });
+    }
     return { removed: result.count };
   }
 

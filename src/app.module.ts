@@ -29,6 +29,7 @@ import { CustomFieldsModule } from './custom-fields/custom-fields.module';
 import { TasksModule } from './tasks/tasks.module';
 import { CalModule } from './cal/cal.module';
 import { AutomationsModule } from './automations/automations.module';
+import { MetaWebhooksModule } from './meta-webhooks/meta-webhooks.module';
 import { BroadcastsModule } from './broadcasts/broadcasts.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { TriggersModule } from './triggers/triggers.module';
@@ -106,6 +107,7 @@ import { PermissionsGuard } from './auth/permissions.guard';
     TasksModule,
     CalModule,
     AutomationsModule,
+    MetaWebhooksModule,
     BroadcastsModule,
     NotificationsModule,
     TriggersModule,

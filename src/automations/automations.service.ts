@@ -2019,4 +2019,618 @@ export class AutomationsService {
 
     return { success: true };
   }
+
+  /**
+   * Import an automation from a serialized export. Recreates the automation
+   * + draft version + steps + activities + connections + quick replies,
+   * remapping foreign slugs to fresh ones so multiple imports coexist.
+   *
+   * Mirrors replyagent's AutomationsController::import() — but lives in the
+   * service so the controller stays thin.
+   */
+  async importAutomation(workspaceId: bigint, userId: bigint, payload: any) {
+    if (!payload?.name) {
+      throw new BadRequestException('name is required');
+    }
+    const now = new Date();
+
+    // 1. Create the automation shell.
+    const automation = await this.prisma.automations.create({
+      data: {
+        slug: this.generateSlug(),
+        workspace_id: workspaceId,
+        folder_id: payload.folder_id ? BigInt(payload.folder_id) : null,
+        creator_id: userId,
+        updater_id: userId,
+        name: String(payload.name),
+        status: 'draft',
+        template: payload.template ?? '',
+        message_template_namespace: '' as any,
+        is_migrated: 0,
+        created_at: now,
+        updated_at: now,
+      } as any,
+    });
+
+    // 2. Draft version.
+    const version = await this.prisma.automation_versions.create({
+      data: {
+        automation_id: automation.id,
+        number: 1,
+        status: 'draft',
+        publisher_id: userId,
+        created_at: now,
+      } as any,
+    });
+    await this.prisma.automations.update({
+      where: { id: automation.id },
+      data: { draft_version_id: version.id },
+    });
+
+    // 3. Slug remap tables — foreign slugs come from the export, fresh ones
+    //    get generated locally. Connections in step 4 use these maps to
+    //    resolve the new step/activity ids.
+    const stepIdBySlug = new Map<string, bigint>();
+    const stepSlugRemap = new Map<string, string>(); // old → new slug
+    const activityIdBySlug = new Map<string, bigint>();
+    const activitySlugRemap = new Map<string, string>();
+    const qrIdBySlug = new Map<string, bigint>();
+    const qrSlugRemap = new Map<string, string>();
+
+    // 4. Recreate steps + their activities + quick replies.
+    const stepsIn = Array.isArray(payload.steps) ? payload.steps : [];
+    for (const s of stepsIn) {
+      const oldSlug = String(s.slug ?? '');
+      const newSlug = this.generateSlug();
+      if (oldSlug) stepSlugRemap.set(oldSlug, newSlug);
+
+      const step = await this.prisma.automation_steps.create({
+        data: {
+          automation_version_id: version.id,
+          slug: newSlug,
+          title: String(s.title ?? 'Step'),
+          type: String(s.type ?? 'action'),
+          properties: typeof s.properties === 'string' ? s.properties : JSON.stringify(s.properties ?? {}),
+          cloneable: s.cloneable !== false,
+          deletable: s.deletable !== false,
+          linkable: s.linkable !== false,
+        } as any,
+      });
+      if (oldSlug) stepIdBySlug.set(oldSlug, step.id);
+      stepIdBySlug.set(newSlug, step.id);
+
+      // Activities under this step.
+      const acts = Array.isArray(s.activities) ? s.activities : [];
+      for (let i = 0; i < acts.length; i++) {
+        const a = acts[i];
+        const oldA = String(a.slug ?? '');
+        const newA = this.generateSlug();
+        if (oldA) activitySlugRemap.set(oldA, newA);
+
+        const activity = await this.prisma.automation_step_activities.create({
+          data: {
+            slug: newA,
+            step_id: step.id,
+            parent_id: null,
+            event: a.event ?? null,
+            properties: typeof a.properties === 'string' ? a.properties : JSON.stringify(a.properties ?? {}),
+            linkable: a.linkable !== false,
+            order: Number(a.order ?? i + 1),
+          } as any,
+        });
+        if (oldA) activityIdBySlug.set(oldA, activity.id);
+        activityIdBySlug.set(newA, activity.id);
+      }
+
+      // Quick replies under this step.
+      const qrs = Array.isArray(s.quick_replies) ? s.quick_replies : [];
+      for (let i = 0; i < qrs.length; i++) {
+        const q = qrs[i];
+        const oldQ = String(q.slug ?? '');
+        const newQ = this.generateSlug();
+        if (oldQ) qrSlugRemap.set(oldQ, newQ);
+
+        const row = await this.prisma.automation_quick_replies.create({
+          data: {
+            automation_step_id: step.id,
+            slug: newQ,
+            title: String(q.title ?? 'Reply'),
+            order: Number(q.order ?? i + 1),
+          } as any,
+        });
+        if (oldQ) qrIdBySlug.set(oldQ, row.id);
+        qrIdBySlug.set(newQ, row.id);
+      }
+    }
+
+    // 5. Connections — convert the export's slug-based references into the
+    //    fresh ids we just created.
+    const connectionsIn = Array.isArray(payload.connections) ? payload.connections : [];
+    for (const c of connectionsIn) {
+      const connectorType = String(c.connector_type ?? '');
+      const oldConnSlug = String(c.connector_slug ?? '');
+      const oldNextStepSlug = String(c.next_step_slug ?? '');
+
+      const nextStepId = stepIdBySlug.get(oldNextStepSlug);
+      if (!nextStepId) continue; // ignore broken refs
+
+      let connectorId: bigint | null = null;
+      if (connectorType.includes('AutomationStep') && !connectorType.includes('Activity')) {
+        connectorId = stepIdBySlug.get(oldConnSlug) ?? null;
+      } else if (connectorType.includes('AutomationStepActivity')) {
+        connectorId = activityIdBySlug.get(oldConnSlug) ?? null;
+      } else if (connectorType.includes('AutomationQuickReply')) {
+        connectorId = qrIdBySlug.get(oldConnSlug) ?? null;
+      }
+      if (!connectorId) continue;
+
+      await this.prisma.automation_flow.create({
+        data: {
+          automation_version_id: version.id,
+          slug: this.generateSlug(),
+          next_step_id: nextStepId,
+          connector_id: connectorId,
+          connector_type: connectorType,
+          deleteable: c.deleteable !== false,
+        } as any,
+      });
+    }
+
+    return {
+      success: true,
+      automation_id: automation.id.toString(),
+      version_id: version.id.toString(),
+      steps_imported: stepsIn.length,
+      connections_imported: connectionsIn.length,
+    };
+  }
+
+  /**
+   * Canvas stats snapshot — returns per-step + per-activity counts the
+   * frontend overlay renders as badges next to each node.
+   *
+   * Reads automation_step_statistics, automation_activity_statistics,
+   * automation_activity_clicks, automation_quick_reply_clicks, and the
+   * top-level total_runs / total_clicks on the automation row.
+   */
+  async getStats(workspaceId: bigint, automationId: bigint) {
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!automation) throw new NotFoundException('Automation not found');
+    const versionId = automation.draft_version_id ?? automation.published_version_id;
+    if (!versionId) {
+      return { total_runs: 0, total_clicks: 0, steps: {}, activities: {} };
+    }
+
+    const steps = await this.prisma.automation_steps.findMany({
+      where: { automation_version_id: versionId, deleted_at: null },
+      select: { id: true, slug: true, comment: true },
+    });
+    const activities = await this.prisma.automation_step_activities.findMany({
+      where: { step_id: { in: steps.map((s) => s.id) }, deleted_at: null },
+      select: { id: true, slug: true, step_id: true },
+    });
+    const stepStatRows = await this.prisma.automation_step_statistics.findMany({
+      where: { step_slug: { in: steps.map((s) => s.slug).filter(Boolean) as string[] } },
+    });
+    const activityStatRows = await this.prisma.automation_activity_statistics.findMany({
+      where: { activity_slug: { in: activities.map((a) => a.slug).filter(Boolean) as string[] } },
+    });
+    const clickRows = await this.prisma.automation_activity_clicks.aggregate({
+      where: { automation_id: automationId },
+      _sum: { clicks: true },
+    });
+
+    // Index by FE node id (= step.comment) so the UI badge can lookup with
+    // the same key it uses on the canvas.
+    const stepsByNodeId: Record<string, any> = {};
+    for (const s of steps) {
+      if (!s.comment) continue;
+      const stats = stepStatRows.find((r) => r.step_slug === s.slug);
+      stepsByNodeId[s.comment] = this.parseJSON(stats?.stats) ?? { runs: 0 };
+    }
+    const activitiesByStepNode: Record<string, any> = {};
+    for (const s of steps) {
+      if (!s.comment) continue;
+      const childActs = activities.filter((a) => a.step_id === s.id);
+      activitiesByStepNode[s.comment] = childActs.map((a) => {
+        const stats = activityStatRows.find((r) => r.activity_slug === a.slug);
+        return {
+          activity_id: a.id.toString(),
+          slug: a.slug,
+          stats: this.parseJSON(stats?.stats) ?? { runs: 0 },
+        };
+      });
+    }
+
+    return {
+      total_runs: Number(automation.total_runs ?? 0),
+      total_clicks: Number(automation.total_clicks ?? 0),
+      total_unique_clicks: Number(clickRows._sum.clicks ?? 0),
+      steps: stepsByNodeId,
+      activities: activitiesByStepNode,
+    };
+  }
+
+  /**
+   * Step-level trigger — find the first activity on this step and fire it
+   * against the given contact. Used by pipelines/reports/inbox flows.
+   */
+  async stepTriggerAutomation(stepId: bigint, contactId: bigint) {
+    const activity = await this.prisma.automation_step_activities.findFirst({
+      where: { step_id: stepId, deleted_at: null },
+      orderBy: { order: 'asc' },
+    });
+    if (!activity) {
+      return { triggered: false, reason: 'no_activity_on_step' };
+    }
+    // Inline import to avoid circular dep; AutomationsService is consumed by
+    // controllers that already inject the processor separately, but the
+    // step-trigger callers expect a single round trip — we call the same
+    // dispatch path the controller uses.
+    // (Note: this method is invoked through the controller which has the
+    // processor injected; if we ever invoke directly from non-controller
+    // code we'll need to inject the processor here too.)
+    return {
+      triggered: true,
+      activity_id: activity.id.toString(),
+      contact_id: contactId.toString(),
+      // The controller will call processor.triggerAutomation(activity.id, contactId);
+      // we return the resolved activity id so the controller's wrapper can
+      // dispatch without re-querying.
+    };
+  }
+
+  /**
+   * Export every automation attached to a bundle, plus the bundle metadata,
+   * as a JSON tree. The shape mirrors `importAutomation`'s expected payload
+   * so a round-trip import recreates the steps faithfully.
+   */
+  async exportCloneKit(workspaceId: bigint, bundleId: bigint) {
+    const bundle = await this.prisma.bundles.findFirst({
+      where: { id: bundleId, workspace_id: Number(workspaceId) },
+    });
+    if (!bundle) throw new NotFoundException('Bundle not found');
+
+    // Mirror replyagent: bundles reference automations via bundle_id on the
+    // automations row. Pull every active row.
+    const automations = await this.prisma.automations.findMany({
+      where: { bundle_id: bundleId, deleted_at: null },
+    });
+
+    const exported: any[] = [];
+    for (const a of automations) {
+      const versionId = a.published_version_id ?? a.draft_version_id;
+      if (!versionId) continue;
+
+      const steps = await this.prisma.automation_steps.findMany({
+        where: { automation_version_id: versionId, deleted_at: null },
+        orderBy: { id: 'asc' },
+      });
+      const stepsOut: any[] = [];
+      for (const s of steps) {
+        const activities = await this.prisma.automation_step_activities.findMany({
+          where: { step_id: s.id, deleted_at: null },
+          orderBy: { order: 'asc' },
+        });
+        const quickReplies = await this.prisma.automation_quick_replies.findMany({
+          where: { automation_step_id: s.id, deleted_at: null },
+        });
+        stepsOut.push({
+          slug: s.slug,
+          title: s.title,
+          type: s.type,
+          properties: this.parseJSON(s.properties),
+          cloneable: s.cloneable,
+          deletable: s.deletable,
+          linkable: s.linkable,
+          activities: activities.map((act) => ({
+            slug: act.slug,
+            event: act.event,
+            properties: this.parseJSON(act.properties),
+            linkable: act.linkable,
+            order: act.order,
+          })),
+          quick_replies: quickReplies.map((q) => ({
+            slug: q.slug,
+            title: q.title,
+            order: q.order,
+          })),
+        });
+      }
+
+      const connections = await this.prisma.automation_flow.findMany({
+        where: { automation_version_id: versionId, deleted_at: null },
+      });
+      // Resolve connector_id → connector_slug and next_step_id → next_step_slug
+      // for portability across the import boundary.
+      const connectionsOut: any[] = [];
+      for (const c of connections) {
+        const nextStep = steps.find((s) => s.id === c.next_step_id);
+        let connectorSlug: string | null = null;
+        if (c.connector_type.includes('AutomationStep') && !c.connector_type.includes('Activity')) {
+          const s = steps.find((s) => s.id === c.connector_id);
+          connectorSlug = s?.slug ?? null;
+        }
+        if (!nextStep || !connectorSlug) continue;
+        connectionsOut.push({
+          slug: c.slug,
+          connector_slug: connectorSlug,
+          connector_type: c.connector_type,
+          next_step_slug: nextStep.slug,
+        });
+      }
+
+      exported.push({
+        name: a.name,
+        template: a.template ?? null,
+        steps: stepsOut,
+        connections: connectionsOut,
+      });
+    }
+
+    return {
+      bundle: {
+        id: bundle.id.toString(),
+        slug: bundle.slug,
+        name: bundle.name,
+        description: bundle.description,
+      },
+      automations: exported,
+    };
+  }
+
+  /**
+   * Share a clone-kit export to a recipient workspace by importing each
+   * automation into that workspace. Returns the ids of the newly-created
+   * automations so the caller can deep-link the recipient.
+   */
+  async shareCloneKit(
+    sourceWorkspaceId: bigint,
+    userId: bigint,
+    bundleId: bigint,
+    recipientWorkspaceId: bigint | null,
+  ) {
+    const exported = await this.exportCloneKit(sourceWorkspaceId, bundleId);
+    if (!recipientWorkspaceId) {
+      // No recipient — just return the export so the caller can hand the
+      // JSON off (replyagent's flow generates a shareable link in this case).
+      return { share_payload: exported };
+    }
+    const imported: string[] = [];
+    for (const a of exported.automations) {
+      const result = await this.importAutomation(recipientWorkspaceId, userId, a);
+      imported.push(result.automation_id);
+    }
+    return {
+      shared_to_workspace_id: recipientWorkspaceId.toString(),
+      automations_imported: imported,
+    };
+  }
+
+  /** Defensive JSON parser used by export helpers. */
+  private parseJSON(raw: any): any {
+    if (raw == null) return null;
+    if (typeof raw !== 'string') return raw;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }
+
+  /**
+   * Reconcile a React-Flow graph into the canonical step/activity/flow rows.
+   *
+   * Strategy: keep a `node.id → step.id` map across saves by stamping the
+   * frontend's node id into `step.comment` (cheap "tag" column) so the
+   * second-save edit case doesn't recreate everything. Edges become rows in
+   * `automation_flow`.
+   *
+   * On every call:
+   *   1. Build a set of node-ids still present.
+   *   2. Existing steps NOT in the set get soft-deleted (deleted_at = now).
+   *   3. For each node: upsert step + first activity with the resolved type/slug.
+   *   4. Wipe existing automation_flow rows for this version and recreate from edges.
+   */
+  async syncGraph(
+    workspaceId: bigint,
+    automationId: bigint,
+    nodes: any[],
+    edges: any[],
+  ) {
+    const automation = await this.prisma.automations.findFirst({
+      where: { id: automationId, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!automation) throw new NotFoundException('Automation not found');
+    const versionId = automation.draft_version_id;
+    if (!versionId) throw new BadRequestException('Automation has no draft version');
+
+    const now = new Date();
+    const nodeIds = new Set(nodes.map((n: any) => String(n.id)));
+
+    // Load existing steps for this version.
+    const existingSteps = await this.prisma.automation_steps.findMany({
+      where: { automation_version_id: versionId, deleted_at: null },
+    });
+
+    // Map node.id → step.id via step.comment (we stash the FE id there).
+    const stepByNodeId = new Map<string, any>();
+    for (const s of existingSteps) {
+      if (s.comment && nodeIds.has(s.comment)) {
+        stepByNodeId.set(s.comment, s);
+      }
+    }
+
+    // 2. Soft-delete steps whose node is gone.
+    const orphanIds = existingSteps
+      .filter((s) => !s.comment || !nodeIds.has(s.comment))
+      .map((s) => s.id);
+    if (orphanIds.length > 0) {
+      await this.prisma.automation_steps.updateMany({
+        where: { id: { in: orphanIds } },
+        data: { deleted_at: now },
+      });
+      // Also soft-delete their activities.
+      await this.prisma.automation_step_activities.updateMany({
+        where: { step_id: { in: orphanIds } },
+        data: { deleted_at: now },
+      });
+    }
+
+    // 3. Upsert each node.
+    for (const node of nodes) {
+      const nId = String(node.id);
+      const data = node.data ?? {};
+      const stepType = String(data.stepType ?? 'action');
+      const actionSlug = data.actionSlug ?? null;
+      const title = String(data.label ?? 'Step');
+      const properties = JSON.stringify({
+        x: node.position?.x ?? 0,
+        y: node.position?.y ?? 0,
+        ...((data.properties ?? {}) as object),
+      });
+      const activityProps = JSON.stringify({
+        slug: actionSlug,
+        ...((data.activity_properties ?? data.value ?? {}) as object),
+      });
+
+      const existing = stepByNodeId.get(nId);
+      let stepRow: any;
+      if (existing) {
+        stepRow = await this.prisma.automation_steps.update({
+          where: { id: existing.id },
+          data: {
+            title,
+            type: stepType,
+            properties,
+            updated_at: now,
+            comment: nId,
+          } as any,
+        });
+      } else {
+        stepRow = await this.prisma.automation_steps.create({
+          data: {
+            automation_version_id: versionId,
+            slug: this.generateSlug(),
+            title,
+            type: stepType,
+            properties,
+            cloneable: true,
+            deletable: true,
+            linkable: true,
+            comment: nId,
+          } as any,
+        });
+      }
+
+      // Ensure the first activity exists and carries the action slug.
+      const firstActivity = await this.prisma.automation_step_activities.findFirst({
+        where: { step_id: stepRow.id, deleted_at: null },
+        orderBy: { order: 'asc' },
+      });
+      if (firstActivity) {
+        await this.prisma.automation_step_activities.update({
+          where: { id: firstActivity.id },
+          data: {
+            event: data.triggerEvent ?? firstActivity.event,
+            properties: activityProps,
+            updated_at: now,
+          } as any,
+        });
+      } else {
+        await this.prisma.automation_step_activities.create({
+          data: {
+            slug: this.generateSlug(),
+            step_id: stepRow.id,
+            parent_id: null,
+            event: data.triggerEvent ?? null,
+            properties: activityProps,
+            linkable: true,
+            order: 1,
+          } as any,
+        });
+      }
+
+      // Cache the step for the connection pass.
+      stepByNodeId.set(nId, stepRow);
+    }
+
+    // 4. Reset flow connections for this version.
+    await this.prisma.automation_flow.deleteMany({
+      where: { automation_version_id: versionId },
+    });
+    for (const edge of edges) {
+      const sourceNode = String(edge.source ?? '');
+      const targetNode = String(edge.target ?? '');
+      const sourceStep = stepByNodeId.get(sourceNode);
+      const targetStep = stepByNodeId.get(targetNode);
+      if (!sourceStep || !targetStep) continue;
+
+      await this.prisma.automation_flow.create({
+        data: {
+          automation_version_id: versionId,
+          slug: this.generateSlug(),
+          next_step_id: targetStep.id,
+          connector_id: sourceStep.id,
+          connector_type: 'App\\Models\\Automations\\AutomationStep',
+          deleteable: true,
+        } as any,
+      });
+    }
+
+    return {
+      success: true,
+      nodes_synced: nodes.length,
+      edges_synced: edges.length,
+      orphans_removed: orphanIds.length,
+    };
+  }
+
+  /**
+   * Resolve the contact behind an inbox row. Used by the manual-trigger
+   * endpoint when the agent fires an automation from a conversation.
+   * The inbox row stores `modelable_type/id` polymorphically — we follow
+   * the channel-specific chat table to find the contact_id.
+   */
+  async lookupInboxContact(inboxId: bigint, workspaceId: bigint): Promise<bigint | null> {
+    const inbox = await this.prisma.inbox.findFirst({
+      where: { id: inboxId, workspace_id: workspaceId },
+    });
+    if (!inbox) return null;
+
+    const mType = inbox.modelable_type ?? '';
+    const mId = inbox.modelable_id;
+    if (!mId) return null;
+
+    try {
+      if (mType.includes('WhatsappChat')) {
+        const chat = await this.prisma.wa_chats.findUnique({ where: { id: mId } });
+        return chat?.contact_id ?? null;
+      }
+      if (mType.includes('TelegramChat')) {
+        const chat = await this.prisma.telegram_chats.findUnique({ where: { id: mId } });
+        return chat?.contact_id ?? null;
+      }
+      if (mType.includes('FacebookChat')) {
+        const chat = await this.prisma.fb_chats.findUnique({ where: { id: mId } });
+        return chat?.contact_id ?? null;
+      }
+      if (mType.includes('InstagramChat') || mType.includes('InstaChat')) {
+        const chat = await this.prisma.insta_chats.findUnique({ where: { id: mId } });
+        return chat?.contact_id ?? null;
+      }
+      if (mType.includes('WebchatChat') || mType.includes('WcChat')) {
+        const chat = await this.prisma.wc_chats.findUnique({ where: { id: mId } });
+        return chat?.contact_id ?? null;
+      }
+      if (mType.includes('App\\Models\\Contact')) {
+        return mId;
+      }
+    } catch (e: any) {
+      this.logger.warn(`lookupInboxContact failed for inbox ${inboxId}: ${e?.message ?? e}`);
+    }
+    return null;
+  }
 }
