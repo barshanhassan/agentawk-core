@@ -1,12 +1,13 @@
 import {
-  Controller,
-  Get,
-  Post,
-  Delete,
   Body,
+  Controller,
+  Delete,
+  Get,
   Param,
-  UseGuards,
+  Patch,
+  Post,
   Request,
+  UseGuards,
 } from '@nestjs/common';
 import { WidgetsService } from './widgets.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
@@ -19,29 +20,32 @@ export class WidgetsController {
   @Get()
   async getWidgets(@Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    const widgets = await this.service.getWidgets(workspaceId);
-    return widgets.map((w: any) => ({
-      ...w,
-      id: w.id.toString(),
-      workspace_id: w.workspace_id.toString(),
-    }));
+    return this.service.getWidgets(workspaceId);
   }
 
   @Post()
   async createWidget(@Body() body: any, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    const widget = await this.service.createWidget(workspaceId, body);
-    return {
-      ...widget,
-      id: widget.id.toString(),
-      workspace_id: widget.workspace_id.toString(),
-    };
+    const userId = BigInt(req.user.sub || 0);
+    return this.service.createWidget(workspaceId, userId, body);
+  }
+
+  @Patch(':id')
+  async updateWidget(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    const userId = BigInt(req.user.sub || 0);
+    return this.service.createWidget(workspaceId, userId, { ...body, id });
   }
 
   @Delete(':id')
   async deleteWidget(@Param('id') id: string, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    await this.service.deleteWidget(workspaceId, BigInt(id));
+    const userId = BigInt(req.user.sub || 0);
+    await this.service.deleteWidget(workspaceId, userId, BigInt(id));
     return { success: true };
   }
 }

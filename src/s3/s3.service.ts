@@ -5,6 +5,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  DeleteObjectsCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
@@ -78,6 +79,25 @@ export class S3Service {
     }
   }
 
+  /**
+   * Stream a private object directly (server-mediated download). Use this
+   * when you want to force Content-Disposition: attachment headers or hide
+   * the bucket URL — the gallery `/download` endpoint relies on this so the
+   * browser actually saves the file instead of opening it inline.
+   */
+  async getObjectStream(filePath: string): Promise<NodeJS.ReadableStream | null> {
+    try {
+      const out = await this.client.send(
+        new GetObjectCommand({ Bucket: this.bucket, Key: filePath }),
+      );
+      // AWS SDK v3 returns a Readable on Node — coerce away the union types.
+      return (out.Body as unknown as NodeJS.ReadableStream) ?? null;
+    } catch (e: any) {
+      this.logger.error(`getObjectStream failed (${filePath}): ${e?.message || e}`);
+      return null;
+    }
+  }
+
   /** Generate a signed URL for downloading/displaying a private object. Default 1h expiry. */
   async getSignedUrl(filePath: string, expiresIn = 3600): Promise<string | null> {
     try {
@@ -126,6 +146,58 @@ export class S3Service {
       this.logger.error(`delete failed (${filePath}): ${e?.message || e}`);
       return false;
     }
+  }
+
+  /**
+   * Delete every object under a given prefix. Mirrors replyagent's
+   * `Storage::disk('s3')->deleteDirectory($path)` — used by folder delete
+   * and workspace teardown. Uses ListObjectsV2 + DeleteObjects in batches
+   * of 1000 (the S3 API's hard cap per request).
+   */
+  async deleteDirectory(prefix: string): Promise<{ deleted: number; errored: number }> {
+    let deleted = 0;
+    let errored = 0;
+    let continuationToken: string | undefined;
+    try {
+      do {
+        const out = await this.client.send(
+          new ListObjectsV2Command({
+            Bucket: this.bucket,
+            Prefix: prefix,
+            ContinuationToken: continuationToken,
+          }),
+        );
+        const keys = (out.Contents ?? [])
+          .map((o) => o.Key)
+          .filter((k): k is string => !!k);
+        if (keys.length > 0) {
+          // DeleteObjects accepts up to 1000 keys per call.
+          for (let i = 0; i < keys.length; i += 1000) {
+            const batch = keys.slice(i, i + 1000);
+            const res = await this.client.send(
+              new DeleteObjectsCommand({
+                Bucket: this.bucket,
+                Delete: { Objects: batch.map((k) => ({ Key: k })) },
+              }),
+            );
+            deleted += res.Deleted?.length ?? 0;
+            errored += res.Errors?.length ?? 0;
+            if (res.Errors?.length) {
+              this.logger.error(
+                `deleteDirectory partial failure under "${prefix}": ${res.Errors.length} errors`,
+              );
+            }
+          }
+        }
+        continuationToken = out.IsTruncated ? out.NextContinuationToken : undefined;
+      } while (continuationToken);
+    } catch (e: any) {
+      this.logger.error(
+        `deleteDirectory failed (${prefix}): ${e?.message || e}`,
+      );
+      errored += 1;
+    }
+    return { deleted, errored };
   }
 
   /** Check if a file exists. */

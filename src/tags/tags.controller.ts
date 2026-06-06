@@ -38,8 +38,10 @@ export class TagsController {
   }
 
   @Post('link')
-  async linkTag(@Body() body: any) {
-    return this.service.linkTag(body);
+  async linkTag(@Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    const userId = BigInt(req.user.sub || 0);
+    return this.service.linkTag(workspaceId, userId, body);
   }
 
   @Get(':id/links')
@@ -49,8 +51,10 @@ export class TagsController {
   }
 
   @Delete('unlink/:linkId')
-  async unlinkTag(@Param('linkId') linkId: string) {
-    return this.service.unlinkTag(BigInt(linkId));
+  async unlinkTag(@Param('linkId') linkId: string, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    const userId = BigInt(req.user.sub || 0);
+    return this.service.unlinkTag(workspaceId, userId, BigInt(linkId));
   }
 
   @Patch(':id')
@@ -66,7 +70,8 @@ export class TagsController {
   @Delete(':id')
   async deleteTag(@Param('id') id: string, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.deleteTag(workspaceId, BigInt(id));
+    const userId = BigInt(req.user.sub || 0);
+    return this.service.deleteTag(workspaceId, userId, BigInt(id));
   }
 
   // ─── Folder Management ──────────────────────────────────────────────

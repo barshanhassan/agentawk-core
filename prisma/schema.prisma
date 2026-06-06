@@ -2173,6 +2173,14 @@ model iframes {
   workspace_id BigInt    @db.UnsignedBigInt
   name         String    @db.VarChar(255)
   menu         String?   @db.VarChar(255)
+  /// settings_menu | main_menu — controls where the iframe surfaces in the
+  /// shell (sidebar settings list vs the top-level navigation).
+  placement    String    @default("settings_menu") @db.VarChar(20)
+  /// Icon name / asset path shown next to the menu entry.
+  icon         String?   @db.VarChar(255)
+  /// Sidebar label, kept separate from the menu group `name` so the same
+  /// iframe can appear under a custom heading without renaming the iframe.
+  menu_text    String?   @db.VarChar(255)
   html         String?   @db.Text
   created_at   DateTime? @db.Timestamp(0)
   updated_at   DateTime? @db.Timestamp(0)
@@ -4108,7 +4116,7 @@ model widgets {
   id           BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
   name         String    @db.VarChar(255)
   title        String    @db.VarChar(255)
-  subtitle     String    @db.Text
+  subtitle     String?   @db.Text
   workspace_id BigInt    @db.UnsignedBigInt
   slug         String    @db.VarChar(60)
   header_bg    String    @db.VarChar(10)

@@ -28,52 +28,101 @@ export class ApiTriggersPublicController {
   @Post(':slug')
   async receive(@Param('slug') slug: string, @Body() body: any) {
     if (!slug) throw new BadRequestException('slug required');
-    const trigger = await this.prisma.api_triggers.findFirst({
-      where: { slug, live: true } as any,
-    });
+    const trigger = await this.prisma.api_triggers.findFirst({ where: { slug } });
     if (!trigger) {
-      // Silently 200 so external integrations don't retry-storm us on a
-      // disabled trigger — replyagent does the same.
-      return { received: false, reason: 'trigger_not_found_or_disabled' };
+      // Silently 200 so external integrations don't retry-storm us on an
+      // unknown trigger.
+      return { received: false, reason: 'trigger_not_found' };
     }
 
-    // 1. Persist the request.
-    const request = await this.prisma.api_trigger_requests.create({
-      data: {
-        api_trigger_id: trigger.id,
-        data_keys: this.summariseKeys(body),
-        payload: typeof body === 'string' ? body : JSON.stringify(body ?? {}),
-        status: 'SUCCESS' as any,
-      } as any,
-    });
+    // Flatten the incoming payload into dot-notation leaf nodes — mirrors
+    // replyagent's `extract_leaf_nodes_recursive` in PHP. The resulting dict
+    // is what powers the Manage view's "Select a key to map" picker.
+    const dataKeys = this.flattenLeaves(body ?? {});
 
-    // 2. Resolve / create the contact using the trigger's index_field.
-    const contactId = await this.resolveOrCreateContact(trigger, body);
-    if (!contactId) {
-      await this.prisma.api_trigger_requests.update({
-        where: { id: request.id },
-        data: { status: 'FAILED' as any, error: 'contact_resolution_failed' as any } as any,
+    // ── Flow split (mirrors ApiTriggersController::triggerRequest) ──────
+    //
+    //  1. If trigger is LIVE → save a request row + run automation.
+    //  2. If trigger is NOT live AND mapped_keys is empty → bootstrap the
+    //     mapping picker by storing the incoming keys as `mapped_keys`.
+    //  3. If trigger is NOT live AND mapped_keys exists but the incoming
+    //     keys differ → stash them as `new_keys`; the Manage view will
+    //     show an "Update Mapping" banner.
+    //
+    if (trigger.live) {
+      const request = await this.prisma.api_trigger_requests.create({
+        data: {
+          api_trigger_id: trigger.id,
+          data_keys: JSON.stringify(dataKeys),
+          payload: typeof body === 'string' ? body : JSON.stringify(body ?? {}),
+          status: 'SUCCESS' as any,
+          created_at: new Date(),
+          updated_at: new Date(),
+        } as any,
       });
-      return { received: true, contact_resolved: false };
+
+      const contactId = await this.resolveOrCreateContact(trigger, body);
+      if (!contactId) {
+        await this.prisma.api_trigger_requests.update({
+          where: { id: request.id },
+          data: { status: 'FAILED' as any, error: 'contact_resolution_failed' as any } as any,
+        });
+        return { received: true, contact_resolved: false };
+      }
+
+      this.events.emit('integration.api_trigger', {
+        apiTriggerId: trigger.id,
+        contactId,
+        workspaceId: trigger.workspace_id,
+        payload: body,
+      });
+
+      return { success: 'Request received' };
     }
 
-    // 3. Emit the trigger event — AutomationTriggerService listens for
-    //    `event = 'api_trigger'` activities with this trigger's id filter.
-    this.events.emit('integration.api_trigger', {
+    // Not live: bootstrap or accumulate keys.
+    if (!trigger.mapped_keys) {
+      await this.prisma.api_triggers.update({
+        where: { id: trigger.id },
+        data: { mapped_keys: JSON.stringify(dataKeys), updated_at: new Date() } as any,
+      });
+    } else {
+      // Only set new_keys if they differ from mapped_keys so we don't
+      // pollute the Manage UI with redundant "Update mapping" banners.
+      const existing = this.parseJSON(trigger.mapped_keys) ?? {};
+      const sameShape = JSON.stringify(Object.keys(existing).sort()) === JSON.stringify(Object.keys(dataKeys).sort());
+      if (!sameShape) {
+        await this.prisma.api_triggers.update({
+          where: { id: trigger.id },
+          data: { new_keys: JSON.stringify(dataKeys), updated_at: new Date() } as any,
+        });
+      }
+    }
+
+    this.events.emit('api_trigger.updated', {
       apiTriggerId: trigger.id,
-      contactId,
       workspaceId: trigger.workspace_id,
-      payload: body,
     });
 
-    return { received: true, contact_id: contactId.toString() };
+    return { success: 'Request received' };
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────
 
-  private summariseKeys(body: any): string {
-    if (!body || typeof body !== 'object') return '[]';
-    return JSON.stringify(Object.keys(body));
+  /** Recursively flatten an object into dot-notation leaves —
+   *  `{a:{b:1}, c:2}` → `{"a.b":1, "c":2}`. Matches PHP
+   *  `extract_leaf_nodes_recursive`. */
+  private flattenLeaves(data: any, prefix = '', out: Record<string, any> = {}): Record<string, any> {
+    if (data == null || typeof data !== 'object') return out;
+    for (const [k, v] of Object.entries(data)) {
+      const path = prefix === '' ? k : `${prefix}.${k}`;
+      if (v != null && typeof v === 'object' && !Array.isArray(v)) {
+        this.flattenLeaves(v, path, out);
+      } else {
+        out[path] = v;
+      }
+    }
+    return out;
   }
 
   private async resolveOrCreateContact(trigger: any, body: any): Promise<bigint | null> {

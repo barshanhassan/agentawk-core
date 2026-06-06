@@ -39,9 +39,15 @@ export class PlanFeaturesService {
     // Latest active subscription wins. `default=true` takes priority but we
     // fall back to any ACTIVE so a subscription mid-renewal doesn't surprise
     // anyone.
+    // Enum is lowercase: future | in_trial | active | non_renewing | paused | cancelled.
+    // We treat `active` and `in_trial` as live so trialing agencies aren't
+    // hard-blocked from API access.
     const subscription: any = await this.prisma.billing_subscriptions.findFirst(
       {
-        where: { agency_id: workspace.agency_id, status: 'ACTIVE' as any },
+        where: {
+          agency_id: workspace.agency_id,
+          status: { in: ['active', 'in_trial'] as any },
+        },
         orderBy: [{ default: 'desc' }, { activated_at: 'desc' }],
         select: { billing_plan_id: true },
       },

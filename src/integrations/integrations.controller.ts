@@ -116,20 +116,40 @@ export class IntegrationsController {
   }
 
   // ─── Visual API Triggers ───────────────────────────────────────────
+  // Routes mirror replyagent's `ApiTriggersController.php`. We keep the
+  // EZCONN paths RESTful (GET/POST/PATCH/DELETE on `/api-triggers`) and the
+  // public webhook still lives at `/api-triggers/webhook/:slug` (see
+  // ApiTriggersPublicController).
 
   @Get('api-triggers')
   async getApiTriggers(@Request() req: any) {
     return this.service.getApiTriggers(BigInt(req.user.workspace_id || 1));
   }
 
+  /** Single-trigger fetch used by the Manage view to pull full
+   *  mapping/mapped_keys/new_keys/tags. */
+  @Get('api-triggers/:id')
+  async getApiTrigger(@Param('id') id: string, @Request() req: any) {
+    return this.service.getApiTrigger(BigInt(req.user.workspace_id || 1), BigInt(id));
+  }
+
   @Post('api-triggers')
   async createApiTrigger(@Body() body: any, @Request() req: any) {
-    return this.service.createApiTrigger(BigInt(req.user.workspace_id || 1), body);
+    return this.service.createApiTrigger(
+      BigInt(req.user.workspace_id || 1),
+      BigInt(req.user.sub || req.user.id || 0),
+      body,
+    );
   }
 
   @Patch('api-triggers/:id')
   async updateApiTrigger(@Param('id') id: string, @Body() body: any, @Request() req: any) {
-    return this.service.updateApiTrigger(BigInt(id), BigInt(req.user.workspace_id || 1), body);
+    return this.service.updateApiTrigger(
+      BigInt(id),
+      BigInt(req.user.workspace_id || 1),
+      BigInt(req.user.sub || req.user.id || 0),
+      body,
+    );
   }
 
   @Delete('api-triggers/:id')
@@ -138,7 +158,17 @@ export class IntegrationsController {
   }
 
   @Get('api-triggers/:id/logs')
-  async getApiTriggerLogs(@Param('id') id: string, @Request() req: any) {
-    return this.service.getApiTriggerLogs(BigInt(id), BigInt(req.user.workspace_id || 1));
+  async getApiTriggerLogs(
+    @Param('id') id: string,
+    @Query('page') page: string,
+    @Query('limit') limit: string,
+    @Request() req: any,
+  ) {
+    return this.service.getApiTriggerLogs(
+      BigInt(id),
+      BigInt(req.user.workspace_id || 1),
+      page ? parseInt(page, 10) : 1,
+      limit ? parseInt(limit, 10) : 20,
+    );
   }
 }

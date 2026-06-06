@@ -369,59 +369,176 @@ export class IntegrationsService {
   }
 
   // ─── Visual API Triggers ───────────────────────────────────────────
+  //
+  // Mirrors replyagent's ApiTriggersController.php verbatim — same fields,
+  // same shapes, same flow. Public webhook is in
+  // `api-triggers-public.controller.ts`.
 
   async getApiTriggers(workspaceId: bigint) {
     return this.prisma.api_triggers.findMany({
       where: { workspace_id: workspaceId },
-      orderBy: { id: 'desc' }
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+        live: true,
+        index_field: true,
+        created_at: true,
+        updated_at: true,
+      },
+      orderBy: { created_at: 'desc' },
     });
   }
 
-  async createApiTrigger(workspaceId: bigint, data: any) {
-    const slug = data.name.toLowerCase().replace(/\s+/g, '-');
+  /** GET single trigger — Manage view needs the full row incl.
+   *  mapping/mapped_keys/new_keys/created_tags/updated_tags. */
+  async getApiTrigger(workspaceId: bigint, id: bigint) {
+    const t = await this.prisma.api_triggers.findFirst({
+      where: { id, workspace_id: workspaceId },
+    });
+    if (!t) throw new NotFoundException('Trigger not found');
+    return t;
+  }
+
+  async createApiTrigger(workspaceId: bigint, userId: bigint, data: any) {
+    if (!data?.name?.trim()) {
+      throw new BadRequestException('API name is required');
+    }
+    // Replyagent uses a random unique slug (ApiTrigger::generateSlug). We do
+    // the same so two triggers with the same name don't collide.
+    const slug = await this.generateUniqueTriggerSlug();
+
     return this.prisma.api_triggers.create({
       data: {
         workspace_id: workspaceId,
-        name: data.name,
-        slug: slug,
-        live: data.live || false,
-        update_duplicates: data.update_duplicates || false,
-        creator_id: BigInt(1), // Should be current user
-      }
-    });
-  }
-
-  async updateApiTrigger(id: bigint, workspaceId: bigint, data: any) {
-    return this.prisma.api_triggers.updateMany({
-      where: { id, workspace_id: workspaceId },
-      data: {
-        name: data.name,
-        live: data.live,
-        update_duplicates: data.update_duplicates,
-        mapping: data.mapping,
+        name: String(data.name).trim().slice(0, 255),
+        slug,
+        live: false,
+        // Replyagent's create modal only collects name; the model defaults
+        // index_field='primary_mobile' and update_duplicates=false.
+        index_field: (data.index_field ?? 'primary_mobile') as any,
+        update_duplicates: !!data.update_duplicates,
+        created_tags: data.created_tags ? JSON.stringify(data.created_tags) : '[]',
+        updated_tags: data.updated_tags ? JSON.stringify(data.updated_tags) : '[]',
+        creator_id: userId,
+        created_at: new Date(),
         updated_at: new Date(),
-      }
+      },
     });
   }
 
-  async deleteApiTrigger(id: bigint, workspaceId: bigint) {
-    await this.prisma.api_triggers.deleteMany({
-      where: { id, workspace_id: workspaceId }
-    });
-    return { success: true };
-  }
-
-  async getApiTriggerLogs(triggerId: bigint, workspaceId: bigint) {
-    // Verify trigger belongs to workspace
+  async updateApiTrigger(id: bigint, workspaceId: bigint, userId: bigint, data: any) {
     const trigger = await this.prisma.api_triggers.findFirst({
-      where: { id: triggerId, workspace_id: workspaceId }
+      where: { id, workspace_id: workspaceId },
     });
     if (!trigger) throw new NotFoundException('Trigger not found');
 
-    return this.prisma.api_trigger_requests.findMany({
-      where: { api_trigger_id: triggerId },
-      orderBy: { created_at: 'desc' },
-      take: 50
+    const patch: any = { updater_id: userId, updated_at: new Date() };
+
+    if (data.name != null && String(data.name).trim() !== '' && data.name !== trigger.name) {
+      patch.name = String(data.name).trim().slice(0, 255);
+    }
+
+    // Replyagent stores mapping as JSON array — `[{slug,key,prefix,postfix,field}]`
+    if (Object.prototype.hasOwnProperty.call(data, 'mapping')) {
+      patch.mapping = data.mapping ? JSON.stringify(data.mapping) : null;
+    }
+
+    // `update_keys=true` flips new_keys → mapped_keys and clears new_keys.
+    // Mirrors `if ($request->filled("update_keys"))` block.
+    if (data.update_keys) {
+      patch.mapped_keys = trigger.new_keys;
+      patch.new_keys = null;
+    }
+
+    if (data.index_field) {
+      patch.index_field = data.index_field;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(data, 'update_duplicates')) {
+      patch.update_duplicates = !!data.update_duplicates;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(data, 'created_tags')) {
+      patch.created_tags = JSON.stringify(data.created_tags ?? []);
+    }
+    if (Object.prototype.hasOwnProperty.call(data, 'updated_tags')) {
+      patch.updated_tags = JSON.stringify(data.updated_tags ?? []);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(data, 'live')) {
+      patch.live = !!data.live;
+    }
+
+    await this.prisma.api_triggers.update({ where: { id }, data: patch });
+    return this.prisma.api_triggers.findUnique({ where: { id } });
+  }
+
+  async deleteApiTrigger(id: bigint, workspaceId: bigint) {
+    const trigger = await this.prisma.api_triggers.findFirst({
+      where: { id, workspace_id: workspaceId },
     });
+    if (!trigger) throw new NotFoundException('Trigger not found');
+    // Cascade: replyagent wipes ApiTriggerRequest rows before deleting.
+    await this.prisma.api_trigger_requests.deleteMany({ where: { api_trigger_id: id } });
+    await this.prisma.api_triggers.delete({ where: { id } });
+    return { success: true };
+  }
+
+  async getApiTriggerLogs(triggerId: bigint, workspaceId: bigint, page = 1, limit = 20) {
+    const trigger = await this.prisma.api_triggers.findFirst({
+      where: { id: triggerId, workspace_id: workspaceId },
+    });
+    if (!trigger) throw new NotFoundException('Trigger not found');
+
+    const safePage = Math.max(1, Number(page) || 1);
+    const safeLimit = Math.min(100, Math.max(1, Number(limit) || 20));
+    const offset = (safePage - 1) * safeLimit;
+
+    const [data, total] = await Promise.all([
+      this.prisma.api_trigger_requests.findMany({
+        where: { api_trigger_id: triggerId },
+        orderBy: { created_at: 'desc' },
+        skip: offset,
+        take: safeLimit,
+      }),
+      this.prisma.api_trigger_requests.count({ where: { api_trigger_id: triggerId } }),
+    ]);
+
+    const lastPage = Math.max(1, Math.ceil(total / safeLimit));
+    // Laravel-style link array — the Vue logs pagination renders these
+    // directly. Keep label keys minimal: { url, label, active }.
+    const links: Array<{ url: string | null; label: string; active: boolean }> = [];
+    links.push({ url: safePage > 1 ? String(safePage - 1) : null, label: '&laquo; Previous', active: false });
+    for (let p = 1; p <= lastPage; p++) {
+      links.push({ url: String(p), label: String(p), active: p === safePage });
+    }
+    links.push({ url: safePage < lastPage ? String(safePage + 1) : null, label: 'Next &raquo;', active: false });
+
+    return {
+      data,
+      current_page: safePage,
+      per_page: safeLimit,
+      total,
+      last_page: lastPage,
+      from: total === 0 ? 0 : offset + 1,
+      to: Math.min(offset + safeLimit, total),
+      links,
+    };
+  }
+
+  /** Random 16-char alphanumeric slug, retried until unique. Replyagent's
+   *  ApiTrigger::generateSlug() shape — we copy it so external integrations
+   *  using replyagent-style trigger URLs feel identical. */
+  private async generateUniqueTriggerSlug(): Promise<string> {
+    const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    for (let attempt = 0; attempt < 8; attempt++) {
+      let s = '';
+      for (let i = 0; i < 16; i++) s += charset[Math.floor(Math.random() * charset.length)];
+      const exists = await this.prisma.api_triggers.findFirst({ where: { slug: s } });
+      if (!exists) return s;
+    }
+    // Extremely unlikely, but fall through with a timestamp suffix.
+    return `t${Date.now()}${Math.floor(Math.random() * 1e6)}`;
   }
 }
