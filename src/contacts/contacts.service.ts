@@ -77,22 +77,140 @@ export class ContactsService {
   /**
    * Get single contact detail
    */
+  /**
+   * Single contact detail — fully enriched for the ContactDetailsModal:
+   *   - tag_links (was referencing an undefined var; fixed)
+   *   - phones (contact_mobiles, sorted primary first, type whatsapp/phone split)
+   *   - emails (contact_emails, primary first)
+   *   - custom_fields (via CustomFieldsService)
+   *   - linked-record counts (tasks / bookings / calls / ad_clicks) so the
+   *     left sidebar can render real numbers instead of zeros
+   */
   async getContact(workspaceId: bigint, contactId: bigint) {
     const contact = await this.prisma.contacts.findFirst({
-      where: { id: contactId, workspace_id: workspaceId, deleted_at: null }
+      where: { id: contactId, workspace_id: workspaceId, deleted_at: null },
     });
-
     if (!contact) throw new NotFoundException('Contact not found');
 
-    const customFields = await this.customFieldsService.getEntityValues('Contact', contact.id);
+    // Tag links — proper per-contact query (previous code referenced a var
+    // from getContacts() and crashed at runtime).
+    const tagLinks = await this.prisma.tag_links.findMany({
+      where: {
+        linkable_type: 'App\\Models\\Contact',
+        linkable_id: contact.id,
+      },
+    });
 
-    const contactWithTags = {
-      ...this.serialize(contact),
-      tag_links: tagLinks.map(tl => ({ tags: { name: tl.name } })),
-      custom_fields: customFields,
+    // Phones / emails. We split phones into the WhatsApp variant + the
+    // regular `phone` rows so the modal can render them as separate sections
+    // (matches the screenshot).
+    const [allMobiles, emails] = await Promise.all([
+      this.prisma.contact_mobiles.findMany({
+        where: {
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: contact.id,
+        },
+        orderBy: [{ is_primary: 'desc' }, { id: 'asc' }],
+      }),
+      this.prisma.contact_emails.findMany({
+        where: {
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: contact.id,
+        },
+        orderBy: [{ is_primary: 'desc' }, { id: 'asc' }],
+      }),
+    ]);
+
+    const phones = allMobiles
+      .filter((m) => String(m.type ?? 'phone').toLowerCase() !== 'whatsapp')
+      .map((m) => this.serializeMobile(m));
+    const whatsapps = allMobiles
+      .filter((m) => String(m.type ?? '').toLowerCase() === 'whatsapp')
+      .map((m) => this.serializeMobile(m));
+
+    // Linked-record counts powering the sidebar TASKS / BOOKINGS / CALLS /
+    // AD CLICKS chips. Each lookup is best-effort: a missing table or a
+    // mismatched modelable shape yields 0 rather than crashing the whole
+    // detail fetch.
+    const tasksCount = await this.prisma.tasks
+      .count({ where: { workspace_id: workspaceId, contact_id: contact.id } })
+      .catch(() => 0);
+    const bookingsCount = await this.prisma.bookings
+      .count({ where: { workspace_id: workspaceId, contact_id: contact.id } })
+      .catch(() => 0);
+
+    // Calls: twilio_call_logs scoped to the workspace's twilio accounts, then
+    // matched to any of the contact's mobile numbers (from / to). If the
+    // contact has no numbers we skip the lookup entirely.
+    let callsCount = 0;
+    const allNumbers = allMobiles
+      .map((m) => m.full_mobile_number ?? m.mobile_number ?? null)
+      .filter((x): x is string => !!x);
+    if (allNumbers.length) {
+      try {
+        const twilioAccountIds = (
+          await this.prisma.twilio_accounts.findMany({
+            where: { workspace_id: workspaceId, deleted_at: null },
+            select: { id: true },
+          })
+        ).map((a) => a.id);
+        if (twilioAccountIds.length) {
+          callsCount = await this.prisma.twilio_call_logs.count({
+            where: {
+              twilio_account_id: { in: twilioAccountIds },
+              OR: [
+                { from_number: { in: allNumbers } },
+                { to_number: { in: allNumbers } },
+              ],
+            },
+          });
+        }
+      } catch {
+        callsCount = 0;
+      }
+    }
+
+    const customFields = await this.customFieldsService
+      .getEntityValues('Contact', contact.id)
+      .catch(() => [] as any[]);
+
+    return {
+      success: true,
+      contact: {
+        ...this.serialize(contact),
+        tag_links: tagLinks.map((tl) => ({ tags: { name: tl.name } })),
+        tags: tagLinks.map((tl) => tl.name),
+        phones,
+        whatsapps,
+        emails: emails.map((e) => ({
+          id: e.id.toString(),
+          email: e.email,
+          type: e.type,
+          is_primary: !!e.is_primary,
+          created_at: e.created_at,
+        })),
+        custom_fields: customFields,
+        counts: {
+          tasks: tasksCount,
+          bookings: bookingsCount,
+          calls: callsCount,
+          ad_clicks: 0, // ad_clicks table not present yet — keep slot for parity
+        },
+      },
     };
+  }
 
-    return { success: true, contact: contactWithTags };
+  /** Project a contact_mobiles row into the lean shape the modal renders. */
+  private serializeMobile(m: any) {
+    return {
+      id: m.id.toString(),
+      country_code: m.country_code ?? null,
+      mobile_number: m.mobile_number ?? null,
+      full_mobile_number: m.full_mobile_number ?? null,
+      type: m.type ?? 'phone',
+      is_primary: !!m.is_primary,
+      created_at: m.created_at,
+    };
   }
 
   /**
