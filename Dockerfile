@@ -4,14 +4,20 @@ FROM node:20-alpine AS builder
 # Create app directory
 WORKDIR /app
 
-# Install OpenSSL for Prisma
-RUN apk add --no-cache openssl
+# Install OpenSSL for Prisma + libc6-compat which sharp's prebuilt binary
+# needs on Alpine (musl libc). `vips-dev` is only required if sharp falls
+# back to source build — we keep `vips` (runtime) so the prebuilt binary
+# can dlopen it if needed.
+RUN apk add --no-cache openssl libc6-compat vips
 
 # A wildcard is used to ensure both package.json AND package-lock.json are copied
 COPY package*.json ./
 
-# Install app dependencies
-RUN npm ci
+# Install app dependencies. `--include=optional` forces npm to install the
+# platform-specific sharp binary (e.g. @img/sharp-linuxmusl-x64) — without
+# this flag, npm sometimes silently skips optional deps in CI environments
+# and sharp throws at require() time.
+RUN npm ci --include=optional
 
 # Copy Prisma schema and generate client before building
 COPY prisma ./prisma/
@@ -28,12 +34,13 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Install OpenSSL (required by Prisma at runtime)
-RUN apk add --no-cache openssl
+# Same Alpine deps the builder uses — sharp's binary needs libc6-compat
+# + libvips at runtime.
+RUN apk add --no-cache openssl libc6-compat vips
 
 # Copy package files and install only production dependencies
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm ci --omit=dev --include=optional
 
 # Copy built files from the builder stage
 COPY --from=builder /app/dist ./dist
