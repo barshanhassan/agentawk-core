@@ -1,6 +1,10 @@
 generator client {
   provider      = "prisma-client-js"
-  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+  // `native` covers local dev (Windows / macOS / Linux);
+  // `debian-openssl-3.0.x` is what the production Docker image uses (Debian
+  // bookworm-slim with OpenSSL 3); `linux-musl-openssl-3.0.x` is kept so any
+  // older Alpine-based environments still work.
+  binaryTargets = ["native", "debian-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
 }
 
 datasource db {
