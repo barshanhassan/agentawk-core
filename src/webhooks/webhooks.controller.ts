@@ -44,6 +44,7 @@ export class WebhooksController {
   @Delete(':id')
   async delete(@Param('id') id: string, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.delete(workspaceId, BigInt(id));
+    const userId = BigInt(req.user.sub || 1);
+    return this.service.delete(workspaceId, BigInt(id), userId);
   }
 }

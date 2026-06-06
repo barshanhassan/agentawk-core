@@ -33,6 +33,18 @@ export class WebhooksService {
   async create(workspaceId: bigint, creatorId: bigint, data: any) {
     const { name, url, events } = data;
 
+    if (!name || !String(name).trim()) {
+      throw new BadRequestException('Webhook name is required');
+    }
+    if (!url || !this.isValidUrl(url)) {
+      throw new BadRequestException('A valid webhook URL is required');
+    }
+    if (!Array.isArray(events) || events.length === 0) {
+      throw new BadRequestException(
+        'Select at least one event for this webhook',
+      );
+    }
+
     // URL verification logic from Laravel
     if (!(await this.testWebhook(url))) {
       throw new BadRequestException('We could not verify the webhook URL');
@@ -46,6 +58,13 @@ export class WebhooksService {
         events: typeof events === 'string' ? events : JSON.stringify(events),
         creator_id: creatorId,
       },
+    });
+
+    await this.writeAuditLog(workspaceId, creatorId, 'webhook_created', {
+      webhook_id: String(webhook.id),
+      name,
+      url,
+      events,
     });
 
     return { webhook };
@@ -89,6 +108,13 @@ export class WebhooksService {
       },
     });
 
+    await this.writeAuditLog(workspaceId, updaterId, 'webhook_updated', {
+      webhook_id: String(webhookId),
+      name,
+      url,
+      events,
+    });
+
     return { webhook: updatedWebhook };
   }
 
@@ -97,7 +123,7 @@ export class WebhooksService {
    * @param workspaceId
    * @param webhookId
    */
-  async delete(workspaceId: bigint, webhookId: bigint) {
+  async delete(workspaceId: bigint, webhookId: bigint, deleterId?: bigint) {
     const webhook = await this.prisma.webhooks.findFirst({
       where: { id: webhookId, workspace_id: workspaceId },
     });
@@ -110,7 +136,62 @@ export class WebhooksService {
       where: { id: webhookId },
     });
 
+    await this.writeAuditLog(
+      workspaceId,
+      deleterId ?? null,
+      'webhook_deleted',
+      {
+        webhook_id: String(webhookId),
+        name: webhook.name,
+        url: webhook.url,
+      },
+    );
+
     return { success: true };
+  }
+
+  /**
+   * Lightweight URL validation — must parse as a URL and be http/https.
+   * The deeper reachability check happens in testWebhook().
+   */
+  private isValidUrl(value: string): boolean {
+    try {
+      const u = new URL(value);
+      return u.protocol === 'http:' || u.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Write an audit_logs row for webhook CRUD operations. Best-effort —
+   * a failure here must never bubble up because the caller has already
+   * mutated the row.
+   */
+  private async writeAuditLog(
+    workspaceId: bigint,
+    userId: bigint | null,
+    event: string,
+    data: any,
+  ): Promise<void> {
+    try {
+      await this.prisma.audit_logs.create({
+        data: {
+          workspace_id: workspaceId,
+          user_id: userId,
+          event,
+          modelable_type: 'App\\Models\\Webhook\\Webhook',
+          modelable_id: data?.webhook_id ? BigInt(data.webhook_id) : null,
+          data: JSON.stringify(data ?? {}),
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      });
+    } catch (err: any) {
+      this.logger.warn(
+        `[webhooks] audit log write failed: ${err?.message ?? err}`,
+      );
+    }
   }
 
   /**

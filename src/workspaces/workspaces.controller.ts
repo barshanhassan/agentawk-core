@@ -11,6 +11,7 @@ import {
   Param,
 } from '@nestjs/common';
 import { WorkspacesService } from './workspaces.service';
+import { PlanFeaturesService } from './plan-features.service';
 import { RolesService } from '../roles/roles.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
 import { Logger } from '@nestjs/common';
@@ -24,12 +25,25 @@ export class WorkspacesController {
   constructor(
     private readonly service: WorkspacesService,
     private readonly rolesService: RolesService,
+    private readonly planFeatures: PlanFeaturesService,
   ) {}
 
   @Get('current')
   async getWorkspace(@Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     return this.service.getWorkspace(workspaceId);
+  }
+
+  /**
+   * Plan-level feature flags. Resolved by following the billing chain
+   * (workspace → agency → active subscription → billing_plan). Frontend
+   * calls this from Developer Settings to know whether to show the
+   * upgrade-prompt card vs the live API token UI.
+   */
+  @Get('plan-features')
+  async getPlanFeatures(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.planFeatures.getForWorkspace(workspaceId);
   }
 
   // Workspaces the logged-in user can switch to (for the workspace switcher).
@@ -166,17 +180,8 @@ export class WorkspacesController {
     return this.service.updatePasswordPolicy(workspaceId, userId, body);
   }
 
-  @Get('developer-settings')
-  async getDeveloperSettings(@Request() req: any) {
-    const workspaceId = BigInt(req.user.workspace_id || 1);
-    const userId = BigInt(req.user.id || 1);
-    return this.service.getDeveloperSettings(workspaceId, userId);
-  }
-
-  @Post('developer-settings')
-  async updateDeveloperSettings(@Body() body: any, @Request() req: any) {
-    const workspaceId = BigInt(req.user.workspace_id || 1);
-    const userId = BigInt(req.user.id || 1);
-    return this.service.updateDeveloperSettings(workspaceId, userId, body);
-  }
+  // Note: the old `developer-settings` endpoints were removed — they
+  // stored a JSON blob in user_states that the new flow doesn't need.
+  // API key now lives in `users.api_token` (GET/POST /api/users/api-token)
+  // and webhooks have their own dedicated `/api/webhooks` CRUD.
 }

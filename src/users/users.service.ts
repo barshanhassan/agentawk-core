@@ -216,9 +216,9 @@ export class UsersService {
 
   /**
    * Get programmatic API Token for Webhooks / External triggers.
+   * Mirrors replyagent's `UsersController@getPublicAPIToken`.
    */
   async getPublicAPIToken(userId: bigint, workspaceId: bigint) {
-    // Laravel logic checked the Workspace table for `api_token`
     const user = await this.prisma.users.findUnique({
       where: { id: userId },
       select: { api_token: true },
@@ -228,17 +228,45 @@ export class UsersService {
   }
 
   /**
-   * Generate new programmatic API Token for Webhooks / External triggers.
+   * Generate a new programmatic API token and persist it to
+   * `users.api_token`. Mirrors replyagent's `createPublicAPIToken`
+   * (which used Sanctum); we store the raw token directly so the
+   * `PublicApiGuard` can do a single equality check on inbound
+   * `Authorization: Bearer …` requests.
+   *
+   * Audit-logged as `api_token_regenerated` so a workspace owner can
+   * see when a token was rotated and from where.
    */
-  async createPublicAPIToken(userId: bigint, workspaceId: bigint) {
+  async createPublicAPIToken(
+    userId: bigint,
+    workspaceId: bigint,
+    requestIp?: string,
+  ) {
     const token = crypto.randomBytes(32).toString('hex');
 
-    await this.prisma.workspaces.update({
-      where: { id: workspaceId },
-      data: {
-        /* mapping api token logic */
-      },
+    await this.prisma.users.update({
+      where: { id: userId },
+      data: { api_token: token },
     });
+
+    try {
+      await this.prisma.audit_logs.create({
+        data: {
+          workspace_id: workspaceId,
+          user_id: userId,
+          event: 'api_token_regenerated',
+          modelable_type: 'App\\Models\\User',
+          modelable_id: userId,
+          data: JSON.stringify({ ip: requestIp ?? null }),
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      });
+    } catch (err: any) {
+      this.logger.warn(
+        `[createPublicAPIToken] audit log write failed: ${err?.message ?? err}`,
+      );
+    }
 
     return { success: true, api_token: token, message: 'API Token generated' };
   }
@@ -288,35 +316,123 @@ export class UsersService {
   }
 
   /**
-   * Dedicated Change Password Logic
-   * Verifies current password before updating to new hashed password
+   * Dedicated Change Password — mirrors replyagent's
+   * `Api\AuthController@changePassword`. Validates server-side (don't trust
+   * the client-only rules), checks the current password, rejects reuse of
+   * the same password, persists the bcrypt hash, and writes a
+   * `password_changed` audit log row with the request IP for compliance.
+   *
+   * Returns 400 with `{ errors: { field: message } }` on validation failures
+   * so the frontend can surface errors per field (matches replyagent's
+   * response shape).
    */
-  async changePassword(userId: bigint, data: any) {
-    const { currentPassword, newPassword } = data;
+  async changePassword(
+    userId: bigint,
+    data: any,
+    requestIp?: string,
+  ) {
+    // Accept both camelCase (frontend) and snake_case (replyagent parity)
+    // so external integrators using the legacy shape keep working.
+    const currentPassword: string =
+      data?.currentPassword ?? data?.current_password ?? data?.old_password;
+    const newPassword: string =
+      data?.newPassword ?? data?.new_password;
+    const retypePassword: string =
+      data?.retypePassword ?? data?.retype_password ?? data?.confirm_password;
 
-    if (!currentPassword || !newPassword) {
-      throw new BadRequestException('Current and new password are required');
+    const errors: Record<string, string> = {};
+    if (!currentPassword) errors.currentPassword = 'Current password is required';
+    if (!newPassword) errors.newPassword = 'New password is required';
+    if (!retypePassword)
+      errors.retypePassword = 'Retype password is required';
+
+    // Complexity gates — kept in sync with the UI rules so a successful
+    // direct API call cannot bypass them.
+    if (newPassword) {
+      const complaints: string[] = [];
+      if (newPassword.length < 8) complaints.push('at least 8 characters');
+      if (!/[A-Z]/.test(newPassword)) complaints.push('one uppercase letter');
+      if (!/[!@#$%^&*(),.?":{}|<>]/.test(newPassword))
+        complaints.push('one special character');
+      if (!/\d/.test(newPassword)) complaints.push('one number');
+      if (complaints.length) {
+        errors.newPassword = `Password must contain ${complaints.join(', ')}`;
+      }
+    }
+
+    if (newPassword && retypePassword && newPassword !== retypePassword) {
+      errors.retypePassword = 'Passwords do not match';
+    }
+
+    if (Object.keys(errors).length) {
+      throw new BadRequestException({ errors });
     }
 
     const user = await this.prisma.users.findUnique({
       where: { id: userId },
     });
-
     if (!user) throw new NotFoundException('User not found');
 
-    // Verification - Note: In some systems, password might be empty if using SSO / Social Login
-    const isMatched = await bcrypt.compare(currentPassword, user.password || '');
+    // user.password is nullable for SSO/social-login users — bcrypt.compare
+    // against '' returns false safely, so the user just gets a normal
+    // "current password is wrong" error.
+    const isMatched = await bcrypt.compare(
+      currentPassword,
+      user.password || '',
+    );
     if (!isMatched) {
-      throw new BadRequestException('Current password does not match');
+      throw new BadRequestException({
+        errors: { currentPassword: 'Current password is incorrect' },
+      });
+    }
+
+    // Block reusing the exact same password. (Without password_history this
+    // is the best we can do — replyagent does no reuse check at all, so
+    // we're already ahead of parity here.)
+    if (user.password) {
+      const sameAsOld = await bcrypt.compare(newPassword, user.password);
+      if (sameAsOld) {
+        throw new BadRequestException({
+          errors: { newPassword: 'New password must differ from the current one' },
+        });
+      }
     }
 
     const hashedPassword = await bcrypt.hash(newPassword, 10);
-
     await this.prisma.users.update({
       where: { id: userId },
       data: { password: hashedPassword },
     });
 
-    return { success: true, message: 'Password updated successfully' };
+    // Replyagent writes an audit log entry on password change with the
+    // request IP for compliance. We mirror that shape exactly — Laravel-style
+    // modelable_type so existing log readers (admin dashboards, replyagent
+    // legacy tooling) recognise the row.
+    try {
+      await this.prisma.audit_logs.create({
+        data: {
+          workspace_id: user.active_workspace_id ?? BigInt(0),
+          user_id: userId,
+          event: 'password_changed',
+          modelable_type: 'App\\Models\\User',
+          modelable_id: userId,
+          data: JSON.stringify({ ip: requestIp ?? null }),
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      });
+    } catch (err) {
+      // Audit-log failure must never block the user from changing their
+      // password — surface the failure to logs and continue.
+      this.logger.warn(
+        `[changePassword] audit_logs write failed: ${(err as Error)?.message ?? err}`,
+      );
+    }
+
+    return {
+      success: true,
+      message: 'Password updated successfully',
+      code: 'SUCCESS',
+    };
   }
 }

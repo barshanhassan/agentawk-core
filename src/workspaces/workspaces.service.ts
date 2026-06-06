@@ -931,58 +931,11 @@ export class WorkspacesService {
     });
   }
 
-  /**
-   * Developer Settings Persistence
-   * Uses user_states table with type 'developer_settings'
-   */
-  async getDeveloperSettings(workspaceId: bigint, userId: bigint) {
-    const state = await this.prisma.user_states.findFirst({
-      where: { user_id: userId, type: 'developer_settings' },
-    });
-    if (state) return JSON.parse(state.data);
-    
-    // Default settings if none exist
-    return {
-      apiKey: this.generateRandomKey(40),
-      webhooks: [],
-    };
-  }
-
-  async updateDeveloperSettings(workspaceId: bigint, userId: bigint, data: any) {
-    const existing = await this.prisma.user_states.findFirst({
-      where: { user_id: userId, type: 'developer_settings' },
-    });
-
-    let finalData = { ...data };
-    if (data.regenerateKey) {
-      finalData.apiKey = this.generateRandomKey(40);
-      delete finalData.regenerateKey;
-    }
-
-    if (existing) {
-      const currentData = JSON.parse(existing.data);
-      const mergedData = { ...currentData, ...finalData };
-      return this.prisma.user_states.update({
-        where: { id: existing.id },
-        data: { data: JSON.stringify(mergedData) },
-      });
-    }
-
-    return this.prisma.user_states.create({
-      data: {
-        user_id: userId,
-        type: 'developer_settings',
-        data: JSON.stringify(finalData),
-      },
-    });
-  }
-
-  private generateRandomKey(length: number): string {
-    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let result = '';
-    for (let i = 0; i < length; i++) {
-      result += characters.charAt(Math.floor(Math.random() * characters.length));
-    }
-    return result;
-  }
+  // Note: the previous `getDeveloperSettings` / `updateDeveloperSettings`
+  // methods (stored a fake API key + webhooks JSON in user_states) were
+  // removed. The Developer Settings UI now reads from the real
+  // `users.api_token` column and the dedicated `webhooks` table. Existing
+  // user_states rows of type 'developer_settings' are no longer queried —
+  // they remain in the table as inert legacy data and can be cleaned up
+  // by a one-shot DB script if desired.
 }

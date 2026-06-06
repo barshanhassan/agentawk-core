@@ -8,15 +8,20 @@ import {
   Request,
   UseInterceptors,
   UploadedFile,
+  ForbiddenException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { UsersService } from './users.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
+import { PlanFeaturesService } from '../workspaces/plan-features.service';
 
 @UseGuards(JwtAuthGuard)
 @Controller('users')
 export class UsersController {
-  constructor(private readonly service: UsersService) {}
+  constructor(
+    private readonly service: UsersService,
+    private readonly planFeatures: PlanFeaturesService,
+  ) {}
 
   @Post('update')
   async updateProfile(@Body() body: any, @Request() req: any) {
@@ -81,7 +86,24 @@ export class UsersController {
   async createPublicAPIToken(@Request() req: any) {
     const userId = BigInt(req.user.sub || 1);
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.createPublicAPIToken(userId, workspaceId);
+
+    // Plan gate — mirrors replyagent's
+    // `agency.subscription.plan.allow_api` check. Surfacing 403 here
+    // keeps the UI honest about why the regenerate button is disabled
+    // even if the caller tries to bypass the frontend.
+    const features = await this.planFeatures.getForWorkspace(workspaceId);
+    if (!features.allow_api) {
+      throw new ForbiddenException(
+        'Your current plan does not include public API access.',
+      );
+    }
+
+    const ip =
+      (req.headers?.['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+      req.ip ||
+      req.socket?.remoteAddress ||
+      undefined;
+    return this.service.createPublicAPIToken(userId, workspaceId, ip);
   }
 
   @Get('theme')
@@ -99,6 +121,14 @@ export class UsersController {
   @Post('change-password')
   async changePassword(@Body() body: any, @Request() req: any) {
     const userId = BigInt(req.user.sub || 1);
-    return this.service.changePassword(userId, body);
+    // Forward the request IP for the `password_changed` audit log row.
+    // x-forwarded-for is honoured first so Cloud Run requests record the
+    // real client IP rather than the load-balancer hop.
+    const ip =
+      (req.headers?.['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+      req.ip ||
+      req.socket?.remoteAddress ||
+      undefined;
+    return this.service.changePassword(userId, body, ip);
   }
 }

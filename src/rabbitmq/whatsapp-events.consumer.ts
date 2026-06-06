@@ -152,6 +152,32 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
           status: newStatus,
           error: errorData,
         });
+
+        // Notify outbound webhook subscribers (Developer Settings → Webhooks).
+        // Map WhatsApp's `sent | delivered | read | failed` 1:1 to our event
+        // slugs; anything else (e.g. accepted) is internal-only.
+        const eventName =
+          newStatus === 'sent'
+            ? 'message.sent'
+            : newStatus === 'delivered'
+              ? 'message.delivered'
+              : newStatus === 'read'
+                ? 'message.read'
+                : newStatus === 'failed'
+                  ? 'message.failed'
+                  : null;
+        if (eventName) {
+          this.events.emit(eventName, {
+            workspaceId: account.workspace_id,
+            wa_message_id: msg.id.toString(),
+            wa_chat_id: chat.id.toString(),
+            wamid,
+            channel: 'whatsapp',
+            status: newStatus,
+            error: errorData,
+            occurred_at: now.toISOString(),
+          });
+        }
       }
     }
   }

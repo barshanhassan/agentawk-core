@@ -59,12 +59,6 @@ export class AuthController {
     return this.authService.disableTFA(BigInt(req.user.sub), password);
   }
 
-  @UseGuards(JwtAuthGuard)
-  @Post('change-password')
-  async changePassword(@Request() req: any, @Body() body: any) {
-    return this.authService.changePassword(BigInt(req.user.sub), body);
-  }
-
   @Post('forgot-password')
   async forgotPassword(
     @Body('email') email: string,

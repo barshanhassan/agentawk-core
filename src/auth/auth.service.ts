@@ -631,30 +631,8 @@ export class AuthService {
     return { message: 'Password updated successfully', code: 'SUCCESS' };
   }
 
-  async changePassword(userId: bigint, data: any) {
-    if (data.new_password !== data.confirm_password) {
-      throw new BadRequestException('New passwords do not match');
-    }
-
-    const user = await this.prisma.users.findUnique({ where: { id: userId } });
-    if (!user) throw new BadRequestException('User not found');
-
-    const isPasswordValid = await bcrypt.compare(
-      data.old_password,
-      user.password || '',
-    );
-    if (!isPasswordValid)
-      throw new UnauthorizedException('Incorrect old password');
-
-    const hashedPassword = await bcrypt.hash(data.new_password, 10);
-
-    await this.prisma.users.update({
-      where: { id: userId },
-      data: { password: hashedPassword },
-    });
-
-    return { message: 'Password updated successfully' };
-  }
+  // Note: changePassword was removed from this service — UsersService.changePassword
+  // is the single source of truth. See backend/src/users/users.service.ts.
 
   async loadUserPermissions(userId: bigint, isOwner?: boolean): Promise<string[]> {
     // Owner gets wildcard — all permissions granted. Use the caller-provided
