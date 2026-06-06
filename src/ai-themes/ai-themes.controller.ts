@@ -5,6 +5,8 @@ import {
   Patch,
   Delete,
   Param,
+  Body,
+  Query,
   UseGuards,
   Request,
 } from '@nestjs/common';
@@ -16,33 +18,71 @@ import { JwtAuthGuard } from '../auth/auth.guard';
 export class AiThemesController {
   constructor(private readonly aiThemesService: AiThemesService) {}
 
+  // List + optional type filter — same endpoint shape as replyagent's
+  // `index($type = null)`. Type comes through as a query param to keep the
+  // path stable; replyagent overloads the route, we keep it RESTful.
   @Get()
-  index(@Request() req: any) {
-    return { message: 'Listing all AI themes', user: req.user };
+  list(@Request() req: any, @Query('type') type?: string) {
+    return this.aiThemesService.list(
+      BigInt(req.user.workspace_id || 1),
+      BigInt(req.user.sub || req.user.id || 0),
+      req.user.role || 'agent',
+      type || undefined,
+    );
   }
 
-  @Get(':type')
-  indexWithType(@Param('type') type: string, @Request() req: any) {
-    return { message: `Listing AI themes of type ${type}`, user: req.user };
-  }
-
-  @Get(':theme/show')
-  show(@Param('theme') theme: string, @Request() req: any) {
-    return { message: `Showing AI theme ${theme}`, user: req.user };
+  @Get(':id')
+  show(@Param('id') id: string, @Request() req: any) {
+    return this.aiThemesService.show(BigInt(req.user.workspace_id || 1), BigInt(id));
   }
 
   @Post()
-  store(@Request() req: any) {
-    return { message: 'Creating new AI theme', user: req.user };
+  create(@Body() body: any, @Request() req: any) {
+    return this.aiThemesService.create(BigInt(req.user.workspace_id || 1), body);
   }
 
-  @Patch(':theme')
-  update(@Param('theme') theme: string, @Request() req: any) {
-    return { message: `Updating AI theme ${theme}`, user: req.user };
+  @Patch(':id')
+  update(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    return this.aiThemesService.update(BigInt(req.user.workspace_id || 1), BigInt(id), body);
   }
 
-  @Delete(':theme')
-  destroy(@Param('theme') theme: string, @Request() req: any) {
-    return { message: `Deleting AI theme ${theme}`, user: req.user };
+  @Delete(':id')
+  delete(@Param('id') id: string, @Request() req: any) {
+    return this.aiThemesService.delete(BigInt(req.user.workspace_id || 1), BigInt(id));
+  }
+
+  // ─── User access management ──────────────────────────────────────────
+
+  @Get(':id/users')
+  listUsers(@Param('id') id: string, @Request() req: any) {
+    return this.aiThemesService.listUsers(
+      BigInt(req.user.workspace_id || 1),
+      BigInt(id),
+    );
+  }
+
+  @Post(':id/users/:userId/toggle')
+  toggleUserAccess(
+    @Param('id') id: string,
+    @Param('userId') userId: string,
+    @Body('access') access: boolean,
+    @Request() req: any,
+  ) {
+    return this.aiThemesService.toggleUserAccess(
+      BigInt(req.user.workspace_id || 1),
+      BigInt(id),
+      BigInt(userId),
+      !!access,
+    );
+  }
+
+  // ─── Baserow fields proxy ────────────────────────────────────────────
+
+  @Get(':id/fields')
+  fields(@Param('id') id: string, @Request() req: any) {
+    return this.aiThemesService.fetchBaserowFields(
+      BigInt(req.user.workspace_id || 1),
+      BigInt(id),
+    );
   }
 }
