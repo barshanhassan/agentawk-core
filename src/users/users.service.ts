@@ -20,6 +20,76 @@ export class UsersService {
   ) {}
 
   /**
+   * List users in a workspace. Used by the Contact Profile's Opportunity
+   * form to populate the "Assigned to" dropdown. Returns lean rows so the
+   * client picker doesn't have to know about modelable / agency plumbing.
+   *
+   * Resolution: a workspace owner is identified by `modelable_type=Workspace`
+   * + `modelable_id=workspaceId`; regular agents are joined through
+   * `team_members.workspace_id`. We union both sets and dedupe by id.
+   */
+  async listWorkspaceUsers(workspaceId: bigint) {
+    const [owners, members] = await Promise.all([
+      this.prisma.users
+        .findMany({
+          where: {
+            modelable_type: 'App\\Models\\Workspace',
+            modelable_id: workspaceId,
+          },
+          select: {
+            id: true,
+            first_name: true,
+            last_name: true,
+            full_name: true,
+            email: true,
+            gallery_media_id: true,
+          },
+        })
+        .catch(() => [] as any[]),
+      (this.prisma as any).team_members
+        ?.findMany?.({
+          where: { workspace_id: workspaceId },
+          select: { user_id: true },
+        })
+        .catch(() => [] as any[]) ?? [],
+    ]);
+
+    const memberIds = (members as any[])
+      .map((m) => m.user_id)
+      .filter((x): x is bigint => !!x);
+    const additionalUsers = memberIds.length
+      ? await this.prisma.users.findMany({
+          where: { id: { in: memberIds } },
+          select: {
+            id: true,
+            first_name: true,
+            last_name: true,
+            full_name: true,
+            email: true,
+            gallery_media_id: true,
+          },
+        })
+      : [];
+
+    const byId = new Map<string, any>();
+    for (const u of [...owners, ...additionalUsers]) {
+      const display =
+        u.full_name ||
+        [u.first_name, u.last_name].filter(Boolean).join(' ').trim() ||
+        u.email;
+      byId.set(u.id.toString(), {
+        id: u.id.toString(),
+        first_name: u.first_name,
+        last_name: u.last_name,
+        full_name: display,
+        name: display,
+        email: u.email,
+      });
+    }
+    return { users: Array.from(byId.values()) };
+  }
+
+  /**
    * Update User Name, Email, Profile details.
    */
   async updateProfile(userId: bigint, data: any) {

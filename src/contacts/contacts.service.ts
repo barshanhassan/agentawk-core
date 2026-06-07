@@ -174,6 +174,49 @@ export class ContactsService {
       .getEntityValues('Contact', contact.id)
       .catch(() => [] as any[]);
 
+    // ─── Linked-record LISTS (not just counts) ──────────────────────
+    // The contact-details modal needs to render the actual task rows,
+    // booking rows, call rows etc. in the left sidebar. We cap at 5 each
+    // for the sidebar preview; the "see all" affordance can paginate later.
+
+    const tasks = await this.prisma.tasks
+      .findMany({
+        where: { workspace_id: workspaceId, contact_id: contact.id },
+        orderBy: [{ datetime: 'desc' }, { id: 'desc' }],
+        take: 5,
+      })
+      .catch(() => [] as any[]);
+    const taskUserIds = Array.from(
+      new Set(tasks.map((t) => t.user_id).filter((x): x is bigint => !!x)),
+    );
+    const taskUsers = taskUserIds.length
+      ? await this.prisma.users.findMany({
+          where: { id: { in: taskUserIds } },
+          select: { id: true, first_name: true, last_name: true },
+        })
+      : [];
+    const taskUserById = new Map(taskUsers.map((u) => [u.id.toString(), u]));
+
+    const bookings = await this.prisma.bookings
+      .findMany({
+        where: { workspace_id: workspaceId, contact_id: contact.id },
+        orderBy: [{ start: 'desc' }, { id: 'desc' }],
+        take: 5,
+      })
+      .catch(() => [] as any[]);
+
+    // Latest open Support-Number-Task entry for this inbox (replyagent
+    // surfaces this as a top-of-profile chip).
+    let supportNumberTask: string | null = null;
+    try {
+      const sn = await this.prisma.support_numbers.findFirst({
+        where: { workspace_id: workspaceId, contact_id: contact.id, is_open: 1 },
+        orderBy: { id: 'desc' },
+        select: { sn_number: true },
+      });
+      supportNumberTask = sn?.sn_number ?? null;
+    } catch {}
+
     return {
       success: true,
       contact: {
@@ -190,11 +233,41 @@ export class ContactsService {
           created_at: e.created_at,
         })),
         custom_fields: customFields,
+        support_number_task: supportNumberTask,
+        tasks: tasks.map((t) => {
+          const u = t.user_id ? taskUserById.get(t.user_id.toString()) : null;
+          const assigneeName = u
+            ? [u.first_name, u.last_name].filter(Boolean).join(' ').trim() || `User ${u.id}`
+            : null;
+          return {
+            id: t.id.toString(),
+            description: t.description,
+            datetime: t.datetime,
+            status: t.status,
+            assignee_name: assigneeName,
+            assignee_initials: assigneeName
+              ? assigneeName
+                  .split(/\s+/)
+                  .map((p: string) => p[0])
+                  .join('')
+                  .slice(0, 2)
+                  .toUpperCase()
+              : null,
+          };
+        }),
+        bookings: bookings.map((b) => ({
+          id: b.id.toString(),
+          title: b.eventTitle ?? b.booking_id ?? `Booking ${b.id}`,
+          start: b.start,
+          booking_id: b.booking_id,
+        })),
         counts: {
           tasks: tasksCount,
           bookings: bookingsCount,
           calls: callsCount,
           ad_clicks: 0, // ad_clicks table not present yet — keep slot for parity
+          opportunities: 0,
+          groups: 0,
         },
       },
     };
@@ -643,6 +716,613 @@ export class ContactsService {
     });
 
     return { success: true };
+  }
+
+  // ─── Replyagent parity: profile modal endpoints ─────────────────────
+
+  /**
+   * Change a contact's status (active / inactive). Mirrors replyagent's
+   * POST /contact/change-status/:id { action: status } endpoint.
+   */
+  async changeContactStatus(
+    workspaceId: bigint,
+    contactId: bigint,
+    status: string,
+  ) {
+    const contact = await this.prisma.contacts.findFirst({
+      where: { id: contactId, workspace_id: workspaceId },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    const next = String(status || '').toUpperCase();
+    await this.prisma.contacts.update({
+      where: { id: contactId },
+      data: { status: next as any },
+    });
+
+    this.eventEmitter.emit('contact.status_changed', {
+      contactId,
+      workspaceId,
+      status: next,
+    });
+
+    return { success: true, status: next };
+  }
+
+  /**
+   * Remove a system field (phone / email / address / url) or a custom field
+   * value from a contact. Body shape: { contact, field, type }
+   *   - type === 'contact'    → contact_mobiles / contact_emails row
+   *   - type === 'additional' → addresses / urls row
+   *   - type === 'custom'     → custom field entity value
+   */
+  async removeField(
+    workspaceId: bigint,
+    contactId: bigint,
+    field: any,
+    type: string,
+  ) {
+    const contact = await this.prisma.contacts.findFirst({
+      where: { id: contactId, workspace_id: workspaceId },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    const slug = String(field?.slug ?? '').toLowerCase();
+    const objectId = field?.object_id ? BigInt(field.object_id) : null;
+
+    if (!objectId) {
+      return { success: false, message: 'Missing field reference' };
+    }
+
+    try {
+      if (type === 'contact' || type === 'additional') {
+        if (slug === 'mobile' || slug === 'whatsapp') {
+          await this.prisma.contact_mobiles.deleteMany({
+            where: {
+              id: objectId,
+              modelable_type: 'App\\Models\\Contact',
+              modelable_id: contactId,
+            },
+          });
+        } else if (slug === 'email') {
+          await this.prisma.contact_emails.deleteMany({
+            where: {
+              id: objectId,
+              modelable_type: 'App\\Models\\Contact',
+              modelable_id: contactId,
+            },
+          });
+        } else if (slug === 'address') {
+          // `addresses` is polymorphic via addressable_type/addressable_id.
+          await this.prisma.addresses
+            .deleteMany({
+              where: {
+                id: objectId,
+                addressable_type: 'App\\Models\\Contact',
+                addressable_id: contactId,
+              },
+            })
+            .catch(() => null);
+        }
+      } else if (type === 'custom') {
+        // `custom_field_entity_values` is polymorphic via modelable_type/id;
+        // it does NOT carry a `custom_field_id` column directly. `cf_entity_id`
+        // is the FK to `custom_field_entities` (junction), so we scope by
+        // (cf_entity_id, modelable_type, modelable_id) for safety.
+        try {
+          await this.prisma.custom_field_entity_values.deleteMany({
+            where: {
+              cf_entity_id: objectId,
+              modelable_type: 'App\\Models\\Contact',
+              modelable_id: contactId,
+            },
+          });
+        } catch {}
+      }
+    } catch (e) {
+      this.logger.warn(`removeField failed: ${e}`);
+    }
+
+    return await this.getContact(workspaceId, contactId);
+  }
+
+  /**
+   * Toggle a phone / email row's primary flag. The frontend sends this on
+   * the "Mark primary" menu action — replyagent stores a single primary per
+   * channel, so flipping one to primary clears the rest of the same type.
+   */
+  async setPrimary(
+    workspaceId: bigint,
+    contactId: bigint,
+    fieldId: bigint,
+    fieldType: 'mobile' | 'email',
+    markPrimary: boolean,
+  ) {
+    const contact = await this.prisma.contacts.findFirst({
+      where: { id: contactId, workspace_id: workspaceId },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    if (fieldType === 'mobile') {
+      const row = await this.prisma.contact_mobiles.findFirst({
+        where: { id: fieldId, modelable_id: contactId },
+      });
+      if (!row) throw new NotFoundException('Mobile not found');
+      if (markPrimary) {
+        await this.prisma.contact_mobiles.updateMany({
+          where: {
+            modelable_type: 'App\\Models\\Contact',
+            modelable_id: contactId,
+            type: row.type ?? 'phone',
+          },
+          data: { is_primary: 0 },
+        });
+      }
+      await this.prisma.contact_mobiles.update({
+        where: { id: fieldId },
+        data: { is_primary: markPrimary ? 1 : 0 },
+      });
+    } else {
+      if (markPrimary) {
+        await this.prisma.contact_emails.updateMany({
+          where: {
+            modelable_type: 'App\\Models\\Contact',
+            modelable_id: contactId,
+          },
+          data: { is_primary: 0 },
+        });
+      }
+      await this.prisma.contact_emails.update({
+        where: { id: fieldId },
+        data: { is_primary: markPrimary ? 1 : 0 },
+      });
+    }
+    return await this.getContact(workspaceId, contactId);
+  }
+
+  /**
+   * Mark a contact's opt-in row as unsubscribed. Mirrors replyagent's
+   * POST /contact/unsubscribe/:optinId { contact_id }. We best-effort look
+   * up an `optins` table — schemas vary, so a missing model returns success
+   * without error rather than crashing.
+   */
+  async unsubscribe(workspaceId: bigint, contactId: bigint, optinId: bigint) {
+    try {
+      await (this.prisma as any).optins?.update?.({
+        where: { id: optinId },
+        data: { is_subscribed: 0, unsubscribed_at: new Date() },
+      });
+    } catch {}
+    return { success: true };
+  }
+
+  async optin(workspaceId: bigint, contactId: bigint, data: any) {
+    try {
+      await (this.prisma as any).optins?.create?.({
+        data: {
+          workspace_id: workspaceId,
+          contact_id: contactId,
+          channel: data.channel ?? null,
+          is_subscribed: 1,
+        },
+      });
+    } catch {}
+    return { success: true };
+  }
+
+  /**
+   * Fetch a contact's full detail for the merge-preview pane. Same shape as
+   * getContact() but returns the lean payload the MergeContacts modal binds
+   * to (mobile_contacts/email_contacts/whatsapp_chats/etc.).
+   */
+  async getContactForMerge(workspaceId: bigint, contactId: bigint) {
+    const contact = await this.prisma.contacts.findFirst({
+      where: { id: contactId, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    const [mobiles, emails, tagLinks] = await Promise.all([
+      this.prisma.contact_mobiles.findMany({
+        where: {
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: contact.id,
+        },
+      }),
+      this.prisma.contact_emails.findMany({
+        where: {
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: contact.id,
+        },
+      }),
+      this.prisma.tag_links.findMany({
+        where: {
+          linkable_type: 'App\\Models\\Contact',
+          linkable_id: contact.id,
+        },
+      }),
+    ]);
+
+    return {
+      ...this.serialize(contact),
+      slug: contact.id.toString(),
+      full_name:
+        `${contact.first_name ?? ''} ${contact.last_name ?? ''}`.trim() ||
+        'Unnamed',
+      picture: '/images/avatar.png',
+      mobile_contacts: mobiles.map((m) => ({
+        ...this.serializeMobile(m),
+        slug: String(m.type ?? 'mobile').toLowerCase() === 'whatsapp'
+          ? 'whatsapp'
+          : 'mobile',
+        national_mobile_number: m.full_mobile_number ?? m.mobile_number ?? '',
+      })),
+      email_contacts: emails.map((e) => ({
+        id: e.id.toString(),
+        email: e.email,
+        is_primary: !!e.is_primary,
+      })),
+      tag_links: tagLinks.map((tl) => ({
+        id: tl.id.toString(),
+        name: tl.name,
+        tag_id: tl.tag_id?.toString(),
+      })),
+      custom_fields_data: [],
+      telegram_chats: [],
+      whatsapp_chats: mobiles
+        .filter((m) => String(m.type ?? '').toLowerCase() === 'whatsapp')
+        .map((m) => ({
+          id: m.id.toString(),
+          wa_id: m.full_mobile_number ?? m.mobile_number ?? '',
+          profile_name: contact.full_name ?? '',
+        })),
+      facebook_chats: [],
+      instagram_chats: [],
+    };
+  }
+
+  /**
+   * Search candidate destination contacts for a merge. Mirrors replyagent's
+   * POST /contact/search-destination { current_contact_id, key }.
+   */
+  async searchDestinationContacts(
+    workspaceId: bigint,
+    currentContactId: bigint,
+    key: string,
+  ) {
+    const trimmed = String(key ?? '').trim();
+    if (trimmed.length < 3) return { contacts: [] };
+
+    const contacts = await this.prisma.contacts.findMany({
+      where: {
+        workspace_id: workspaceId,
+        deleted_at: null,
+        id: { not: currentContactId },
+        OR: [
+          { first_name: { contains: trimmed } },
+          { last_name: { contains: trimmed } },
+          { full_name: { contains: trimmed } },
+        ],
+      },
+      take: 20,
+      orderBy: { id: 'desc' },
+    });
+
+    return {
+      contacts: contacts.map((c) => ({
+        id: c.id.toString(),
+        slug: c.id.toString(),
+        full_name:
+          c.full_name ||
+          `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim() ||
+          'Unnamed',
+        picture: '/images/avatar.png',
+        created_at: c.created_at,
+      })),
+    };
+  }
+
+  /**
+   * Merge two contacts. The destination keeps the older `created_at`, takes
+   * over all phones / emails / tags / custom fields / chat threads from the
+   * source, and the source is soft-deleted. Returns the merged contact.
+   */
+  async mergeContacts(
+    workspaceId: bigint,
+    currentContactId: bigint,
+    destinationContactId: bigint,
+  ) {
+    if (currentContactId === destinationContactId) {
+      throw new BadRequestException('Cannot merge a contact into itself');
+    }
+
+    const [current, dest] = await Promise.all([
+      this.prisma.contacts.findFirst({
+        where: { id: currentContactId, workspace_id: workspaceId },
+      }),
+      this.prisma.contacts.findFirst({
+        where: { id: destinationContactId, workspace_id: workspaceId },
+      }),
+    ]);
+    if (!current || !dest) throw new NotFoundException('Contact not found');
+
+    // 1. Move all phones / emails to the destination, skip duplicates.
+    const [currentMobiles, destMobiles] = await Promise.all([
+      this.prisma.contact_mobiles.findMany({
+        where: {
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: current.id,
+        },
+      }),
+      this.prisma.contact_mobiles.findMany({
+        where: {
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: dest.id,
+        },
+      }),
+    ]);
+    const destMobileSet = new Set(
+      destMobiles.map((m) => m.full_mobile_number ?? m.mobile_number ?? ''),
+    );
+    for (const m of currentMobiles) {
+      const key = m.full_mobile_number ?? m.mobile_number ?? '';
+      if (destMobileSet.has(key)) {
+        await this.prisma.contact_mobiles.delete({ where: { id: m.id } });
+      } else {
+        await this.prisma.contact_mobiles.update({
+          where: { id: m.id },
+          data: { modelable_id: dest.id },
+        });
+      }
+    }
+
+    const [currentEmails, destEmails] = await Promise.all([
+      this.prisma.contact_emails.findMany({
+        where: {
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: current.id,
+        },
+      }),
+      this.prisma.contact_emails.findMany({
+        where: {
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: dest.id,
+        },
+      }),
+    ]);
+    const destEmailSet = new Set(destEmails.map((e) => e.email));
+    for (const e of currentEmails) {
+      if (destEmailSet.has(e.email)) {
+        await this.prisma.contact_emails.delete({ where: { id: e.id } });
+      } else {
+        await this.prisma.contact_emails.update({
+          where: { id: e.id },
+          data: { modelable_id: dest.id },
+        });
+      }
+    }
+
+    // 2. Move tag_links; dedupe by tag_id.
+    const [currentTagLinks, destTagLinks] = await Promise.all([
+      this.prisma.tag_links.findMany({
+        where: {
+          linkable_type: 'App\\Models\\Contact',
+          linkable_id: current.id,
+        },
+      }),
+      this.prisma.tag_links.findMany({
+        where: {
+          linkable_type: 'App\\Models\\Contact',
+          linkable_id: dest.id,
+        },
+      }),
+    ]);
+    const destTagSet = new Set(
+      destTagLinks.map((t) => t.tag_id?.toString() ?? ''),
+    );
+    for (const tl of currentTagLinks) {
+      if (destTagSet.has(tl.tag_id?.toString() ?? '')) {
+        await this.prisma.tag_links.delete({ where: { id: tl.id } });
+      } else {
+        await this.prisma.tag_links.update({
+          where: { id: tl.id },
+          data: { linkable_id: dest.id },
+        });
+      }
+    }
+
+    // 3. Move conversations to the destination contact. The `inbox` table
+    //    has no `contact_id` column — it's polymorphic via modelable_type/id.
+    //    Each per-channel chats table owns the `contact_id` foreign key, so
+    //    we reassign there instead. (best-effort per table — missing models
+    //    on some workspace builds are tolerated.)
+    const reassignContact = async (table: any) => {
+      try {
+        await table.updateMany({
+          where: { contact_id: current.id },
+          data: { contact_id: dest.id },
+        });
+      } catch {}
+    };
+    await Promise.all([
+      reassignContact(this.prisma.wa_chats),
+      reassignContact(this.prisma.telegram_chats),
+      reassignContact(this.prisma.fb_chats),
+      reassignContact(this.prisma.insta_chats),
+      reassignContact(this.prisma.evolution_chats),
+      reassignContact(this.prisma.zapi_chats),
+      reassignContact(this.prisma.twilio_chats),
+    ]);
+    await (this.prisma as any).notes
+      ?.updateMany?.({
+        where: { contact_id: current.id, workspace_id: workspaceId },
+        data: { contact_id: dest.id },
+      })
+      .catch(() => null);
+    await this.prisma.tasks
+      .updateMany({
+        where: { contact_id: current.id, workspace_id: workspaceId },
+        data: { contact_id: dest.id },
+      })
+      .catch(() => null);
+    await this.prisma.bookings
+      .updateMany({
+        where: { contact_id: current.id, workspace_id: workspaceId },
+        data: { contact_id: dest.id },
+      })
+      .catch(() => null);
+
+    // 4. Pick the earlier created_at so the merged contact keeps its history.
+    const earlierCreatedAt =
+      current.created_at && dest.created_at
+        ? current.created_at < dest.created_at
+          ? current.created_at
+          : dest.created_at
+        : current.created_at ?? dest.created_at ?? new Date();
+    await this.prisma.contacts.update({
+      where: { id: dest.id },
+      data: { created_at: earlierCreatedAt },
+    });
+
+    // 5. Soft-delete the source contact.
+    await this.prisma.contacts.update({
+      where: { id: current.id },
+      data: { deleted_at: new Date() },
+    });
+
+    this.eventEmitter.emit('contact.merged', {
+      workspaceId,
+      sourceId: current.id,
+      destinationId: dest.id,
+    });
+
+    const merged = await this.getContact(workspaceId, dest.id);
+    return { success: true, contact: merged.contact };
+  }
+
+  /**
+   * Move a contact to a different company (or unlink). Body: { company_id }.
+   * Replyagent endpoint: POST /company/assign[/:company_id].
+   */
+  async changeCompany(
+    workspaceId: bigint,
+    contactId: bigint,
+    companyId: bigint | null,
+  ) {
+    const contact = await this.prisma.contacts.findFirst({
+      where: { id: contactId, workspace_id: workspaceId },
+    });
+    if (!contact) throw new NotFoundException('Contact not found');
+
+    await this.prisma.contacts.update({
+      where: { id: contactId },
+      data: { company_id: companyId },
+    });
+
+    this.eventEmitter.emit('contact.company_changed', {
+      contactId,
+      workspaceId,
+      companyId,
+    });
+
+    return await this.getContact(workspaceId, contactId);
+  }
+
+  /**
+   * Download a contact's conversation history as a plain-text transcript.
+   * Returns the text; the controller wraps it in a downloadable response.
+   *
+   * The schema has no unified `inbox_messages` table or `inbox.contact_id`
+   * column — each channel has its own chats table (wa_chats, telegram_chats,
+   * fb_chats, insta_chats, evolution_chats, zapi_chats, twilio_chats), each
+   * with `contact_id`, and a matching messages table (wa_messages, …) keyed
+   * by `{channel}_chat_id`. So we gather chat ids per channel, pull messages
+   * across channels, then sort by created_at.
+   */
+  async downloadConversation(workspaceId: bigint, contactId: bigint) {
+    const idSelect = { select: { id: true } } as any;
+    const [waChats, tgChats, fbChats, igChats, evoChats, zapiChats, twChats] =
+      await Promise.all([
+        this.prisma.wa_chats.findMany({ where: { contact_id: contactId }, ...idSelect }).catch(() => [] as any[]),
+        this.prisma.telegram_chats.findMany({ where: { contact_id: contactId }, ...idSelect }).catch(() => [] as any[]),
+        this.prisma.fb_chats.findMany({ where: { contact_id: contactId }, ...idSelect }).catch(() => [] as any[]),
+        this.prisma.insta_chats.findMany({ where: { contact_id: contactId }, ...idSelect }).catch(() => [] as any[]),
+        this.prisma.evolution_chats.findMany({ where: { contact_id: contactId }, ...idSelect }).catch(() => [] as any[]),
+        this.prisma.zapi_chats.findMany({ where: { contact_id: contactId }, ...idSelect }).catch(() => [] as any[]),
+        this.prisma.twilio_chats.findMany({ where: { contact_id: contactId }, ...idSelect }).catch(() => [] as any[]),
+      ]);
+
+    const wa = waChats.map((c: any) => c.id);
+    const tg = tgChats.map((c: any) => c.id);
+    const fb = fbChats.map((c: any) => c.id);
+    const ig = igChats.map((c: any) => c.id);
+    const evo = evoChats.map((c: any) => c.id);
+    const zapi = zapiChats.map((c: any) => c.id);
+    const tw = twChats.map((c: any) => c.id);
+
+    const buckets = await Promise.all([
+      wa.length
+        ? this.prisma.wa_messages
+            .findMany({ where: { wa_chat_id: { in: wa } }, orderBy: { created_at: 'asc' } })
+            .then((rs) => rs.map((m: any) => ({ ...m, _channel: 'WhatsApp' })))
+            .catch(() => [] as any[])
+        : [],
+      tg.length
+        ? this.prisma.telegram_messages
+            .findMany({ where: { telegram_chat_id: { in: tg } }, orderBy: { created_at: 'asc' } })
+            .then((rs) => rs.map((m: any) => ({ ...m, _channel: 'Telegram' })))
+            .catch(() => [] as any[])
+        : [],
+      fb.length
+        ? this.prisma.fb_messages
+            .findMany({ where: { fb_chat_id: { in: fb } }, orderBy: { created_at: 'asc' } })
+            .then((rs) => rs.map((m: any) => ({ ...m, _channel: 'Messenger' })))
+            .catch(() => [] as any[])
+        : [],
+      ig.length
+        ? this.prisma.insta_messages
+            .findMany({ where: { insta_chat_id: { in: ig } }, orderBy: { created_at: 'asc' } })
+            .then((rs) => rs.map((m: any) => ({ ...m, _channel: 'Instagram' })))
+            .catch(() => [] as any[])
+        : [],
+      evo.length
+        ? this.prisma.evolution_messages
+            .findMany({ where: { evolution_chat_id: { in: evo } }, orderBy: { created_at: 'asc' } })
+            .then((rs) => rs.map((m: any) => ({ ...m, _channel: 'Evolution' })))
+            .catch(() => [] as any[])
+        : [],
+      zapi.length
+        ? this.prisma.zapi_messages
+            .findMany({ where: { zapi_chat_id: { in: zapi } }, orderBy: { created_at: 'asc' } })
+            .then((rs) => rs.map((m: any) => ({ ...m, _channel: 'Z-API' })))
+            .catch(() => [] as any[])
+        : [],
+      tw.length
+        ? this.prisma.twilio_messages
+            .findMany({ where: { twilio_chat_id: { in: tw } }, orderBy: { created_at: 'asc' } })
+            .then((rs) => rs.map((m: any) => ({ ...m, _channel: 'SMS' })))
+            .catch(() => [] as any[])
+        : [],
+    ]);
+
+    const all = buckets.flat();
+    all.sort((a, b) => {
+      const ad = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const bd = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return ad - bd;
+    });
+
+    const lines = [
+      `Conversation history for contact ${contactId.toString()}`,
+      `Exported: ${new Date().toISOString()}`,
+      '',
+    ];
+    for (const m of all) {
+      const ts = m.created_at ? new Date(m.created_at).toISOString() : '';
+      const dir = String(m.direction ?? '').toUpperCase();
+      const sender = dir === 'OUTGOING' || dir === 'OUTBOUND' ? 'Agent' : 'Contact';
+      lines.push(`[${ts}] [${m._channel}] ${sender}: ${m.text ?? '(media)'}`);
+    }
+    return lines.join('\n');
   }
 
   // ─── Bulk operations (mirror gateway's BulkTagAction / BulkCustomFieldAction jobs) ─────────────────

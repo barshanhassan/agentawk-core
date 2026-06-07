@@ -53,4 +53,18 @@ export class NotesController {
     const userId = BigInt(req.user.sub || 1);
     return this.service.deleteNote(BigInt(noteId), workspaceId, userId);
   }
+
+  /**
+   * Replyagent parity: GET /note/timeline/:c_id — activity feed combining
+   * CRM notes + inbox messages across every channel for the contact.
+   */
+  @Get('timeline/:c_id')
+  async getTimeline(
+    @Param('c_id') contactId: string,
+    @Query() params: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getTimeline(BigInt(contactId), workspaceId, params);
+  }
 }

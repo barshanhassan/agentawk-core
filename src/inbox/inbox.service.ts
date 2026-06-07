@@ -35,35 +35,72 @@ export class InboxService {
       mode,
       page = 1,
       limit = 20,
+      is_read,         // 0/1 — Read / Unread tabs
+      is_upcoming,     // true — Upcoming tab (snooze in the future)
+      channel_types,   // string[] — channels filter chips
+      current_user_id, // bigint — used for the "my chats" tab (NOT a tab now, but kept for future)
     } = filters;
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const take = parseInt(limit);
 
     const where: any = { workspace_id: workspaceId };
-    console.log('Fetching inbox for workspace:', workspaceId.toString(), 'filters:', filters);
 
-
-    // Map frontend status to database enums
+    // Map frontend status to database enums. Falling through to `not: DELETED`
+    // is the "All" behaviour — every other tab sets a specific filter below.
     if (status === 'closed' || status === 'completed') {
       where.status = 'COMPLETED';
-    } else if (status === 'snoozed') {
-      // Handle snooze if applicable
     } else if (status === 'queued') {
       where.status = 'UNASSIGNED';
     } else if (status === 'active') {
       where.status = 'ACTIVE';
     } else if (status === 'all' || !status) {
-      // "All" tab on the frontend sends status=undefined; treat that the same as
-      // an explicit 'all' — every non-deleted thread regardless of assignment.
-      // Without this branch, undefined would fall through to the ACTIVE default
-      // and UNASSIGNED rows (every newly-arrived WhatsApp chat) would vanish from
-      // the inbox list.
       where.status = { not: 'DELETED' };
     } else {
-      // Unknown explicit status value — fall back to ACTIVE for safety.
       where.status = 'ACTIVE';
     }
 
+    // Read / Unread — drives the Read + Unread tabs. Accept both 0/1 and
+    // boolean inputs because the frontend ships JSON `1` not `"1"`.
+    if (is_read === 1 || is_read === '1' || is_read === true) {
+      where.is_read = 1;
+    } else if (is_read === 0 || is_read === '0' || is_read === false) {
+      where.is_read = 0;
+    }
+
+    // Upcoming — snoozed conversations whose snooze datetime is still in the
+    // future. Schema uses `snooze` (NOT NULL DATETIME); rows that were never
+    // snoozed have snooze=1970-01-01, so `> now` cleanly excludes them.
+    if (is_upcoming === true || is_upcoming === 'true') {
+      where.snooze = { gt: new Date() };
+    } else if (status === 'all' || !status) {
+      // Hide rows currently snoozed away from the All view. Because `snooze`
+      // is NOT NULL in the schema (epoch sentinel for "never snoozed"), a
+      // single `<= NOW()` clause covers both never-snoozed and past-snooze
+      // rows — no `{ snooze: null }` (which Prisma rejects for non-nullable).
+      where.snooze = { lte: new Date() };
+    }
+
+    // Channels filter (multi-select chip row in the filter popover). Each
+    // channel maps to one or more `modelable_type` patterns.
+    if (Array.isArray(channel_types) && channel_types.length > 0) {
+      const modelablePatterns: string[] = [];
+      for (const c of channel_types) {
+        const lc = String(c).toLowerCase();
+        if (lc === 'whatsapp') modelablePatterns.push('WhatsappChat');
+        else if (lc === 'zapi') modelablePatterns.push('ZapiChat');
+        else if (lc === 'telegram') modelablePatterns.push('TelegramChat');
+        else if (lc === 'messenger' || lc === 'fb' || lc === 'facebook')
+          modelablePatterns.push('FbChat', 'FacebookChat');
+        else if (lc === 'instagram') modelablePatterns.push('InstaChat', 'InstagramChat');
+        else if (lc === 'sms') modelablePatterns.push('TwilioChat');
+        else if (lc === 'webchat') modelablePatterns.push('WcChat', 'WebchatChat');
+      }
+      if (modelablePatterns.length) {
+        where.OR = modelablePatterns.map((p) => ({
+          modelable_type: { contains: p },
+        }));
+      }
+    }
 
     // Mode-based filtering
     if (mode === 'ASSIGNED') {
@@ -71,6 +108,9 @@ export class InboxService {
     } else if (mode === 'UNASSIGNED') {
       where.assigned_to = null;
     } else if (mode === 'FOLDER' && folder_id) {
+      where.folder_id = BigInt(folder_id);
+    }
+    if (folder_id) {
       where.folder_id = BigInt(folder_id);
     }
 
@@ -228,58 +268,50 @@ export class InboxService {
       unassigned: 0,
     };
 
-    // User filtering for assigned counts
-    const userFilter = userIds.length > 0 ? { user_id: { in: userIds } } : { user_id: { not: null } };
+    // Tab counts feed the frontend's All / Read / Unread / Queue / Upcoming /
+    // Done labels. They are WORKSPACE-wide (not assigned-only) so the badges
+    // match replyagent's behaviour where the chip beside each tab shows the
+    // global total, not just what the current agent owns.
+    //
+    // `snooze` is NOT NULL in the schema (epoch sentinel = never snoozed), so
+    // a plain `<= NOW()` clause covers both cases. Using `{ snooze: null }`
+    // here would crash Prisma with "Argument `snooze` is missing".
+    const notSnoozed = { snooze: { lte: now } };
 
-    // 1. Inbox (Active & Assigned)
+    // 1. Inbox (ACTIVE, not snoozed) — base for the All tab
     counts.inbox = await getCount({
       status: 'ACTIVE',
-      ...userFilter,
-      OR: [
-        { snooze: null },
-        { snooze: { lte: now } }
-      ]
+      ...notSnoozed,
     });
 
-    // 2. Unread
+    // 2. Unread (is_read = 0, ACTIVE, not snoozed)
     counts.unread = await getCount({
       status: 'ACTIVE',
       is_read: 0,
-      ...userFilter,
-      OR: [
-        { snooze: null },
-        { snooze: { lte: now } }
-      ]
+      ...notSnoozed,
     });
 
-    // 3. Read
+    // 3. Read (is_read = 1, ACTIVE, not snoozed)
     counts.read = await getCount({
       status: 'ACTIVE',
       is_read: 1,
-      ...userFilter,
-      OR: [
-        { snooze: null },
-        { snooze: { lte: now } }
-      ]
+      ...notSnoozed,
     });
 
     // 4. Future (Snoozed)
     counts.future = await getCount({
       status: 'ACTIVE',
-      ...userFilter,
-      snooze: { gt: now }
+      snooze: { gt: now },
     });
 
     // 5. Completed
     counts.completed = await getCount({
       status: 'COMPLETED',
-      ...userFilter
     });
 
-    // 6. Unassigned
+    // 6. Unassigned (Queue tab)
     counts.unassigned = await getCount({
       status: 'UNASSIGNED',
-      user_id: null
     });
 
     // Folder counts
@@ -429,7 +461,23 @@ export class InboxService {
     // empties out.
     const text = data.message_text ?? data.text ?? data.message ?? '';
 
-    this.logger.log(`Processing outgoing message for inbox ${inboxId} (Type: ${type}, ID: ${modelableId})`);
+    // Compose mode comes from the Reply/Note tabs in the inbox composer.
+    // Note mode persists the message as an internal annotation (type='note',
+    // not dispatched to Meta) so it shows up in the chat thread without ever
+    // leaving EZCONN — matches replyagent's Note tab behaviour exactly.
+    const composeMode = String(data.compose_mode ?? 'reply').toLowerCase();
+    const isNote = composeMode === 'note';
+
+    // Reply-to context: when the agent used the reply-arrow on a specific
+    // earlier message, the bubble id comes through here. We persist it as the
+    // outgoing row's `replied_to_message_id` so the thread can render the
+    // quoted-reply preview client-side, and so the customer sees the same
+    // quoted reply on their end (WhatsApp `context.message_id`).
+    const replyToMessageId = data.reply_to_message_id ? Number(data.reply_to_message_id) : null;
+
+    this.logger.log(
+      `Processing outgoing message for inbox ${inboxId} (Type: ${type}, ID: ${modelableId}, mode=${composeMode}${replyToMessageId ? `, reply_to=${replyToMessageId}` : ''})`,
+    );
 
     if (!String(text).trim()) {
       throw new BadRequestException('Message body is empty — provide message_text/text');
@@ -482,32 +530,55 @@ export class InboxService {
             sender_id: userId,
             text: text,
             direction: 'OUTGOING',
-            type: 'text',
+            // Note rows carry type='note'; the publish-to-Meta step below is
+            // skipped for them so the customer never receives this content.
+            type: isNote ? 'note' : 'text',
             mobile_number: chat.wa_id || '',
-            status: 'pending',
-            // Schema has created_at/updated_at as nullable with NO default. If we
-            // skip them, the chat list (which sorts by created_at ASC) treats
-            // these rows as NULL and renders them at the TOP instead of the
-            // bottom — outbound messages appear above the recipient's reply.
+            // Notes are finalised immediately; outbound real messages start
+            // pending and flip to sent/delivered via the consumer.
+            status: isNote ? 'sent' : 'pending',
+            ...(replyToMessageId ? { replied_to_message_id: replyToMessageId as any } : {}),
             created_at: sentAt,
             updated_at: sentAt,
-          },
+          } as any,
         });
+
+        // Internal notes never leave the platform — short-circuit the publish
+        // step so they don't reach Meta/customer.
+        if (isNote) {
+          return { success: true, message: savedMessage, note: true };
+        }
 
         const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
         const whatsappQueue = this.config.get<string>('RABBITMQ_WHATSAPP_QUEUE') || 'whatsapp';
         try {
+          // Build the WhatsApp Cloud-API payload. When reply_to is set, attach
+          // a `context.message_id` so the customer sees their original message
+          // quoted above the agent's reply (native WhatsApp quoted-reply UX).
+          const waContext: any = {
+            messaging_product: 'whatsapp',
+            to: chat.wa_id,
+            type: 'text',
+            text: { body: text },
+          };
+          if (replyToMessageId) {
+            try {
+              const repliedTo = await this.prisma.wa_messages.findUnique({
+                where: { id: BigInt(replyToMessageId) },
+                select: { wamid: true } as any,
+              });
+              if ((repliedTo as any)?.wamid) {
+                waContext.context = { message_id: (repliedTo as any).wamid };
+              }
+            } catch {}
+          }
+
           await this.rabbit.publish(exchange, whatsappQueue, {
             event: 'WA_OUTBOUND_MESSAGE',
             payload: {
               accountId: account.meta_account_id,
               phoneNumberId: phone.wa_number_id,
-              context: {
-                messaging_product: 'whatsapp',
-                to: chat.wa_id,
-                type: 'text',
-                text: { body: text },
-              },
+              context: waContext,
               // Correlation tag — comes back via WA_OUTBOUND_MESSAGE_STATUS so the
               // consumer can flip THIS row to sent/failed instead of guessing.
               meta: {
@@ -790,10 +861,15 @@ export class InboxService {
     });
   }
 
-  async snoozeConversation(inboxId: bigint, until: Date, workspaceId: bigint) {
+  async snoozeConversation(
+    inboxId: bigint,
+    until: Date | null,
+    workspaceId: bigint,
+  ) {
+    // `null` clears the snooze (replyagent: passing schedule=null unsnoozes).
     return this.prisma.inbox.update({
       where: { id: inboxId, workspace_id: workspaceId },
-      data: { snooze: until, status: 'ACTIVE' },
+      data: { snooze: until ?? new Date(0), status: 'ACTIVE' },
     });
   }
 
@@ -1029,5 +1105,562 @@ export class InboxService {
     });
 
     return { success: true, inbox_id: inbox.id };
+  }
+
+  // ─── Read receipts ────────────────────────────────────────────────
+
+  /**
+   * Mark a conversation as read (`inbox.is_read = 1`). Mirrors replyagent's
+   * `POST /inbox/seen/{inbox_id}`. Sends a socket event so other open tabs of
+   * the same workspace can also clear their unread badge without a refetch.
+   */
+  async markAsSeen(inboxId: bigint, workspaceId: bigint) {
+    const inbox = await this.prisma.inbox.findFirst({
+      where: { id: inboxId, workspace_id: workspaceId },
+    });
+    if (!inbox) throw new NotFoundException('Inbox not found');
+    if (inbox.is_read === 1) return { success: true, already_read: true };
+    await this.prisma.inbox.update({
+      where: { id: inboxId },
+      data: { is_read: 1 },
+    });
+    this.chatGateway.emitToWorkspace(workspaceId, 'inbox_read', {
+      inbox_id: inboxId.toString(),
+    });
+    return { success: true };
+  }
+
+  // ─── Reactions ────────────────────────────────────────────────────
+
+  /**
+   * Add / remove a reaction on a message. Uses the existing `message_reactions`
+   * table (polymorphic: `message_type` + `message_id`). Replyagent's behaviour:
+   * sending the same emoji clears it; a different emoji replaces it.
+   */
+  async reactToMessage(
+    inboxId: bigint,
+    messageId: bigint,
+    workspaceId: bigint,
+    userId: bigint,
+    body: any,
+  ) {
+    const inbox = await this.prisma.inbox.findFirst({
+      where: { id: inboxId, workspace_id: workspaceId },
+    });
+    if (!inbox) throw new NotFoundException('Inbox not found');
+
+    const messageType = body?.message_type || this.messageTypeFor(inbox.modelable_type ?? '');
+    const reaction = (body?.reaction || '').toString().slice(0, 24) || null;
+
+    const existing = await this.prisma.message_reactions.findFirst({
+      where: {
+        message_type: messageType,
+        message_id: messageId,
+        sender_id: userId,
+      },
+    });
+
+    if (existing) {
+      if (!reaction || existing.reaction === reaction) {
+        await this.prisma.message_reactions.delete({ where: { id: existing.id } });
+        return { success: true, action: 'removed' };
+      }
+      const updated = await this.prisma.message_reactions.update({
+        where: { id: existing.id },
+        data: { reaction, updated_at: new Date() },
+      });
+      return { success: true, action: 'updated', reaction: updated };
+    }
+
+    if (!reaction) return { success: true, action: 'noop' };
+    const created = await this.prisma.message_reactions.create({
+      data: {
+        workspace_id: workspaceId,
+        sender_id: userId,
+        message_type: messageType,
+        message_id: messageId,
+        reaction,
+        direction: 'OUTGOING',
+        communication_mode: 'INBOX',
+        created_at: new Date(),
+        updated_at: new Date(),
+      },
+    });
+    return { success: true, action: 'added', reaction: created };
+  }
+
+  // ─── Reminders (24h-window WhatsApp + Telegram + Z-API) ────────────
+
+  /**
+   * Schedule a reminder by writing `remind_at` on a brand-new outbound message
+   * row. The existing message cron sweep picks it up when `remind_at <= NOW()`
+   * and dispatches via the regular send path. We use the channel-specific
+   * message table so the reminder shows up in the chat thread just like a
+   * normal message would — no separate reminders table required.
+   */
+  async scheduleReminder(workspaceId: bigint, userId: bigint, body: any) {
+    if (!body?.inbox_id) throw new BadRequestException('inbox_id required');
+    if (!body?.schedule_at) throw new BadRequestException('schedule_at required');
+
+    const inbox = await this.prisma.inbox.findFirst({
+      where: { id: BigInt(body.inbox_id), workspace_id: workspaceId },
+    });
+    if (!inbox) throw new NotFoundException('Inbox not found');
+
+    const channel = String(inbox.modelable_type || '').toLowerCase();
+    const allowedChannels = ['whatsapp', 'zapi', 'telegram'];
+    const channelKey = allowedChannels.find((c) => channel.includes(c));
+    if (!channelKey) {
+      throw new BadRequestException(
+        'Reminders are only available for WhatsApp, Z-API, and Telegram channels.',
+      );
+    }
+
+    const remindAt = new Date(body.schedule_at);
+    if (isNaN(remindAt.getTime()) || remindAt.getTime() <= Date.now()) {
+      throw new BadRequestException('schedule_at must be a future timestamp');
+    }
+
+    const text = String(body.text_message || '').trim();
+    if (!text && !body.template_id) {
+      throw new BadRequestException('text_message or template_id required');
+    }
+
+    let messageRow: any = null;
+    if (channelKey === 'whatsapp') {
+      messageRow = await this.prisma.wa_messages.create({
+        data: {
+          wa_chat_id: inbox.modelable_id,
+          wa_number_id: BigInt(0),
+          sender_id: userId,
+          text,
+          direction: 'OUTGOING',
+          type: body.template_id ? 'template' : 'text',
+          mobile_number: '',
+          status: 'pending',
+          remind_at: remindAt,
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      });
+    } else if (channelKey === 'telegram') {
+      messageRow = await this.prisma.telegram_messages.create({
+        data: {
+          telegram_chat_id: inbox.modelable_id,
+          sender_id: userId,
+          text,
+          direction: 'OUTGOING',
+          type: 'text',
+          message_id: `rem_${Date.now()}`,
+          message_number: BigInt(Date.now()),
+          seen: false,
+          status: 'PENDING',
+          remind_at: remindAt,
+        } as any,
+      });
+    } else if (channelKey === 'zapi') {
+      messageRow = await (this.prisma as any).zapi_messages.create({
+        data: {
+          zapi_chat_id: inbox.modelable_id,
+          sender_id: userId,
+          text,
+          direction: 'OUTGOING',
+          type: 'text',
+          status: 'pending',
+          remind_at: remindAt,
+        },
+      });
+    }
+
+    return {
+      success: true,
+      message_id: messageRow?.id?.toString(),
+      channel: channelKey,
+      remind_at: remindAt,
+    };
+  }
+
+  /** Move a scheduled reminder's `remind_at` to NOW so the cron picks it up immediately. */
+  async sendReminderNow(workspaceId: bigint, body: any) {
+    if (!body?.message_id || !body?.channel) {
+      throw new BadRequestException('message_id and channel are required');
+    }
+    const channel = String(body.channel).toLowerCase();
+    const id = BigInt(body.message_id);
+    if (channel === 'whatsapp') {
+      await this.prisma.wa_messages.update({
+        where: { id },
+        data: { remind_at: new Date() },
+      });
+    } else if (channel === 'telegram') {
+      await this.prisma.telegram_messages.update({
+        where: { id },
+        data: { remind_at: new Date() } as any,
+      });
+    } else if (channel === 'zapi') {
+      await (this.prisma as any).zapi_messages.update({
+        where: { id },
+        data: { remind_at: new Date() },
+      });
+    } else {
+      throw new BadRequestException('Unsupported channel');
+    }
+    return { success: true };
+  }
+
+  /** Cancel a scheduled reminder by deleting the pending message row. */
+  async cancelReminder(workspaceId: bigint, body: any) {
+    if (!body?.message_id || !body?.channel) {
+      throw new BadRequestException('message_id and channel are required');
+    }
+    const channel = String(body.channel).toLowerCase();
+    const id = BigInt(body.message_id);
+    if (channel === 'whatsapp') {
+      await this.prisma.wa_messages.deleteMany({
+        where: { id, status: 'pending' },
+      });
+    } else if (channel === 'telegram') {
+      await this.prisma.telegram_messages.deleteMany({
+        where: { id, status: 'PENDING' } as any,
+      });
+    } else if (channel === 'zapi') {
+      await (this.prisma as any).zapi_messages.deleteMany({
+        where: { id, status: 'pending' },
+      });
+    } else {
+      throw new BadRequestException('Unsupported channel');
+    }
+    return { success: true };
+  }
+
+  // ─── Automate / start-chat / AI ────────────────────────────────────
+
+  /**
+   * Trigger an automation/Smart Flow against the conversation's contact. The
+   * AutomationProcessor is the source of truth — we just dispatch an event the
+   * processor listens for. Mirrors replyagent's `POST /inbox/automate`.
+   */
+  async automate(workspaceId: bigint, userId: bigint, body: any) {
+    if (!body?.inbox_id || !body?.automation_id) {
+      throw new BadRequestException('inbox_id and automation_id required');
+    }
+    const inbox = await this.prisma.inbox.findFirst({
+      where: { id: BigInt(body.inbox_id), workspace_id: workspaceId },
+    });
+    if (!inbox) throw new NotFoundException('Inbox not found');
+    const contactId = await this.resolveInboxContact(inbox);
+    if (!contactId) throw new BadRequestException('Inbox has no resolvable contact');
+    this.eventEmitter.emit('automation.manual_trigger', {
+      workspaceId,
+      userId,
+      contactId,
+      automationId: BigInt(body.automation_id),
+      inboxId: inbox.id,
+    });
+    return { success: true };
+  }
+
+  /**
+   * Open (or reuse) a WhatsApp conversation with a contact. Creates the
+   * `wa_chats` row if missing, then upserts the inbox row so the new chat
+   * shows up in the agent's list immediately.
+   */
+  async startWhatsappChat(workspaceId: bigint, userId: bigint, body: any) {
+    if (!body?.contact_id) throw new BadRequestException('contact_id required');
+    if (!body?.wa_account_id || !body?.wa_number_id) {
+      throw new BadRequestException('wa_account_id and wa_number_id required');
+    }
+    const contactId = BigInt(body.contact_id);
+    const waAccountId = BigInt(body.wa_account_id);
+    const waNumberId = BigInt(body.wa_number_id);
+
+    const mobile = await this.prisma.contact_mobiles.findFirst({
+      where: {
+        modelable_type: 'App\\Models\\Contact',
+        modelable_id: contactId,
+      },
+      orderBy: [{ is_primary: 'desc' }],
+    });
+    const waId = String(mobile?.full_mobile_number ?? mobile?.mobile_number ?? '').replace(/[^0-9]/g, '');
+    if (!waId) throw new BadRequestException('Contact has no phone number');
+
+    let chat = await this.prisma.wa_chats.findFirst({
+      where: { wa_account_id: waAccountId, wa_number_id: waNumberId, wa_id: waId },
+    });
+    if (!chat) {
+      chat = await this.prisma.wa_chats.create({
+        data: {
+          wa_account_id: waAccountId,
+          wa_number_id: waNumberId,
+          contact_id: contactId,
+          wa_id: waId,
+          created_at: new Date(),
+          updated_at: new Date(),
+        } as any,
+      });
+    }
+
+    let inbox = await this.prisma.inbox.findFirst({
+      where: {
+        workspace_id: workspaceId,
+        modelable_type: 'App\\Models\\WhatsappChat',
+        modelable_id: chat.id,
+      },
+    });
+    if (!inbox) {
+      inbox = await this.prisma.inbox.create({
+        data: {
+          workspace_id: workspaceId,
+          user_id: userId,
+          type: 'WHATSAPP',
+          status: 'ACTIVE',
+          is_assigned: 1,
+          assigned_by: userId,
+          assigned_on: new Date(),
+          snooze: new Date(0),
+          modelable_type: 'App\\Models\\WhatsappChat',
+          modelable_id: chat.id,
+          last_updated: new Date(),
+          created_at: new Date(),
+          updated_at: new Date(),
+        } as any,
+      });
+    }
+    return { success: true, inbox_id: inbox.id.toString(), chat_id: chat.id.toString() };
+  }
+
+  /**
+   * Open a Z-API (unofficial WhatsApp QR) conversation. Same shape as
+   * startWhatsappChat — different table set (zapi_chats).
+   */
+  async startZapiChat(workspaceId: bigint, userId: bigint, body: any) {
+    if (!body?.contact_id || !body?.zapi_account_id) {
+      throw new BadRequestException('contact_id and zapi_account_id required');
+    }
+    const contactId = BigInt(body.contact_id);
+    const zapiAccountId = BigInt(body.zapi_account_id);
+
+    const mobile = await this.prisma.contact_mobiles.findFirst({
+      where: {
+        modelable_type: 'App\\Models\\Contact',
+        modelable_id: contactId,
+      },
+      orderBy: [{ is_primary: 'desc' }],
+    });
+    const phone = String(mobile?.full_mobile_number ?? '').replace(/[^0-9]/g, '');
+    if (!phone) throw new BadRequestException('Contact has no phone number');
+
+    let chat = await (this.prisma as any).zapi_chats.findFirst({
+      where: { zapi_account_id: zapiAccountId, phone },
+    });
+    if (!chat) {
+      chat = await (this.prisma as any).zapi_chats.create({
+        data: {
+          zapi_account_id: zapiAccountId,
+          contact_id: contactId,
+          phone,
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      });
+    }
+
+    let inbox = await this.prisma.inbox.findFirst({
+      where: {
+        workspace_id: workspaceId,
+        modelable_type: 'App\\Models\\ZapiChat',
+        modelable_id: chat.id,
+      },
+    });
+    if (!inbox) {
+      inbox = await this.prisma.inbox.create({
+        data: {
+          workspace_id: workspaceId,
+          user_id: userId,
+          type: 'ZAPI',
+          status: 'ACTIVE',
+          is_assigned: 1,
+          assigned_by: userId,
+          assigned_on: new Date(),
+          snooze: new Date(0),
+          modelable_type: 'App\\Models\\ZapiChat',
+          modelable_id: chat.id,
+          last_updated: new Date(),
+          created_at: new Date(),
+          updated_at: new Date(),
+        } as any,
+      });
+    }
+    return { success: true, inbox_id: inbox.id.toString(), chat_id: chat.id.toString() };
+  }
+
+  /**
+   * AI text transformer stub. Real replyagent calls an LLM with a system prompt
+   * per `mode` (translate / correct / expand / shorten). We accept the same
+   * envelope and return the input passthrough so the UI can wire end-to-end
+   * even before the AI provider is bound; switching to a real call later only
+   * touches this method.
+   */
+  async transformAi(workspaceId: bigint, body: any) {
+    const text = String(body?.text ?? '').trim();
+    const mode = String(body?.mode ?? 'correct').toLowerCase();
+    if (!text) throw new BadRequestException('text required');
+    return {
+      success: true,
+      mode,
+      output: text, // TODO: bind to real LLM provider here.
+    };
+  }
+
+  // ─── Destructive ───────────────────────────────────────────────────
+
+  /** Soft-delete (status=DELETED) a single inbox row. */
+  async deleteInbox(inboxId: bigint, workspaceId: bigint) {
+    const inbox = await this.prisma.inbox.findFirst({
+      where: { id: inboxId, workspace_id: workspaceId },
+    });
+    if (!inbox) throw new NotFoundException('Inbox not found');
+    await this.prisma.inbox.update({
+      where: { id: inboxId },
+      data: { status: 'DELETED' },
+    });
+    return { success: true };
+  }
+
+  /** Bulk soft-delete inbox rows (replyagent's `DELETE /inbox/chats`). */
+  async deleteChats(workspaceId: bigint, inboxIds: bigint[]) {
+    if (!inboxIds.length) return { success: true, count: 0 };
+    const res = await this.prisma.inbox.updateMany({
+      where: { id: { in: inboxIds }, workspace_id: workspaceId },
+      data: { status: 'DELETED' },
+    });
+    return { success: true, count: res.count };
+  }
+
+  /**
+   * Hard-delete a single message from the appropriate channel table. Replyagent
+   * `POST /inbox/message/delete` accepts {message_id, message_type, channel}.
+   */
+  async deleteMessage(workspaceId: bigint, body: any) {
+    if (!body?.message_id || !body?.channel) {
+      throw new BadRequestException('message_id and channel required');
+    }
+    const id = BigInt(body.message_id);
+    const channel = String(body.channel).toLowerCase();
+    if (channel === 'whatsapp') {
+      await this.prisma.wa_messages.deleteMany({ where: { id } });
+    } else if (channel === 'telegram') {
+      await this.prisma.telegram_messages.deleteMany({ where: { id } });
+    } else if (channel === 'zapi') {
+      await (this.prisma as any).zapi_messages.deleteMany({ where: { id } });
+    } else if (channel === 'messenger' || channel === 'fb') {
+      await this.prisma.fb_messages.deleteMany({ where: { id } });
+    } else if (channel === 'instagram' || channel === 'insta') {
+      await this.prisma.insta_messages.deleteMany({ where: { id } });
+    } else if (channel === 'webchat') {
+      await this.prisma.wc_messages.deleteMany({ where: { id } });
+    } else {
+      throw new BadRequestException('Unsupported channel');
+    }
+    return { success: true };
+  }
+
+  // ─── Profile action (tag / note / task from the inbox UI) ──────────
+
+  /**
+   * Generic profile-action endpoint mirroring replyagent's
+   * `POST /inbox/profile-action/{inbox_id}`. The body's `action` field decides
+   * what to do; we keep this purposefully thin so adding a new action type
+   * (e.g. `archive_contact`) is a single switch case.
+   */
+  async profileAction(
+    inboxId: bigint,
+    workspaceId: bigint,
+    userId: bigint,
+    body: any,
+  ) {
+    const action = String(body?.action ?? '').toLowerCase();
+    const inbox = await this.prisma.inbox.findFirst({
+      where: { id: inboxId, workspace_id: workspaceId },
+    });
+    if (!inbox) throw new NotFoundException('Inbox not found');
+    const contactId = await this.resolveInboxContact(inbox);
+
+    switch (action) {
+      case 'apply_tag': {
+        if (!contactId) throw new BadRequestException('No contact');
+        const tagName = String(body.tag ?? '').trim();
+        if (!tagName) throw new BadRequestException('tag required');
+        let tag = await this.prisma.tags.findFirst({
+          where: { workspace_id: workspaceId, name: tagName },
+        });
+        if (!tag) {
+          tag = await this.prisma.tags.create({
+            data: {
+              workspace_id: workspaceId,
+              user_id: userId,
+              taggable_type: 'App\\Models\\Workspace',
+              taggable_id: workspaceId,
+              name: tagName,
+              display_inbox: 0,
+              bg_color: '#d3c78d',
+              text_color: '#c04d30',
+            },
+          });
+        }
+        await this.prisma.tag_links.create({
+          data: {
+            linkable_type: 'App\\Models\\Contact',
+            linkable_id: contactId,
+            tag_id: tag.id,
+            name: tag.name,
+          },
+        });
+        this.eventEmitter.emit('contact.tag_applied', {
+          contactId,
+          tagId: tag.id,
+          workspaceId,
+        });
+        return { success: true, tag };
+      }
+      case 'remove_tag': {
+        if (!contactId) throw new BadRequestException('No contact');
+        const tagName = String(body.tag ?? '').trim();
+        await this.prisma.tag_links.deleteMany({
+          where: {
+            linkable_type: 'App\\Models\\Contact',
+            linkable_id: contactId,
+            name: tagName,
+          },
+        });
+        return { success: true };
+      }
+      case 'set_status': {
+        return this.updateInboxStatus(inboxId, body.status, workspaceId);
+      }
+      case 'set_folder': {
+        await this.prisma.inbox.update({
+          where: { id: inboxId },
+          data: { folder_id: body.folder_id ? BigInt(body.folder_id) : null },
+        });
+        return { success: true };
+      }
+      default:
+        throw new BadRequestException(`Unsupported action: ${action}`);
+    }
+  }
+
+  // ─── Helpers ──────────────────────────────────────────────────────
+
+  /** Map an inbox's `modelable_type` to the message-table polymorphic key. */
+  private messageTypeFor(modelableType: string): string {
+    const t = modelableType.toLowerCase();
+    if (t.includes('whatsapp')) return 'App\\Models\\Whatsapp\\WhatsappMessage';
+    if (t.includes('telegram')) return 'App\\Models\\Telegram\\TelegramMessage';
+    if (t.includes('zapi')) return 'App\\Models\\Zapi\\ZapiMessage';
+    if (t.includes('messenger') || t.includes('fb')) return 'App\\Models\\Facebook\\FacebookMessage';
+    if (t.includes('insta')) return 'App\\Models\\Instagram\\InstagramMessage';
+    if (t.includes('webchat') || t.includes('wc')) return 'App\\Models\\Webchat\\WcMessage';
+    return modelableType;
   }
 }

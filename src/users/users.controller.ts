@@ -23,6 +23,16 @@ export class UsersController {
     private readonly planFeatures: PlanFeaturesService,
   ) {}
 
+  /**
+   * List users in the current workspace. Used by the OpportunityForm
+   * "Assigned to" dropdown. Returns lean rows (id + display name + email).
+   */
+  @Get()
+  async listUsers(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.listWorkspaceUsers(workspaceId);
+  }
+
   @Post('update')
   async updateProfile(@Body() body: any, @Request() req: any) {
     const userId = BigInt(req.user.sub || 1);

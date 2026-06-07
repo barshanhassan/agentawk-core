@@ -32,6 +32,26 @@ export class TasksController {
     return this.service.saveTask(workspaceId, userId, workspaceTimezone, body);
   }
 
+  @Patch(':id')
+  async updateTask(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.updateTask(workspaceId, BigInt(id), body);
+  }
+
+  /**
+   * Mark a task COMPLETED — used by the Contact Profile sidebar's checkmark
+   * button. Dedicated route so we can emit a future `task.completed` event.
+   */
+  @Post(':id/complete')
+  async completeTask(@Param('id') id: string, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.completeTask(workspaceId, BigInt(id));
+  }
+
   @Delete(':id')
   async deleteTask(@Param('id') id: string, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);

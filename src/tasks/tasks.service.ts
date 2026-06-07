@@ -120,4 +120,46 @@ export class TasksService {
 
     return { success: true };
   }
+
+  /**
+   * Partial update for an existing task. Accepts any subset of the
+   * task columns the frontend allows users to edit (status, datetime,
+   * description, user_id). Used by the sidebar complete (✅) and snooze
+   * (🔔) buttons in the Contact Profile modal.
+   */
+  async updateTask(workspaceId: bigint, taskId: bigint, data: any) {
+    const task = await this.prisma.tasks.findFirst({
+      where: { id: taskId, workspace_id: workspaceId },
+    });
+    if (!task) throw new NotFoundException('Task not found');
+
+    const update: any = {};
+    if (data.status !== undefined) update.status = data.status;
+    if (data.description !== undefined) update.description = data.description;
+    if (data.user_id !== undefined)
+      update.user_id = data.user_id ? BigInt(data.user_id) : null;
+    if (data.datetime !== undefined) {
+      // Accept ISO strings or epoch numbers — convert to Date.
+      update.datetime = data.datetime ? new Date(data.datetime) : null;
+    }
+
+    if (Object.keys(update).length === 0) {
+      return { success: true, task };
+    }
+
+    const updated = await this.prisma.tasks.update({
+      where: { id: taskId },
+      data: update,
+    });
+    return { success: true, task: updated };
+  }
+
+  /**
+   * Convenience endpoint: mark a task COMPLETED. Replyagent parity for the
+   * sidebar checkmark button — keeping it a dedicated route lets us emit a
+   * future `task.completed` event without complicating updateTask.
+   */
+  async completeTask(workspaceId: bigint, taskId: bigint) {
+    return this.updateTask(workspaceId, taskId, { status: 'COMPLETED' });
+  }
 }

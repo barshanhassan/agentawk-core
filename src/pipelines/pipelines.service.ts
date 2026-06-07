@@ -304,12 +304,17 @@ export class PipelinesService {
     if (!opp) throw new NotFoundException('Opportunity not found');
 
     const update: any = { updated_at: new Date() };
+    // Accept both `name` (DB column) and `title` (replyagent / frontend alias).
     if (data.name !== undefined) update.name = data.name;
+    else if (data.title !== undefined) update.name = data.title;
     if (data.amount !== undefined) update.amount = data.amount;
+    else if (data.value !== undefined) update.amount = data.value;
     if (data.expected_close_date !== undefined) update.expected_close_date = data.expected_close_date ? new Date(data.expected_close_date) : null;
+    else if (data.closing_date !== undefined) update.expected_close_date = data.closing_date ? new Date(data.closing_date) : null;
     if (data.contact_id !== undefined) update.contact_id = data.contact_id ? BigInt(data.contact_id) : null;
     if (data.lost_reason_id !== undefined) update.pl_lost_reason_id = data.lost_reason_id ? BigInt(data.lost_reason_id) : null;
     if (data.notes !== undefined) update.notes = data.notes;
+    else if (data.note !== undefined) update.notes = typeof data.note === 'string' ? data.note : data.note?.text ?? null;
 
     const updated = await this.prisma.pipeline_opportunities.update({
       where: { id: opportunityId },

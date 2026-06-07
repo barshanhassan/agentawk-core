@@ -113,4 +113,133 @@ export class ContactsController {
     const userId = BigInt(req.user.sub || req.user.id || 0);
     return this.service.importCsv(workspaceId, userId, body.csv ?? '');
   }
+
+  // ─── Replyagent parity: contact profile modal endpoints ─────────────
+
+  /** POST /api/contacts/:id/change-status { action } */
+  @Post(':id/change-status')
+  async changeStatus(
+    @Param('id') id: string,
+    @Body('action') action: string,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.changeContactStatus(workspaceId, BigInt(id), action);
+  }
+
+  /** DELETE /api/contacts/:id/field — body: { field, type } */
+  @Post(':id/remove-field')
+  async removeField(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.removeField(
+      workspaceId,
+      BigInt(id),
+      body.field ?? body,
+      body.type ?? 'contact',
+    );
+  }
+
+  /** POST /api/contacts/:id/primary — body: { field_id, field_type, mark_primary } */
+  @Post(':id/primary')
+  async setPrimary(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.setPrimary(
+      workspaceId,
+      BigInt(id),
+      BigInt(body.field_id),
+      String(body.field_type ?? 'mobile').toLowerCase() === 'email'
+        ? 'email'
+        : 'mobile',
+      !!body.mark_primary,
+    );
+  }
+
+  /** POST /api/contacts/:id/unsubscribe — body: { optin_id } */
+  @Post(':id/unsubscribe')
+  async unsubscribe(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.unsubscribe(
+      workspaceId,
+      BigInt(id),
+      BigInt(body.optin_id),
+    );
+  }
+
+  /** POST /api/contacts/:id/optin — body: { channel } */
+  @Post(':id/optin')
+  async optin(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.optin(workspaceId, BigInt(id), body);
+  }
+
+  /** GET /api/contacts/:id/merge-preview — destination contact full data */
+  @Get(':id/merge-preview')
+  async mergePreview(@Param('id') id: string, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getContactForMerge(workspaceId, BigInt(id));
+  }
+
+  /** POST /api/contacts/search-destination — body: { current_contact_id, key } */
+  @Post('search-destination')
+  async searchDestination(@Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.searchDestinationContacts(
+      workspaceId,
+      BigInt(body.current_contact_id),
+      String(body.key ?? ''),
+    );
+  }
+
+  /** POST /api/contacts/merge — body: { current_contact, destination_contact } */
+  @Post('merge')
+  async merge(@Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.mergeContacts(
+      workspaceId,
+      BigInt(body.current_contact),
+      BigInt(body.destination_contact),
+    );
+  }
+
+  /** POST /api/contacts/:id/change-company — body: { company_id } */
+  @Post(':id/change-company')
+  async changeCompany(
+    @Param('id') id: string,
+    @Body() body: any,
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.changeCompany(
+      workspaceId,
+      BigInt(id),
+      body.company_id ? BigInt(body.company_id) : null,
+    );
+  }
+
+  /** GET /api/contacts/:id/download-conversation — plain-text transcript */
+  @Get(':id/download-conversation')
+  async downloadConversation(@Param('id') id: string, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    const text = await this.service.downloadConversation(
+      workspaceId,
+      BigInt(id),
+    );
+    return { text, filename: `contact-${id}-conversation.txt` };
+  }
 }
