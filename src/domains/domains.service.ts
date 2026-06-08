@@ -91,6 +91,26 @@ export class DomainsService {
     };
   }
 
+  /**
+   * Return the workspace's custom (non-default) domain, or null. Used by the
+   * White Label → Domain tab to show the connected domain + status on load.
+   */
+  async getCustomDomain(workspaceId: bigint, siteType: string) {
+    const modelable_type =
+      siteType === 'WORKSPACE'
+        ? 'App\\Models\\Workspace'
+        : 'App\\Models\\Agency';
+    const domain = await this.prisma.domains.findFirst({
+      where: {
+        modelable_id: workspaceId,
+        modelable_type,
+        is_default: false,
+      },
+      orderBy: { id: 'desc' },
+    });
+    return { domain: domain ?? null };
+  }
+
   async validateDomain(subDomain: string, rootDomain: string) {
     const sub_domain = subDomain.toLowerCase();
     const root_domain = rootDomain.toLowerCase();

@@ -27,6 +27,14 @@ export class DomainsController {
     );
   }
 
+  @Get('current')
+  async getCurrentDomain(@Request() req: any) {
+    return this.service.getCustomDomain(
+      BigInt(req.user.workspace_id || 1),
+      req.user.site_type || 'WORKSPACE',
+    );
+  }
+
   @Get('validate-domain')
   async validateDomain(
     @Query('sub_domain') subDomain: string,

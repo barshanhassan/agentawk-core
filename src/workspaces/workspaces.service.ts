@@ -145,6 +145,9 @@ export class WorkspacesService {
     if (data.status !== undefined) updateData.status = data.status;
     if (data.timezone !== undefined) updateData.timezone = data.timezone;
     if (data.firstDayOfWeek !== undefined) updateData.first_day_week = data.firstDayOfWeek.toUpperCase();
+    // Touch updated_at so logs/sorting reflect the change (replyagent/Laravel
+    // auto-touches; EZCONN's introspected schema has no DB-side default).
+    updateData.updated_at = new Date();
 
     return this.prisma.workspaces.update({
       where: { id: workspaceId },
@@ -431,12 +434,17 @@ export class WorkspacesService {
       ? await this.prisma.user_login_policies.findMany({ where: { user_id: { in: userIds } } })
       : [];
 
-    // Access scopes (system/custom fields, tags, agents) per user
+    // Access scopes (system/custom fields, tags, agents, channels) per user
     const accesses = userIds.length
       ? await this.prisma.user_accesses.findMany({ where: { user_id: { in: userIds } } })
       : [];
     const accessOf = (uid: bigint, type: string) =>
       accesses.filter(a => a.user_id === uid && a.accessable_type === type).map(a => a.accessable_id.toString());
+
+    // Per-agent limits (open conversations / opportunities / tasks / incoming calls)
+    const limitsRows = userIds.length
+      ? await this.prisma.user_limits.findMany({ where: { user_id: { in: userIds } } })
+      : [];
 
     return users.map(user => {
       const roleRelation = roleables.find(r => r.roleable_id === user.id);
@@ -444,6 +452,10 @@ export class WorkspacesService {
       const mob = mobiles.find(m => m.modelable_id === user.id && m.slug === 'mobile');
       const wa = mobiles.find(m => m.modelable_id === user.id && m.slug === 'whatsapp');
       const policy = policies.find(p => p.user_id === user.id) || null;
+      const lim = limitsRows.find(l => l.user_id === user.id) || null;
+      // Rebuild the channels object (per-type accessable id lists) — replyagent accessableChannels()
+      const channels: Record<string, string[]> = {};
+      for (const m of WorkspacesService.CHANNEL_ACCESS_TYPES) channels[m.key] = accessOf(user.id, m.type);
       return {
         ...user,
         role: role ? role.name : 'Agent',
@@ -453,12 +465,65 @@ export class WorkspacesService {
         whatsapp: wa?.mobile_number || '',
         whatsapp_country: wa ? iso2Of(wa.country_id) : '',
         login_policy: policy,
+        limits: {
+          enable_conversation: lim?.enable_conversation ?? 0,
+          conversation_limit: lim?.conversation_limit ?? 0,
+          enable_opportunities: lim?.enable_opportunities ?? 0,
+          opportunities_limit: lim?.opportunities_limit ?? 0,
+          enable_tasks: lim?.enable_tasks ?? 0,
+          tasks_limit: lim?.tasks_limit ?? 0,
+          enable_call_limit: lim?.enable_call_limit ?? 0,
+          calls_limit: lim?.calls_limit ?? 0,
+        },
         systemFields: accessOf(user.id, 'App\\Models\\SystemField'),
-        customFields: accessOf(user.id, 'App\\Models\\CustomField'),
-        tags: accessOf(user.id, 'App\\Models\\Tag'),
+        customFields: accessOf(user.id, 'App\\Models\\Fields\\CustomField'),
+        tags: accessOf(user.id, 'App\\Models\\Tag\\Tag'),
         agents: accessOf(user.id, 'App\\Models\\User'),
+        channels,
       };
     });
+  }
+
+  /**
+   * Aggregate every conversation channel configured for a workspace, grouped by type —
+   * mirrors replyagent's GET /all-channels (Workspace::allChannels) used by the agent
+   * "Chat Channels" access tab. Display shape per type matches the replyagent frontend.
+   */
+  async getAllChannels(workspaceId: bigint) {
+    const [telegram, twilioAccounts, messenger, instagram, zapi, webchat, waAccounts] = await Promise.all([
+      this.prisma.telegram_bots.findMany({ where: { workspace_id: workspaceId, deleted_at: null } }),
+      this.prisma.twilio_accounts.findMany({ where: { workspace_id: workspaceId, deleted_at: null } }),
+      this.prisma.fb_pages.findMany({ where: { workspace_id: workspaceId, deleted_at: null } }),
+      this.prisma.insta_pages.findMany({ where: { workspace_id: workspaceId, deleted_at: null } }),
+      this.prisma.zapi_instances.findMany({ where: { workspace_id: workspaceId, deleted_at: null } }),
+      this.prisma.wc_instances.findMany({ where: { workspace_id: workspaceId, deleted_at: null } }),
+      this.prisma.wa_accounts.findMany({ where: { workspace_id: workspaceId, deleted_at: null }, select: { id: true } }),
+    ]);
+
+    // WhatsApp channels are the phone numbers under this workspace's WABA accounts.
+    const waAccountIds = waAccounts.map(a => a.id);
+    const waNumbers = waAccountIds.length
+      ? await this.prisma.wa_phone_numbers.findMany({ where: { wa_account_id: { in: waAccountIds } } })
+      : [];
+
+    // Twilio: replyagent flattens accounts → numbers (each number is a selectable channel).
+    const twilioAccountIds = twilioAccounts.map(a => a.id);
+    const twilioNumbers = twilioAccountIds.length
+      ? await this.prisma.twilio_numbers.findMany({ where: { twilio_account_id: { in: twilioAccountIds }, deleted_at: null } })
+      : [];
+    const twAccName = (id: bigint) => twilioAccounts.find(a => a.id === id)?.name || 'Twilio';
+
+    return {
+      channels: {
+        whatsapp: waNumbers.map(n => ({ id: n.id.toString(), verified_name: n.verified_name, display_phone_number: n.display_phone_number })),
+        zapi: zapi.map(z => ({ id: z.id.toString(), name: z.name, phone_number: z.phone_number ?? null })),
+        telegram: telegram.map(t => ({ id: t.id.toString(), name: t.name })),
+        twilio: twilioNumbers.map(n => ({ id: n.id.toString(), account_name: twAccName(n.twilio_account_id), twilio_phone_number: n.twilio_phone_number })),
+        messenger: messenger.map(p => ({ id: p.id.toString(), name: p.name })),
+        instagram: instagram.map(p => ({ id: p.id.toString(), name: p.name })),
+        webchat: webchat.map(w => ({ id: w.id.toString(), name: w.name })),
+      },
+    };
   }
 
   /**
@@ -550,6 +615,12 @@ export class WorkspacesService {
     }
 
     try {
+      if (data.limits) await this.saveLimits(user.id, data.limits);
+    } catch (err: any) {
+      this.logger.warn(`Failed to save agent limits: ${err?.message ?? err}`);
+    }
+
+    try {
       await this.syncUserAccesses(user.id, data);
     } catch (err: any) {
       this.logger.warn(`Failed to save access scopes: ${err?.message ?? err}`);
@@ -634,6 +705,12 @@ export class WorkspacesService {
       if (data.loginPolicy) await this.saveLoginPolicy(memberId, data.loginPolicy);
     } catch (err: any) {
       this.logger.warn(`Failed to update login policy: ${err?.message ?? err}`);
+    }
+
+    try {
+      if (data.limits) await this.saveLimits(memberId, data.limits);
+    } catch (err: any) {
+      this.logger.warn(`Failed to update agent limits: ${err?.message ?? err}`);
     }
 
     try {
@@ -729,35 +806,111 @@ export class WorkspacesService {
     }
   }
 
-  // Morph types for the agent access scopes (replyagent user_accesses)
+  // Morph types for the agent access scopes (replyagent user_accesses). These match the
+  // exact accessable_type strings stored in the production DB (verified against the dump):
+  // CustomField → App\Models\Fields\CustomField, Tag → App\Models\Tag\Tag (namespaced).
   private static ACCESS_TYPES: { key: string; type: string }[] = [
     { key: 'systemFields', type: 'App\\Models\\SystemField' },
-    { key: 'customFields', type: 'App\\Models\\CustomField' },
-    { key: 'tags', type: 'App\\Models\\Tag' },
+    { key: 'customFields', type: 'App\\Models\\Fields\\CustomField' },
+    { key: 'tags', type: 'App\\Models\\Tag\\Tag' },
     { key: 'agents', type: 'App\\Models\\User' },
   ];
 
+  // Morph types for the per-channel access scopes (replyagent UserAccessTrait::saveAccessParams).
+  // The frontend sends a `channels` object keyed by these same keys.
+  private static CHANNEL_ACCESS_TYPES: { key: string; type: string }[] = [
+    { key: 'whatsapp', type: 'App\\Models\\Whatsapp\\WhatsappNumber' },
+    { key: 'zapi', type: 'App\\Models\\Zapi\\ZapiInstance' },
+    { key: 'twilio', type: 'App\\Models\\TwilioNumber' },
+    { key: 'telegram', type: 'App\\Models\\TelegramBot' },
+    { key: 'messenger', type: 'App\\Models\\Facebook\\FacebookPage' },
+    { key: 'instagram', type: 'App\\Models\\Instagram\\InstagramPage' },
+    { key: 'webchat', type: 'App\\Models\\Webchat\\WcInstance' },
+  ];
+
+  private static toBigIntIds(arr: any[]): bigint[] {
+    const out: bigint[] = [];
+    for (const x of arr || []) {
+      let id: bigint;
+      try { id = BigInt(x); } catch { continue; }
+      if (id > 0n) out.push(id);
+    }
+    return out;
+  }
+
   /**
-   * Sync an agent's access scopes (which system fields / custom fields / tags / agents
-   * they can see) into the polymorphic user_accesses table — mirrors replyagent saveAccessParams.
-   * Only the kinds actually present in `data` are touched, so other scopes (e.g. channels) survive.
+   * Sync an agent's access scopes (system/custom fields, tags, agents, and per-channel
+   * access) into the polymorphic user_accesses table — mirrors replyagent saveAccessParams.
+   * Only the kinds actually present in `data` are touched, so untouched scopes survive.
+   * The agent is always granted access to their own conversations (replyagent includes self).
    */
   private async syncUserAccesses(userId: bigint, data: any) {
-    const provided = WorkspacesService.ACCESS_TYPES.filter((m) => Array.isArray(data[m.key]));
-    if (provided.length === 0) return;
-    const types = provided.map((m) => m.type);
+    const buckets: { type: string; ids: bigint[] }[] = [];
+
+    for (const m of WorkspacesService.ACCESS_TYPES) {
+      if (!Array.isArray(data[m.key])) continue;
+      let ids = WorkspacesService.toBigIntIds(data[m.key]);
+      // accessableAgents always includes the agent themselves (replyagent parity).
+      if (m.key === 'agents') ids = [...ids, userId];
+      buckets.push({ type: m.type, ids });
+    }
+
+    const channels = data.channels;
+    if (channels && typeof channels === 'object' && !Array.isArray(channels)) {
+      for (const m of WorkspacesService.CHANNEL_ACCESS_TYPES) {
+        if (!Array.isArray(channels[m.key])) continue;
+        buckets.push({ type: m.type, ids: WorkspacesService.toBigIntIds(channels[m.key]) });
+      }
+    }
+
+    if (buckets.length === 0) return;
+
+    const types = buckets.map((b) => b.type);
     await this.prisma.user_accesses.deleteMany({
       where: { user_id: userId, accessable_type: { in: types } },
     });
+
+    // Dedupe by (type,id) so the self-include or any repeats can't violate uniqueness.
+    const seen = new Set<string>();
     const rows: any[] = [];
-    for (const m of provided) {
-      for (const x of data[m.key] as any[]) {
-        let id: bigint;
-        try { id = BigInt(x); } catch { continue; }
-        if (id > 0n) rows.push({ user_id: userId, accessable_type: m.type, accessable_id: id });
+    for (const b of buckets) {
+      for (const id of b.ids) {
+        const key = `${b.type}:${id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        rows.push({ user_id: userId, accessable_type: b.type, accessable_id: id });
       }
     }
     if (rows.length) await this.prisma.user_accesses.createMany({ data: rows });
+  }
+
+  /**
+   * Upsert an agent's limits (max open conversations / opportunities / tasks / incoming
+   * calls per day, each independently toggleable) — mirrors replyagent user_limits.
+   */
+  private async saveLimits(userId: bigint, limits: any) {
+    if (!limits || typeof limits !== 'object') return;
+    const num = (v: any) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+    };
+    const data: any = {
+      enable_conversation: limits.enable_conversation ? 1 : 0,
+      conversation_limit: num(limits.conversation_limit),
+      enable_opportunities: limits.enable_opportunities ? 1 : 0,
+      opportunities_limit: num(limits.opportunities_limit),
+      enable_tasks: limits.enable_tasks ? 1 : 0,
+      tasks_limit: num(limits.tasks_limit),
+      enable_call_limit: limits.enable_call_limit ? 1 : 0,
+      calls_limit: num(limits.calls_limit),
+      updated_at: new Date(),
+    };
+    const existing = await this.prisma.user_limits.findFirst({ where: { user_id: userId } });
+    if (existing) {
+      await this.prisma.user_limits.update({ where: { id: existing.id }, data });
+    } else {
+      await this.prisma.user_limits.create({ data: { ...data, user_id: userId, created_at: new Date() } });
+    }
   }
 
   /**

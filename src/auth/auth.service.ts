@@ -131,6 +131,10 @@ export class AuthService {
       modelable_type: contextType,
       role: userRole,
       tfa_enabled: user.tfa_enabled,
+      // Owners (is_owner) implicitly hold 'agency.*'/'workspace.*' (see
+      // loadUserPermissions). Surfacing the flag lets the UI grant owner
+      // affordances without re-deriving it from the wildcard slugs.
+      is_owner: user.is_owner,
       workspace_id: contextType.toLowerCase().includes('workspace')
         ? contextId.toString()
         : null,
@@ -147,6 +151,7 @@ export class AuthService {
         last_name: user.last_name,
         tfa_enabled: user.tfa_enabled,
         role: userRole,
+        is_owner: user.is_owner,
         modelable_id: contextId.toString(),
         modelable_type: contextType,
       },

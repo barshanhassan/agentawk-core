@@ -49,6 +49,7 @@ import { BaserowModule } from './baserow/baserow.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
 import { MarketplaceModule } from './marketplace/marketplace.module';
 import { DomainsModule } from './domains/domains.module';
+import { NotificationEmailModule } from './notification-email/notification-email.module';
 import { SystemFieldsModule } from './system-fields/system-fields.module';
 import { AiModule } from './ai/ai.module';
 import { DifyModule } from './dify/dify.module';
@@ -125,6 +126,7 @@ import { PermissionsGuard } from './auth/permissions.guard';
     WebhooksModule,
     MarketplaceModule,
     DomainsModule,
+    NotificationEmailModule,
     SystemFieldsModule,
     AiModule,
     DifyModule,

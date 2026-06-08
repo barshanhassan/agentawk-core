@@ -14,6 +14,7 @@ import { WorkspacesService } from './workspaces.service';
 import { PlanFeaturesService } from './plan-features.service';
 import { RolesService } from '../roles/roles.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
+import { RequirePermission } from '../auth/permissions.decorator';
 import { Logger } from '@nestjs/common';
 
 const WORKSPACE_OWNER = 'App\\Models\\Workspace';
@@ -52,7 +53,11 @@ export class WorkspacesController {
     return this.service.getAccessibleWorkspaces(req.user);
   }
 
+  // Saving needs `workspace.settings.manage` (replyagent parity). Owners get
+  // 'workspace.*' which the PermissionsGuard treats as covering this slug, so
+  // they always pass; other agents are gated by their role. GET stays open.
   @Patch('current')
+  @RequirePermission('workspace.settings.manage')
   async updateWorkspace(@Body() body: any, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     return this.service.updateWorkspace(workspaceId, body);
@@ -86,6 +91,14 @@ export class WorkspacesController {
   async getMembers(@Query() query: any, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     return this.service.getMembers(workspaceId, query);
+  }
+
+  // All conversation channels for the workspace, grouped by type — feeds the agent
+  // "Chat Channels" access tab (replyagent GET /all-channels).
+  @Get('all-channels')
+  async getAllChannels(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getAllChannels(workspaceId);
   }
 
   @Post('members')
