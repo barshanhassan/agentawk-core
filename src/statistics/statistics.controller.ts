@@ -54,4 +54,78 @@ export class StatisticsController {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     return this.service.getDashboardCharts(workspaceId);
   }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  Insights Dashboard extended endpoints
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /** Overview tab → New Users KPI card (replaces hardcoded +2.5/-1.2/+5.8). */
+  @Get('new-users')
+  async getNewUsers(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getNewUsersStats(workspaceId);
+  }
+
+  /** Performance tab → Agent Performance main view. */
+  @Get('agent-performance-main')
+  async getAgentPerformanceMain(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getAgentPerformanceMain(workspaceId);
+  }
+
+  /** Performance tab → Agent Conversion sub-tab. */
+  @Get('agent-conversion')
+  async getAgentConversion(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getAgentConversion(workspaceId);
+  }
+
+  /** WhatsApp tab → Messages sub-tab. Optional ?country=US filter. */
+  @Get('whatsapp-messages')
+  async getWhatsappMessages(@Request() req: any, @Query('country') country?: string) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getWhatsappMessages(workspaceId, country);
+  }
+
+  /** WhatsApp tab → Calls sub-tab. */
+  @Get('whatsapp-calls')
+  async getWhatsappCalls(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getWhatsappCalls(workspaceId);
+  }
+
+  /** Bot tab analytics. */
+  @Get('bot-analytics')
+  async getBotAnalytics(@Request() req: any, @Query('top') top?: string) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getBotAnalytics(workspaceId, top || 'Top 10');
+  }
+
+  /** Voice of Customer → Summary sub-tab. */
+  @Get('sentiment-summary')
+  async getSentimentSummary(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getSentimentSummary(workspaceId);
+  }
+
+  /** Voice of Customer → Details sub-tab. */
+  @Get('sentiment-details')
+  async getSentimentDetails(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getSentimentDetails(workspaceId);
+  }
+
+  /** CSAT → Summary sub-tab (honest empty state). */
+  @Get('csat-summary')
+  async getCsatSummary(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getCsatSummary(workspaceId);
+  }
+
+  /** CSAT → Details sub-tab (honest empty state). */
+  @Get('csat-details')
+  async getCsatDetails(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getCsatDetails(workspaceId);
+  }
 }
