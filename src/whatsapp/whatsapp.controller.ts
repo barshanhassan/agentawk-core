@@ -112,6 +112,43 @@ export class WhatsappController {
     return this.whatsappService.synchronizeData(workspaceId, BigInt(numberId));
   }
 
+  /**
+   * POST /whatsapp/register/:number_id — register the number on Meta Cloud API
+   * with a 6-digit two-step-verification PIN and flip it ACTIVE. Body: { pin? }
+   * (omit `pin` to auto-generate one). Mirrors replyagent's registerNumber.
+   */
+  @Post('register/:number_id')
+  async register(
+    @Param('number_id') numberId: string,
+    @Body() body: { pin?: string },
+    @Request() req: any,
+  ) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.whatsappService.registerNumber(workspaceId, BigInt(numberId), body?.pin);
+  }
+
+  /**
+   * POST /whatsapp/verify-account/:account_id — re-query Meta for the WABA's
+   * review / verification / ownership state and refresh our row. Powers the
+   * "Verify" button on the account header.
+   */
+  @Post('verify-account/:account_id')
+  async verifyAccount(@Param('account_id') accountId: string, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.whatsappService.verifyAccount(workspaceId, BigInt(accountId));
+  }
+
+  /**
+   * POST /whatsapp/resubscribe/:account_id — re-establish the WABA's webhook
+   * subscription on demand (the cron does this automatically every 6h; this is
+   * the manual trigger from the account header).
+   */
+  @Post('resubscribe/:account_id')
+  async resubscribe(@Param('account_id') accountId: string, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.whatsappService.resubscribeAccount(workspaceId, BigInt(accountId));
+  }
+
   // ─── Auto-reply + AI Feeder ──────────────────────────────────────
 
   /**

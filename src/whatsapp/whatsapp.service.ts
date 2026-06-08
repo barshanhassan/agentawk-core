@@ -1,4 +1,5 @@
 import { Injectable, Logger, NotFoundException, BadRequestException, forwardRef, Inject } from '@nestjs/common';
+import { randomInt } from 'crypto';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { MetaGraphApiClient } from './meta-graph-api.client';
@@ -118,6 +119,17 @@ export class WhatsappService {
     });
     if (existingDifferentWs) {
       throw new BadRequestException('This WABA is already connected to another workspace');
+    }
+
+    // Enforce the workspace's WhatsApp channel limit — but only when this WABA
+    // isn't already connected here (re-submitting the form to refresh a token
+    // must not be blocked by the cap).
+    const alreadyConnected = await this.prisma.wa_accounts.findFirst({
+      where: { workspace_id: workspaceId, waba_id: payload.waba_id, deleted_at: null },
+      select: { id: true },
+    });
+    if (!alreadyConnected) {
+      await this.assertChannelCapacity(workspaceId);
     }
 
     // No cross-account phone number conflicts (a phone number lives on a single WABA)
@@ -282,6 +294,15 @@ export class WhatsappService {
       throw new BadRequestException('This WABA is already connected to another workspace');
     }
 
+    // 2a. Enforce the workspace's WhatsApp channel limit on NEW connections.
+    const alreadyConnected = await this.prisma.wa_accounts.findFirst({
+      where: { waba_id: payload.waba_id, workspace_id: workspaceId, deleted_at: null },
+      select: { id: true },
+    });
+    if (!alreadyConnected) {
+      await this.assertChannelCapacity(workspaceId);
+    }
+
     // 3. Fetch WABA details from Meta + upsert wa_accounts
     const wabaInfo: any = await this.meta.fetchWabaAccount(payload.waba_id, accessToken);
     let account = await this.prisma.wa_accounts.findFirst({
@@ -358,6 +379,9 @@ export class WhatsappService {
         pin_code: '',
         code_verification_status: phoneData.code_verification_status ?? '',
         quality_rating: phoneData.quality_rating ?? '',
+        current_limit: phoneData.messaging_limit_tier ?? null,
+        throughput: phoneData.throughput ? JSON.stringify(phoneData.throughput) : null,
+        last_onboarded_time: phoneData.last_onboarded_time ? new Date(phoneData.last_onboarded_time) : null,
         status: 'PENDING',
         name_status: 'PENDING',
         auto_reply_interval: '247',
@@ -653,6 +677,22 @@ export class WhatsappService {
   }
 
   /**
+   * Hard ENFORCE gate for the workspace's WhatsApp channel allowance. getLimits()
+   * powers the FE pre-check, but that's advisory — a determined caller could hit
+   * /onboard or /onboard-manual directly. This throws so the plan limit is
+   * actually upheld server-side. Only called when adding a NEW WABA (re-onboarding
+   * an existing one to refresh its token stays allowed).
+   */
+  private async assertChannelCapacity(workspaceId: bigint) {
+    const { limit, used, can_add } = await this.getLimits(workspaceId);
+    if (!can_add) {
+      throw new BadRequestException(
+        `WhatsApp channel limit reached (${used}/${limit}). Upgrade the workspace plan or remove an existing WhatsApp account before adding another.`,
+      );
+    }
+  }
+
+  /**
    * GET /whatsapp/numbers — flat phone-number list across the workspace.
    * Used by automation pickers ("Send via which number?") and the AI Feeder
    * settings page.
@@ -768,6 +808,27 @@ export class WhatsappService {
       this.logger.warn(`WA_DELETE_ACCOUNT publish failed: ${e?.message ?? e}`);
     }
 
+    // Local cascade — tear down every phone number (chats/messages/inbox),
+    // then the account's templates + statistics, so no orphan rows linger after
+    // the account row is soft-deleted. Mirrors replyagent's DeleteWhatsappAccount
+    // job order (phone numbers → templates → unsubscribe → delete account).
+    const numbers = await this.prisma.wa_phone_numbers.findMany({
+      where: { wa_account_id: account.id },
+    });
+    for (const num of numbers) {
+      await this.cascadeDeleteNumberLocal(num, account).catch((e) =>
+        this.logger.warn(`Cascade number ${num.id} delete failed: ${e?.message ?? e}`),
+      );
+    }
+    // wa_templates.wa_account_id stores the WABA id string (not wa_accounts.id) —
+    // see broadcasts.service.ts which filters templates by waba_id.
+    await this.prisma.wa_templates
+      .deleteMany({ where: { wa_account_id: account.waba_id } })
+      .catch((e) => this.logger.warn(`Cascade wa_templates delete failed: ${e?.message ?? e}`));
+    await this.prisma.wa_statistics
+      .deleteMany({ where: { wa_account_id: account.id } })
+      .catch((e) => this.logger.warn(`Cascade wa_statistics delete failed: ${e?.message ?? e}`));
+
     // Soft delete + emit. Hard delete is left to a cron / final cleanup once
     // the microservice confirms via WA_DELETION_RESULT.
     const updated = await this.prisma.wa_accounts.update({
@@ -815,21 +876,37 @@ export class WhatsappService {
       this.logger.warn(`WA_DELETE_PHONE_NUMBER publish failed: ${e?.message ?? e}`);
     }
 
-    // 2. Cascade delete: chats → messages → linked inbox rows → number.
+    // 2-4. Local cascade: chats → messages → inbox rows → number row + audit log.
+    await this.cascadeDeleteNumberLocal(number, account);
+
+    const updatedAccount = await this.prisma.wa_accounts.findUnique({ where: { id: account.id } });
+    if (updatedAccount) this.emitAccountUpdated(workspaceId, updatedAccount);
+
+    return { success: true, message: 'Phone number deleted' };
+  }
+
+  /**
+   * Local cascade for a single phone number: drop its chats → messages →
+   * linked inbox rows → the number row, then write a channel_deleted audit log.
+   * Shared by deletePhoneNumber (single number) and deleteAccount (full account
+   * teardown) so both paths clean up identically. Mirrors replyagent
+   * WhatsappHelper::deleteWhatsappNumber() (gateway, ~line 2507).
+   */
+  private async cascadeDeleteNumberLocal(
+    number: { id: bigint; verified_name: string; display_phone_number: string },
+    account: { id: bigint; workspace_id: bigint },
+  ) {
     const chats = await this.prisma.wa_chats.findMany({
       where: { wa_number_id: number.id },
       select: { id: true },
     });
     const chatIds = chats.map((c) => c.id);
-
     if (chatIds.length > 0) {
       // Drop messages first (FK on wa_chat_id).
       await this.prisma.wa_messages
         .deleteMany({ where: { wa_chat_id: { in: chatIds } } })
         .catch((e) => this.logger.warn(`Cascade wa_messages delete failed: ${e?.message ?? e}`));
-
-      // Drop inbox rows tied to these wa_chats. Inbox is polymorphic on
-      // modelable_type='App\\Models\\Whatsapp\\WhatsappChat'.
+      // Inbox is polymorphic on modelable_type='App\\Models\\Whatsapp\\WhatsappChat'.
       await this.prisma.inbox
         .deleteMany({
           where: {
@@ -838,21 +915,15 @@ export class WhatsappService {
           },
         })
         .catch((e) => this.logger.warn(`Cascade inbox delete failed: ${e?.message ?? e}`));
-
-      // Now the chats themselves.
       await this.prisma.wa_chats
         .deleteMany({ where: { id: { in: chatIds } } })
         .catch((e) => this.logger.warn(`Cascade wa_chats delete failed: ${e?.message ?? e}`));
     }
-
-    // 3. Drop the phone number row.
     await this.prisma.wa_phone_numbers.delete({ where: { id: number.id } });
-
-    // 4. Audit log + realtime emit so the UI refreshes.
     try {
       await this.prisma.audit_logs.create({
         data: {
-          workspace_id: workspaceId,
+          workspace_id: account.workspace_id,
           user_id: null,
           event: 'channel_deleted',
           modelable_type: 'App\\Models\\Whatsapp\\WhatsappAccount',
@@ -870,11 +941,6 @@ export class WhatsappService {
       // audit_logs is optional — don't block the delete on it.
       this.logger.debug(`audit_log insert failed: ${e?.message ?? e}`);
     }
-
-    const updatedAccount = await this.prisma.wa_accounts.findUnique({ where: { id: account.id } });
-    if (updatedAccount) this.emitAccountUpdated(workspaceId, updatedAccount);
-
-    return { success: true, message: 'Phone number deleted' };
   }
 
   /**
@@ -911,6 +977,10 @@ export class WhatsappService {
     if (phoneResp?.new_name_status && phoneResp.new_name_status !== 'NONE') {
       updateData.name_status = phoneResp.new_name_status;
     }
+    // Keep the messaging-limit tier + throughput fresh on every reconnect so the
+    // manage view reflects Meta's latest numbers (Gap 5).
+    if (phoneResp?.messaging_limit_tier) updateData.current_limit = phoneResp.messaging_limit_tier;
+    if (phoneResp?.throughput) updateData.throughput = JSON.stringify(phoneResp.throughput);
 
     const updated = await this.prisma.wa_phone_numbers.update({
       where: { id: number.id },
@@ -937,6 +1007,164 @@ export class WhatsappService {
     const data = profile?.data?.[0] ?? profile ?? {};
     this.emitPhoneNumberUpdated(workspaceId, number);
     return { success: true, profile: data };
+  }
+
+  /**
+   * POST /whatsapp/register/:number_id — register the phone number on Meta
+   * Cloud API with a 6-digit two-step-verification PIN, then flip it ACTIVE.
+   *
+   * Mirrors replyagent's WhatsappNumberObserver::created() (auto-generates a
+   * 6-digit PIN and calls registerNumber) + WhatsappTrait::registerNumber()
+   * (gateway, line 267). Here it's an explicit admin action so the user can
+   * either let us generate a PIN or supply their own (some businesses keep a
+   * known two-step PIN on file). The PIN is persisted (pin_code) so a later
+   * Meta two-step prompt can reuse it.
+   *
+   * Body: { pin?: '123456' } — omit `pin` to auto-generate a secure one.
+   */
+  async registerNumber(workspaceId: bigint, numberId: bigint, pin?: string) {
+    const number = await this.prisma.wa_phone_numbers.findUnique({ where: { id: numberId } });
+    if (!number) throw new NotFoundException('Phone number not found');
+    const account = await this.prisma.wa_accounts.findFirst({
+      where: { id: number.wa_account_id, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!account) throw new NotFoundException('Account not found for this number');
+
+    // Meta requires the PIN to be exactly 6 digits. Accept an admin-supplied
+    // code or generate a cryptographically-random one.
+    let code = (pin ?? '').trim();
+    if (code) {
+      if (!/^\d{6}$/.test(code)) {
+        throw new BadRequestException('PIN must be exactly 6 digits');
+      }
+    } else {
+      code = String(randomInt(0, 1_000_000)).padStart(6, '0');
+    }
+
+    try {
+      await this.meta.registerPhoneNumber(number.wa_number_id, account.access_token, code);
+    } catch (e: any) {
+      // Meta rejected the registration (already registered with a different PIN,
+      // bad token, etc.). Persist the error so the health banner surfaces it.
+      const failed = await this.prisma.wa_phone_numbers.update({
+        where: { id: number.id },
+        data: { error_code: (e?.message ?? 'register_failed').slice(0, 255), updated_at: new Date() },
+      });
+      this.emitPhoneNumberUpdated(workspaceId, failed);
+      return { success: false, message: e?.message ?? 'Registration failed' };
+    }
+
+    const updated = await this.prisma.wa_phone_numbers.update({
+      where: { id: number.id },
+      data: { pin_code: code, status: 'ACTIVE', error_code: null, updated_at: new Date() },
+    });
+    this.emitPhoneNumberUpdated(workspaceId, updated);
+    return { success: true, pin: code, number: this.serializeNumber(updated) };
+  }
+
+  /**
+   * POST /whatsapp/verify-account/:account_id — re-query Meta for the WABA's
+   * current review / verification / ownership state and patch our row, so the
+   * account badges reflect Meta's latest decision without re-onboarding.
+   * Used by the "Verify" button on the account header.
+   */
+  async verifyAccount(workspaceId: bigint, accountId: bigint) {
+    const account = await this.prisma.wa_accounts.findFirst({
+      where: { id: accountId, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!account) throw new NotFoundException('Account not found');
+
+    let info: any;
+    try {
+      info = await this.meta.fetchWabaAccount(account.waba_id, account.access_token);
+    } catch (e: any) {
+      const failed = await this.prisma.wa_accounts.update({
+        where: { id: account.id },
+        data: { error_code: (e?.message ?? 'verify_failed').slice(0, 255), updated_at: new Date() },
+      });
+      this.emitAccountUpdated(workspaceId, failed);
+      return { success: false, message: e?.message ?? 'Verification failed' };
+    }
+
+    const data: any = {
+      account_review_status: info.account_review_status ?? account.account_review_status,
+      business_verification_status: info.business_verification_status ?? account.business_verification_status,
+      ownership_type: info.ownership_type ?? account.ownership_type,
+      on_behalf_of_business_info: info.on_behalf_of_business_info
+        ? JSON.stringify(info.on_behalf_of_business_info)
+        : account.on_behalf_of_business_info,
+      error_code: null,
+      updated_at: new Date(),
+    };
+    if (info.name) data.name = info.name;
+    if (info.currency) data.currency = info.currency;
+    if (info.message_template_namespace) data.message_template_namespace = info.message_template_namespace;
+
+    const updated = await this.prisma.wa_accounts.update({ where: { id: account.id }, data });
+    this.emitAccountUpdated(workspaceId, updated);
+    return { success: true, account: this.serializeAccount(updated) };
+  }
+
+  /**
+   * Re-subscribe a single WABA to our app's webhook (idempotent on Meta's side).
+   * Mirrors replyagent's reSubscribeWebhook intent (it published WA_SUBSCRIBE);
+   * we call Meta directly AND nudge the microservice so whichever owns the
+   * subscription re-establishes it. Returns true on success.
+   */
+  async resubscribeAccountWebhook(account: {
+    id: bigint;
+    waba_id: string;
+    access_token: string;
+  }): Promise<boolean> {
+    try {
+      await this.meta.subscribeWabaWebhook(account.waba_id, account.access_token);
+      try {
+        await this.rabbit.publish('ra', 'whatsapp', {
+          event: 'WA_SUBSCRIBE',
+          payload: { waba_id: account.waba_id, access_token: account.access_token },
+          meta: { backend_wa_account_id: account.id.toString() },
+        });
+      } catch {
+        /* microservice nudge is best-effort */
+      }
+      return true;
+    } catch (e: any) {
+      this.logger.warn(`resubscribe failed for waba ${account.waba_id}: ${e?.message ?? e}`);
+      return false;
+    }
+  }
+
+  /**
+   * POST /whatsapp/resubscribe/:account_id — manual "re-subscribe webhook"
+   * trigger from the account header.
+   */
+  async resubscribeAccount(workspaceId: bigint, accountId: bigint) {
+    const account = await this.prisma.wa_accounts.findFirst({
+      where: { id: accountId, workspace_id: workspaceId, deleted_at: null },
+    });
+    if (!account) throw new NotFoundException('Account not found');
+    const ok = await this.resubscribeAccountWebhook(account);
+    return {
+      success: ok,
+      message: ok ? 'Webhook re-subscribed' : 'Re-subscribe failed — check the access token.',
+    };
+  }
+
+  /**
+   * Re-subscribe every ACTIVE WhatsApp account's WABA webhook. Called by
+   * WhatsappWebhookSubscriptionService on a schedule so a dropped Meta
+   * subscription self-heals without admin intervention (Gap 6). Returns counts.
+   */
+  async resubscribeAllActive(): Promise<{ total: number; ok: number }> {
+    const accounts = await this.prisma.wa_accounts.findMany({
+      where: { deleted_at: null, status: 'ACTIVE' },
+      select: { id: true, waba_id: true, access_token: true },
+    });
+    let ok = 0;
+    for (const acc of accounts) {
+      if (await this.resubscribeAccountWebhook(acc)) ok++;
+    }
+    return { total: accounts.length, ok };
   }
 
   /**

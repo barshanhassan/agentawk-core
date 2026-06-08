@@ -102,8 +102,41 @@ export class MetaGraphApiClient {
   async fetchPhoneNumberDetails(phoneNumberId: string, accessToken: string) {
     return this.request<any>(
       'GET',
-      `/${phoneNumberId}?fields=id,verified_name,display_phone_number,code_verification_status,quality_rating,platform_type,throughput,last_onboarded_time`,
+      `/${phoneNumberId}?fields=id,verified_name,display_phone_number,code_verification_status,quality_rating,platform_type,throughput,messaging_limit_tier,last_onboarded_time`,
       accessToken,
+    );
+  }
+
+  /**
+   * Register a WhatsApp phone number on Cloud API with a 6-digit two-step
+   * verification PIN. Mirrors replyagent's `registerNumber()`
+   * (gateway/app/Traits/WhatsappTrait.php:267) which posts to
+   * `POST /{phone_number_id}/register` with `{ messaging_product, pin }`.
+   *
+   * Registration is what flips a number from "added to the WABA" to
+   * "able to send/receive on Cloud API". The PIN doubles as the number's
+   * two-step verification code (re-used if Meta later prompts for it).
+   */
+  async registerPhoneNumber(phoneNumberId: string, accessToken: string, pin: string) {
+    return this.request<{ success?: boolean; error?: any }>(
+      'POST',
+      `/${phoneNumberId}/register`,
+      accessToken,
+      { messaging_product: 'whatsapp', pin },
+    );
+  }
+
+  /**
+   * Update (or set) the two-step verification PIN on an already-registered
+   * number. Meta exposes this as `POST /{phone_number_id}` with `{ pin }`.
+   * Used when the admin changes the PIN from the manage view.
+   */
+  async setTwoStepPin(phoneNumberId: string, accessToken: string, pin: string) {
+    return this.request<{ success?: boolean; error?: any }>(
+      'POST',
+      `/${phoneNumberId}`,
+      accessToken,
+      { pin },
     );
   }
 
