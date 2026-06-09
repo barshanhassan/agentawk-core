@@ -114,7 +114,7 @@ export class BillingService {
 
   async cancelSubscription(agencyId: bigint) {
     const sub = await this.prisma.billing_subscriptions.findFirst({
-      where: { agency_id: agencyId, status: 'active' as any }
+      where: { agency_id: agencyId, status: 'active' }
     });
     if (!sub) throw new NotFoundException('No active subscription found');
 

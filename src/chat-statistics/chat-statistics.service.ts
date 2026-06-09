@@ -21,7 +21,7 @@ export class ChatStatisticsService {
       this.prisma.inbox.count({ where: { ...where, status: 'ACTIVE' } }),
       this.prisma.inbox.count({ where: { ...where, status: 'COMPLETED' } }),
       this.prisma.inbox.count({ where: { ...where, status: 'UNASSIGNED' } }),
-      this.prisma.inbox.count({ where: { ...where, status: 'SNOOZED' } }),
+      this.prisma.inbox.count({ where: { ...where, snooze: { gt: new Date() } } }),
     ]);
 
     return {

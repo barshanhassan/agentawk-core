@@ -50,6 +50,7 @@ import { WebhooksModule } from './webhooks/webhooks.module';
 import { MarketplaceModule } from './marketplace/marketplace.module';
 import { DomainsModule } from './domains/domains.module';
 import { NotificationEmailModule } from './notification-email/notification-email.module';
+import { MailModule } from './mail/mail.module';
 import { SystemFieldsModule } from './system-fields/system-fields.module';
 import { AiModule } from './ai/ai.module';
 import { DifyModule } from './dify/dify.module';
@@ -127,6 +128,7 @@ import { PermissionsGuard } from './auth/permissions.guard';
     MarketplaceModule,
     DomainsModule,
     NotificationEmailModule,
+    MailModule,
     SystemFieldsModule,
     AiModule,
     DifyModule,

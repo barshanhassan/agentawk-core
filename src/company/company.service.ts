@@ -45,7 +45,7 @@ export class CompanyService {
         address: data.address || null,
         industry: data.industry || null,
         size: data.size || null,
-        status: 'active',
+        status: 'ACTIVE',
       },
     });
     return { success: true, company };

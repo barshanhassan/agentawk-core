@@ -24,22 +24,23 @@ export class SupervisorChatStatisticsService {
         this.prisma.inbox.count({
           where: {
             workspace_id: workspaceId,
-            assigned_to: member.user_id,
+            user_id: member.user_id,
             status: 'ACTIVE',
           },
         }),
         this.prisma.inbox.count({
           where: {
             workspace_id: workspaceId,
-            assigned_to: member.user_id,
+            user_id: member.user_id,
             status: 'COMPLETED',
           },
         }),
         this.prisma.inbox.count({
           where: {
             workspace_id: workspaceId,
-            assigned_to: member.user_id,
-            status: 'SNOOZED',
+            user_id: member.user_id,
+            // inbox has no SNOOZED status — snoozed = a future `snooze` datetime.
+            snooze: { gt: new Date() },
           },
         }),
       ]);

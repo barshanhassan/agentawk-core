@@ -7,6 +7,7 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
+import { MailerService } from '../mail/mailer.service';
 import { generateSecret, verify, generateURI } from 'otplib';
 
 @Injectable()
@@ -14,6 +15,7 @@ export class AuthService {
   constructor(
     private jwtService: JwtService,
     private prisma: PrismaService,
+    private readonly mailer: MailerService,
   ) {}
 
   async login(userDto: any, domainInfo: any, hostname: string = '') {
@@ -581,12 +583,26 @@ export class AuthService {
       },
     });
 
-    // 📧 In production: SendResetPasswordEmail::dispatch($user->id, $code);
-    // Stub for now
+    // Send the reset code via the configured SMTP provider. No-ops (logs a warning)
+    // if SMTP_* isn't set yet, so the flow never crashes before keys are dropped in.
+    const mailResult = await this.mailer.sendMail({
+      to: email,
+      subject: 'Your password reset code',
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
+          <h2 style="color:#4f46e5">Password reset</h2>
+          <p>Use the code below to reset your password. It is valid for a short time.</p>
+          <p style="font-size:26px;font-weight:bold;letter-spacing:4px;background:#f3f4f6;padding:14px 20px;border-radius:10px;text-align:center">${code}</p>
+          <p style="color:#888;font-size:12px">If you didn't request this, you can ignore this email.</p>
+        </div>`,
+      text: `Your password reset code is: ${code}`,
+    });
 
     return {
       message: 'Password reset email sent',
       code: 'EMAIL_SENT',
+      emailSent: mailResult.sent,
+      // debugCode stays so dev/testing works even before SMTP is configured.
       debugCode: code,
     };
   }

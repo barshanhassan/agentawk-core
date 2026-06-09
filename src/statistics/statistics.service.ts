@@ -76,7 +76,7 @@ export class StatisticsService {
 
     // 1. Telegram
     const telegramBots = await this.prisma.telegram_bots.findMany({
-      where: { workspace_id: workspaceId, status: 'active', deleted_at: null },
+      where: { workspace_id: workspaceId, status: 'ACTIVE', deleted_at: null },
     });
     for (const bot of telegramBots) {
       const chatIds = (
@@ -116,7 +116,7 @@ export class StatisticsService {
 
     // 2. WhatsApp (Direct + ZAPI)
     const waAccounts = await this.prisma.wa_accounts.findMany({
-      where: { workspace_id: workspaceId, status: 'active', deleted_at: null },
+      where: { workspace_id: workspaceId, status: 'ACTIVE', deleted_at: null },
     });
     for (const acc of waAccounts) {
       const chatIds = (
@@ -157,7 +157,7 @@ export class StatisticsService {
     const zapiInstances = await this.prisma.zapi_instances.findMany({
       where: {
         workspace_id: workspaceId,
-        status: 'connected',
+        status: 'CONNECTED',
         deleted_at: null,
       },
     });
@@ -199,7 +199,7 @@ export class StatisticsService {
 
     // 3. Instagram & Messenger
     const fbPages = await this.prisma.fb_pages.findMany({
-      where: { workspace_id: workspaceId, status: 'active', deleted_at: null },
+      where: { workspace_id: workspaceId, status: 'ACTIVE', deleted_at: null },
     });
     for (const page of fbPages) {
       const chatIds = (
@@ -588,7 +588,9 @@ export class StatisticsService {
     const [queueActive, queuePending, queueForwarded] = await Promise.all([
       this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'ACTIVE' } }),
       this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'UNASSIGNED' } }),
-      this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'SNOOZED' } }),
+      // inbox_status has no SNOOZED variant — "snoozed" is tracked via the `snooze`
+      // datetime column (a future time = still snoozed). Count those.
+      this.prisma.inbox.count({ where: { workspace_id: workspaceId, snooze: { gt: new Date() } } }),
     ]);
 
     // ─── KPI 4: Feedback (CSAT placeholder — no csat_responses table) ────
@@ -726,7 +728,7 @@ export class StatisticsService {
     const [queued, active, pending, exited] = await Promise.all([
       this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'UNASSIGNED' } }),
       this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'ACTIVE' } }),
-      this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'SNOOZED' } }),
+      this.prisma.inbox.count({ where: { workspace_id: workspaceId, snooze: { gt: new Date() } } }),
       this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'COMPLETED', closed_at: { gte: last7Days0 } } }),
     ]);
 
@@ -763,7 +765,7 @@ export class StatisticsService {
       const [dQueued, dActive, dPending, dResolved] = await Promise.all([
         this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'UNASSIGNED', created_at: { gte: start, lte: end } } }),
         this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'ACTIVE', created_at: { gte: start, lte: end } } }),
-        this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'SNOOZED', created_at: { gte: start, lte: end } } }),
+        this.prisma.inbox.count({ where: { workspace_id: workspaceId, snooze: { gt: new Date() }, created_at: { gte: start, lte: end } } }),
         this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'COMPLETED', closed_at: { gte: start, lte: end } } }),
       ]);
       trend.push({
@@ -855,11 +857,10 @@ export class StatisticsService {
 
     const waAccounts = await this.prisma.wa_accounts.findMany({
       where: { workspace_id: workspaceId },
-      select: { id: true },
+      select: { id: true, waba_id: true },
     });
-    const waIds = waAccounts.map(a => a.id);
 
-    if (waIds.length === 0) {
+    if (waAccounts.length === 0) {
       return {
         kpi: emptyWaKpi(),
         allDeliveriesTrend: [],
@@ -869,11 +870,17 @@ export class StatisticsService {
       };
     }
 
+    // wa_templates.wa_account_id is a STRING storing the WABA id (NOT wa_accounts.id),
+    // so categorize templates by the accounts' waba_id values.
+    const wabaIds = waAccounts.map(a => a.waba_id).filter((x): x is string => !!x);
+
     // Bulk pull templates so we can categorize message-by-template lookups.
-    const templates = await this.prisma.wa_templates.findMany({
-      where: { wa_account_id: { in: waIds } },
-      select: { id: true, category: true },
-    });
+    const templates = wabaIds.length
+      ? await this.prisma.wa_templates.findMany({
+          where: { wa_account_id: { in: wabaIds } },
+          select: { id: true, category: true },
+        })
+      : [];
     const tplCategory: Record<string, string> = {};
     for (const t of templates) {
       tplCategory[t.id.toString()] = String(t.category || 'utility').toLowerCase();
