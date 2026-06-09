@@ -254,7 +254,9 @@ export class AgencyController {
     const isArchive = data.status === 'ARCHIVE' || data.isArchived === true;
     const isRestore = data.status === 'ACTIVE' || data.isArchived === false;
     const event = isArchive ? 'role_archived' : isRestore ? 'role_restored' : 'role_updated';
-    await this.service.logAgencyEvent(
+    // Fire-and-forget: the audit log must not hold up the response (it already
+    // swallows its own errors). Saves a remote-DB round-trip on every toggle.
+    void this.service.logAgencyEvent(
       BigInt(id), event, actorId, 'App\\Models\\Role', BigInt(roleId), { name: data.name },
     );
     return result;

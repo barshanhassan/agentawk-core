@@ -92,33 +92,72 @@ export class ContactsService {
     });
     if (!contact) throw new NotFoundException('Contact not found');
 
-    // Tag links — proper per-contact query (previous code referenced a var
-    // from getContacts() and crashed at runtime).
-    const tagLinks = await this.prisma.tag_links.findMany({
-      where: {
-        linkable_type: 'App\\Models\\Contact',
-        linkable_id: contact.id,
-      },
-    });
-
-    // Phones / emails. We split phones into the WhatsApp variant + the
-    // regular `phone` rows so the modal can render them as separate sections
-    // (matches the screenshot).
-    const [allMobiles, emails] = await Promise.all([
+    // Everything below depends only on contact.id / workspaceId. These used to
+    // run as ~13 SEQUENTIAL awaits, each a separate round-trip to the (remote)
+    // DB — that's what made the profile take a few seconds to open. Fire the
+    // whole independent batch concurrently instead (Wave A), then a small
+    // second batch (Wave B) for the two queries that need Wave A's results.
+    const [
+      tagLinks,
+      allMobiles,
+      emails,
+      tasksCount,
+      bookingsCount,
+      customFields,
+      tasks,
+      bookings,
+      twilioAccounts,
+      supportNumberRow,
+    ] = await Promise.all([
+      this.prisma.tag_links.findMany({
+        where: { linkable_type: 'App\\Models\\Contact', linkable_id: contact.id },
+      }),
+      // Phones / emails — split into WhatsApp vs regular `phone` rows below.
       this.prisma.contact_mobiles.findMany({
-        where: {
-          modelable_type: 'App\\Models\\Contact',
-          modelable_id: contact.id,
-        },
+        where: { modelable_type: 'App\\Models\\Contact', modelable_id: contact.id },
         orderBy: [{ is_primary: 'desc' }, { id: 'asc' }],
       }),
       this.prisma.contact_emails.findMany({
-        where: {
-          modelable_type: 'App\\Models\\Contact',
-          modelable_id: contact.id,
-        },
+        where: { modelable_type: 'App\\Models\\Contact', modelable_id: contact.id },
         orderBy: [{ is_primary: 'desc' }, { id: 'asc' }],
       }),
+      // Sidebar counts — best-effort, 0 on any error.
+      this.prisma.tasks
+        .count({ where: { workspace_id: workspaceId, contact_id: contact.id } })
+        .catch(() => 0),
+      this.prisma.bookings
+        .count({ where: { workspace_id: workspaceId, contact_id: contact.id } })
+        .catch(() => 0),
+      this.customFieldsService
+        .getEntityValues('Contact', contact.id)
+        .catch(() => [] as any[]),
+      // Sidebar list previews (capped at 5).
+      this.prisma.tasks
+        .findMany({
+          where: { workspace_id: workspaceId, contact_id: contact.id },
+          orderBy: [{ datetime: 'desc' }, { id: 'desc' }],
+          take: 5,
+        })
+        .catch(() => [] as any[]),
+      this.prisma.bookings
+        .findMany({
+          where: { workspace_id: workspaceId, contact_id: contact.id },
+          orderBy: [{ start: 'desc' }, { id: 'desc' }],
+          take: 5,
+        })
+        .catch(() => [] as any[]),
+      // Workspace's twilio accounts — needed to scope the calls count below.
+      this.prisma.twilio_accounts
+        .findMany({ where: { workspace_id: workspaceId, deleted_at: null }, select: { id: true } })
+        .catch(() => [] as { id: bigint }[]),
+      // Latest open Support-Number-Task chip (replyagent parity).
+      this.prisma.support_numbers
+        .findFirst({
+          where: { workspace_id: workspaceId, contact_id: contact.id, is_open: 1 },
+          orderBy: { id: 'desc' },
+          select: { sn_number: true },
+        })
+        .catch(() => null),
     ]);
 
     const phones = allMobiles
@@ -127,95 +166,36 @@ export class ContactsService {
     const whatsapps = allMobiles
       .filter((m) => String(m.type ?? '').toLowerCase() === 'whatsapp')
       .map((m) => this.serializeMobile(m));
+    const supportNumberTask = supportNumberRow?.sn_number ?? null;
 
-    // Linked-record counts powering the sidebar TASKS / BOOKINGS / CALLS /
-    // AD CLICKS chips. Each lookup is best-effort: a missing table or a
-    // mismatched modelable shape yields 0 rather than crashing the whole
-    // detail fetch.
-    const tasksCount = await this.prisma.tasks
-      .count({ where: { workspace_id: workspaceId, contact_id: contact.id } })
-      .catch(() => 0);
-    const bookingsCount = await this.prisma.bookings
-      .count({ where: { workspace_id: workspaceId, contact_id: contact.id } })
-      .catch(() => 0);
-
-    // Calls: twilio_call_logs scoped to the workspace's twilio accounts, then
-    // matched to any of the contact's mobile numbers (from / to). If the
-    // contact has no numbers we skip the lookup entirely.
-    let callsCount = 0;
+    // ─── Wave B — the two lookups that depend on Wave A results ──────
     const allNumbers = allMobiles
       .map((m) => m.full_mobile_number ?? m.mobile_number ?? null)
       .filter((x): x is string => !!x);
-    if (allNumbers.length) {
-      try {
-        const twilioAccountIds = (
-          await this.prisma.twilio_accounts.findMany({
-            where: { workspace_id: workspaceId, deleted_at: null },
-            select: { id: true },
-          })
-        ).map((a) => a.id);
-        if (twilioAccountIds.length) {
-          callsCount = await this.prisma.twilio_call_logs.count({
-            where: {
-              twilio_account_id: { in: twilioAccountIds },
-              OR: [
-                { from_number: { in: allNumbers } },
-                { to_number: { in: allNumbers } },
-              ],
-            },
-          });
-        }
-      } catch {
-        callsCount = 0;
-      }
-    }
-
-    const customFields = await this.customFieldsService
-      .getEntityValues('Contact', contact.id)
-      .catch(() => [] as any[]);
-
-    // ─── Linked-record LISTS (not just counts) ──────────────────────
-    // The contact-details modal needs to render the actual task rows,
-    // booking rows, call rows etc. in the left sidebar. We cap at 5 each
-    // for the sidebar preview; the "see all" affordance can paginate later.
-
-    const tasks = await this.prisma.tasks
-      .findMany({
-        where: { workspace_id: workspaceId, contact_id: contact.id },
-        orderBy: [{ datetime: 'desc' }, { id: 'desc' }],
-        take: 5,
-      })
-      .catch(() => [] as any[]);
+    const twilioAccountIds = twilioAccounts.map((a) => a.id);
     const taskUserIds = Array.from(
       new Set(tasks.map((t) => t.user_id).filter((x): x is bigint => !!x)),
     );
-    const taskUsers = taskUserIds.length
-      ? await this.prisma.users.findMany({
-          where: { id: { in: taskUserIds } },
-          select: { id: true, first_name: true, last_name: true },
-        })
-      : [];
+
+    const [taskUsers, callsCount] = await Promise.all([
+      taskUserIds.length
+        ? this.prisma.users.findMany({
+            where: { id: { in: taskUserIds } },
+            select: { id: true, first_name: true, last_name: true },
+          })
+        : Promise.resolve([] as { id: bigint; first_name: string | null; last_name: string | null }[]),
+      allNumbers.length && twilioAccountIds.length
+        ? this.prisma.twilio_call_logs
+            .count({
+              where: {
+                twilio_account_id: { in: twilioAccountIds },
+                OR: [{ from_number: { in: allNumbers } }, { to_number: { in: allNumbers } }],
+              },
+            })
+            .catch(() => 0)
+        : Promise.resolve(0),
+    ]);
     const taskUserById = new Map(taskUsers.map((u) => [u.id.toString(), u]));
-
-    const bookings = await this.prisma.bookings
-      .findMany({
-        where: { workspace_id: workspaceId, contact_id: contact.id },
-        orderBy: [{ start: 'desc' }, { id: 'desc' }],
-        take: 5,
-      })
-      .catch(() => [] as any[]);
-
-    // Latest open Support-Number-Task entry for this inbox (replyagent
-    // surfaces this as a top-of-profile chip).
-    let supportNumberTask: string | null = null;
-    try {
-      const sn = await this.prisma.support_numbers.findFirst({
-        where: { workspace_id: workspaceId, contact_id: contact.id, is_open: 1 },
-        orderBy: { id: 'desc' },
-        select: { sn_number: true },
-      });
-      supportNumberTask = sn?.sn_number ?? null;
-    } catch {}
 
     return {
       success: true,
