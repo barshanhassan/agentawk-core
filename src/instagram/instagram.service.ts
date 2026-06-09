@@ -5,8 +5,10 @@ import {
   BadRequestException,
   Logger,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { MetaGraphApiClient } from '../whatsapp/meta-graph-api.client';
+import { RabbitMqService } from '../rabbitmq/rabbitmq.service';
 
 @Injectable()
 export class InstagramService {
@@ -15,6 +17,8 @@ export class InstagramService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly meta: MetaGraphApiClient,
+    private readonly rabbit: RabbitMqService,
+    private readonly config: ConfigService,
   ) {}
 
   // ── List pages ──────────────────────────────────────────────────────
@@ -30,6 +34,9 @@ export class InstagramService {
     if (!data?.access_token || !(data?.ig_user_id || data?.page_id)) {
       throw new BadRequestException('access_token + ig_user_id (or page_id) required');
     }
+    const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
+    const igQueue = this.config.get<string>('RABBITMQ_INSTAGRAM_QUEUE') || 'instagram';
+
     const orClauses = [];
     if (data.ig_user_id) orClauses.push({ ig_user_id: data.ig_user_id });
     if (data.page_id)    orClauses.push({ page_id: data.page_id });
@@ -39,7 +46,7 @@ export class InstagramService {
     });
 
     if (existing) {
-      return this.prisma.insta_pages.update({
+      const saved = await this.prisma.insta_pages.update({
         where: { id: existing.id },
         data: {
           access_token: data.access_token,
@@ -49,13 +56,34 @@ export class InstagramService {
           follows_count: data.follows_count ?? existing.follows_count,
           media_count: data.media_count != null ? BigInt(data.media_count) : existing.media_count,
           token_expirey: data.token_expirey ?? existing.token_expirey,
-          status: 'ACTIVE',
+          status: existing.service_account_id ? 'ACTIVE' : 'PENDING',
           updated_at: new Date(),
         },
       });
+
+      if (existing.service_account_id) {
+        // Already in microservice — just refresh credentials
+        await this.rabbit.publish(exchange, igQueue, {
+          event: 'INSTA_UPDATE',
+          payload: {
+            accountId: existing.service_account_id,
+            access_token: data.access_token,
+            ig_user_id: data.ig_user_id ?? existing.ig_user_id,
+            username: data.username ?? existing.username,
+            platform: data.platform ?? existing.platform,
+          },
+        });
+      } else {
+        // Not yet in microservice — re-verify
+        await this.rabbit.publish(exchange, igQueue, {
+          event: 'INSTA_VERIFY',
+          payload: this.buildVerifyPayload(saved, workspaceId),
+        });
+      }
+      return saved;
     }
 
-    return this.prisma.insta_pages.create({
+    const saved = await this.prisma.insta_pages.create({
       data: {
         workspace_id: workspaceId,
         user_id: userId,
@@ -68,7 +96,7 @@ export class InstagramService {
         follows_count: data.follows_count ?? 0,
         media_count: data.media_count != null ? BigInt(data.media_count) : null,
         token_expirey: data.token_expirey ?? null,
-        status: 'ACTIVE',
+        status: 'PENDING',
         account_type: data.account_type ?? 'BUSINESS',
         platform: data.platform ?? 'instagram',
         auto_reply_interval: '247',
@@ -76,6 +104,27 @@ export class InstagramService {
         updated_at: new Date(),
       },
     });
+
+    await this.rabbit.publish(exchange, igQueue, {
+      event: 'INSTA_VERIFY',
+      payload: this.buildVerifyPayload(saved, workspaceId),
+    });
+
+    return saved;
+  }
+
+  private buildVerifyPayload(page: any, workspaceId: bigint) {
+    return {
+      businessPageId: page.page_id ?? page.ig_user_id,
+      accessToken: page.access_token,
+      ig_user_id: page.ig_user_id,
+      username: page.username,
+      name: page.name,
+      platform: page.platform ?? 'facebook',
+      uploadDir: `instagram/${workspaceId}/`,
+      thumbDir: `instagram/${workspaceId}/thumb/`,
+      meta: { backend_insta_page_id: page.id.toString() },
+    };
   }
 
   // ── Connect Instagram Business via OAuth code exchange ──────────────
@@ -189,13 +238,30 @@ export class InstagramService {
     return this.connectPage(workspaceId, userId, { ...data, platform: 'facebook' });
   }
 
-  // ── Disconnect page — DISCONNECTED (valid enum, not INACTIVE) ───────
+  // ── Disconnect page ──────────────────────────────────────────────────
   async disconnectPage(workspaceId: bigint, pageId: bigint) {
     const page = await this.requirePage(workspaceId, pageId);
-    await this.prisma.insta_pages.update({
-      where: { id: page.id },
-      data: { status: 'DISCONNECTED', updated_at: new Date() },
-    });
+    const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
+    const igQueue = this.config.get<string>('RABBITMQ_INSTAGRAM_QUEUE') || 'instagram';
+
+    if (page.service_account_id) {
+      await this.rabbit.publish(exchange, igQueue, {
+        event: 'INSTA_ACCOUNT_DELETING',
+        payload: {
+          account_id: page.service_account_id,
+          username: page.username,
+        },
+      });
+      await this.prisma.insta_pages.update({
+        where: { id: page.id },
+        data: { status: 'DELETING', updated_at: new Date() },
+      });
+    } else {
+      await this.prisma.insta_pages.update({
+        where: { id: page.id },
+        data: { status: 'DISCONNECTED', updated_at: new Date() },
+      });
+    }
     return { success: true };
   }
 
@@ -205,11 +271,67 @@ export class InstagramService {
       throw new BadRequestException('recipient_id + text required');
     }
     const page = await this.requirePage(workspaceId, pageId);
-    const res = await this.meta.sendMessengerMessage(page.access_token, {
-      recipient: { id: payload.recipient_id },
-      message: { text: payload.text },
+
+    // Find or create insta_chat for this recipient
+    const now = new Date();
+    let chat = await this.prisma.insta_chats.findFirst({
+      where: { insta_page_id: page.id, sender_id: payload.recipient_id },
     });
-    return { success: true, upstream: res };
+    if (!chat) {
+      chat = await this.prisma.insta_chats.create({
+        data: {
+          insta_page_id: page.id,
+          user_id: page.user_id,
+          sender_id: payload.recipient_id,
+          recipient_id: page.ig_user_id ?? '',
+          input_attempts: 0n,
+          created_at: now,
+          updated_at: now,
+        },
+      });
+    }
+
+    // Create pending outbound message row for correlation
+    const message = await this.prisma.insta_messages.create({
+      data: {
+        insta_page_id: page.id,
+        insta_chat_id: chat.id,
+        type: 'text',
+        direction: 'OUT',
+        text: payload.text,
+        status: 'pending',
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    if (page.service_account_id) {
+      const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
+      const igQueue = this.config.get<string>('RABBITMQ_INSTAGRAM_QUEUE') || 'instagram';
+      await this.rabbit.publish(exchange, igQueue, {
+        event: 'INSTA_OUTBOUND_MESSAGE',
+        payload: {
+          accountId: page.service_account_id,
+          context: {
+            recipient: { id: payload.recipient_id },
+            message: { text: payload.text },
+          },
+          meta: { backend_insta_message_id: message.id.toString() },
+        },
+      });
+    } else {
+      // Microservice not yet linked — fallback to direct Meta API
+      await this.meta.sendMessengerMessage(page.access_token, {
+        recipient: { id: payload.recipient_id },
+        message: { text: payload.text },
+      });
+      await this.prisma.insta_messages.update({
+        where: { id: message.id },
+        data: { status: 'sent', updated_at: now },
+      });
+    }
+
+    return { success: true, message_id: message.id.toString() };
   }
 
   // ── Sync page stats from Meta API ────────────────────────────────────

@@ -3,9 +3,10 @@ import { InstagramController } from './instagram.controller';
 import { InstagramService } from './instagram.service';
 import { PrismaModule } from '../prisma/prisma.module';
 import { WhatsappModule } from '../whatsapp/whatsapp.module';
+import { RabbitMqModule } from '../rabbitmq/rabbitmq.module';
 
 @Module({
-  imports: [PrismaModule, WhatsappModule],
+  imports: [PrismaModule, WhatsappModule, RabbitMqModule],
   controllers: [InstagramController],
   providers: [InstagramService],
   exports: [InstagramService],

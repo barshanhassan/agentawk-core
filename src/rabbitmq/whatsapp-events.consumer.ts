@@ -60,8 +60,28 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       case 'WA_MESSAGE_STATUS':
         await this.onMessageStatus(envelope.payload);
         return;
+      // ── Instagram events ───────────────────────────────────────────
+      case 'INSTA_VERIFICATION_RESULT':
+        await this.onInstaVerificationResult(envelope.payload);
+        return;
+      case 'INSTA_INBOUND_MESSAGE':
+        await this.onInstaInboundMessage(envelope.payload);
+        return;
+      case 'INSTA_OUTBOUND_MESSAGE_STATUS':
+        await this.onInstaOutboundMessageStatus(envelope.payload);
+        return;
+      case 'INSTA_ACCOUNT_DELETED':
+      case 'INSTA_ACCOUNT_DELETION_FAILED':
+        await this.onInstaAccountDeleted(envelope.payload, event);
+        return;
+      case 'INSTA_COMMENT':
+        await this.onInstaComment(envelope.payload);
+        return;
+      case 'INSTA_REFERRAL':
+      case 'INSTA_POSTBACK':
+        this.logger.debug(`Instagram event ${event} received (automation triggers pending)`);
+        return;
       default:
-        // Defer other events to later phases. Log so we can see what's being skipped.
         this.logger.debug(`Skipping event ${event} (not handled yet)`);
         return;
     }
@@ -683,9 +703,330 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
 
   private guessCountryCode(waId: string): string {
     const digits = waId.replace(/[^0-9]/g, '');
-    // Prefer 3-digit codes (e.g., 234 Nigeria); fall back to 2 then 1.
     if (digits.length > 3) return digits.slice(0, 3);
     if (digits.length > 2) return digits.slice(0, 2);
     return digits.slice(0, 1);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Instagram event handlers
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * INSTA_VERIFY result from instagram-master.
+   * Payload: { status: 'VERIFIED' | error_code, account: { id (Mongo), ig_user_id, username, meta: { backend_insta_page_id } } }
+   */
+  private async onInstaVerificationResult(payload: any): Promise<void> {
+    const backendPageId = payload?.account?.meta?.backend_insta_page_id;
+    if (!backendPageId) {
+      this.logger.warn(`INSTA_VERIFICATION_RESULT missing meta.backend_insta_page_id`);
+      return;
+    }
+
+    let pageId: bigint;
+    try { pageId = BigInt(backendPageId); } catch {
+      this.logger.warn(`INSTA_VERIFICATION_RESULT unparseable backend_insta_page_id=${backendPageId}`);
+      return;
+    }
+
+    const page = await this.prisma.insta_pages.findUnique({ where: { id: pageId } });
+    if (!page) {
+      this.logger.warn(`INSTA_VERIFICATION_RESULT for missing insta_page id=${pageId}`);
+      return;
+    }
+
+    const mongoId = payload?.account?.id ? String(payload.account.id) : null;
+    const now = new Date();
+
+    if (payload.status === 'VERIFIED') {
+      await this.prisma.insta_pages.update({
+        where: { id: page.id },
+        data: { status: 'ACTIVE', service_account_id: mongoId, updated_at: now },
+      });
+      this.logger.log(`insta_page ${page.id} verified — ACTIVE, service_account_id=${mongoId}`);
+    } else {
+      const code = typeof payload.status === 'string' ? payload.status : 'VERIFICATION_FAILED';
+      await this.prisma.insta_pages.update({
+        where: { id: page.id },
+        data: { status: 'FAILED', fail_reason: code, updated_at: now },
+      });
+      this.logger.warn(`insta_page ${page.id} verification FAILED — ${code}`);
+    }
+
+    this.chatGateway.emitToWorkspace(page.workspace_id, 'instagram.page_updated', {
+      id: page.id.toString(),
+      status: payload.status === 'VERIFIED' ? 'ACTIVE' : 'FAILED',
+      service_account_id: mongoId,
+    });
+  }
+
+  /**
+   * Inbound Instagram message from instagram-master (already media-processed).
+   * Payload: { account: { id, meta: { backend_insta_page_id } }, object: messaging }
+   */
+  private async onInstaInboundMessage(payload: any): Promise<void> {
+    const backendPageId = payload?.account?.meta?.backend_insta_page_id;
+    const messaging = payload?.object;
+    if (!backendPageId || !messaging) {
+      this.logger.warn(`INSTA_INBOUND_MESSAGE missing backend_insta_page_id or object`);
+      return;
+    }
+
+    let pageId: bigint;
+    try { pageId = BigInt(backendPageId); } catch {
+      this.logger.warn(`INSTA_INBOUND_MESSAGE unparseable backend_insta_page_id=${backendPageId}`);
+      return;
+    }
+
+    const page = await this.prisma.insta_pages.findUnique({ where: { id: pageId } });
+    if (!page) { this.logger.warn(`INSTA_INBOUND_MESSAGE no insta_page id=${pageId}`); return; }
+
+    const senderId: string = messaging.sender?.id;
+    if (!senderId) { this.logger.warn(`INSTA_INBOUND_MESSAGE missing sender.id`); return; }
+
+    // Skip echo messages
+    if (messaging.message?.is_echo) return;
+
+    const now = new Date();
+    const msgObj = messaging.message ?? {};
+    const mid: string | null = msgObj.mid ?? null;
+    const text: string | null = msgObj.text ?? null;
+    const msgType = msgObj.attachments?.length ? String(msgObj.attachments[0]?.type ?? 'attachment') : 'text';
+    const attachmentsData = msgObj.attachments?.length ? JSON.stringify(msgObj.attachments) : null;
+
+    // Resolve or create contact
+    const contact = await this.resolveInstaContact(page.workspace_id, senderId, messaging.sender?.name ?? null);
+
+    // Resolve or create insta_chat
+    let chat = await this.prisma.insta_chats.findFirst({
+      where: { insta_page_id: page.id, sender_id: senderId },
+    });
+    if (!chat) {
+      chat = await this.prisma.insta_chats.create({
+        data: {
+          insta_page_id: page.id,
+          user_id: page.user_id,
+          contact_id: contact.id,
+          sender_id: senderId,
+          name: contact.full_name ?? null,
+          recipient_id: messaging.recipient?.id ?? page.ig_user_id ?? '',
+          last_interacted_at: now,
+          last_client_interaction: now,
+          input_attempts: 0n,
+          created_at: now,
+          updated_at: now,
+        },
+      });
+    } else {
+      await this.prisma.insta_chats.update({
+        where: { id: chat.id },
+        data: { last_interacted_at: now, last_client_interaction: now, updated_at: now,
+                ...(contact.id ? { contact_id: contact.id } : {}) },
+      });
+    }
+
+    // Save message
+    const message = await this.prisma.insta_messages.create({
+      data: {
+        insta_page_id: page.id,
+        insta_chat_id: chat.id,
+        type: msgType,
+        direction: 'IN',
+        text,
+        status: 'received',
+        mid,
+        payload: attachmentsData ?? JSON.stringify(messaging),
+        timestamp: messaging.timestamp ? String(messaging.timestamp) : null,
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    // Inbox row
+    const INSTA_CHAT_MODELABLE = 'App\\Models\\Instagram\\InstaChat';
+    const existingInbox = await this.prisma.inbox.findFirst({
+      where: { modelable_type: INSTA_CHAT_MODELABLE, modelable_id: chat.id },
+    });
+    let inboxRow: any;
+    if (!existingInbox) {
+      inboxRow = await this.prisma.inbox.create({
+        data: {
+          workspace_id: page.workspace_id,
+          user_id: null,
+          assigned_by: null,
+          type: 'INSTAGRAM',
+          status: 'UNASSIGNED',
+          is_read: 0,
+          is_assigned: 0,
+          snooze: new Date(0),
+          modelable_type: INSTA_CHAT_MODELABLE,
+          modelable_id: chat.id,
+          queued_at: now,
+          last_updated: now,
+          created_at: now,
+          updated_at: now,
+        },
+      });
+    } else {
+      inboxRow = await this.prisma.inbox.update({
+        where: { id: existingInbox.id },
+        data: {
+          is_read: 0,
+          last_updated: now,
+          updated_at: now,
+          status: existingInbox.status === 'COMPLETED' ? 'UNASSIGNED' : existingInbox.status,
+        },
+      });
+    }
+
+    // Broadcast
+    this.chatGateway.emitToWorkspace(page.workspace_id, 'new_message', {
+      inbox_id: inboxRow.id.toString(),
+      message: { text },
+    });
+    this.chatGateway.emitToWorkspace(page.workspace_id, 'instagram.message.inbound', {
+      page_id: page.id.toString(),
+      chat_id: chat.id.toString(),
+      contact_id: contact.id.toString(),
+      inbox_id: inboxRow.id.toString(),
+      message_id: message.id.toString(),
+      sender_id: senderId,
+      type: msgType,
+      text,
+      mid,
+    });
+
+    this.events.emit('message.inbound', {
+      workspaceId: page.workspace_id,
+      inboxId: inboxRow.id,
+      contactId: contact.id,
+      channel: 'instagram',
+      text,
+    });
+
+    this.logger.log(`INSTA inbound saved: chat=${chat.id} message=${message.id} from=${senderId}`);
+  }
+
+  /**
+   * INSTA_OUTBOUND_MESSAGE_STATUS — microservice result after sending via Meta API.
+   * Payload includes meta.backend_insta_message_id for correlation.
+   */
+  private async onInstaOutboundMessageStatus(payload: any): Promise<void> {
+    const backendMsgId = payload?.meta?.backend_insta_message_id;
+    if (!backendMsgId) {
+      this.logger.warn(`INSTA_OUTBOUND_MESSAGE_STATUS missing meta.backend_insta_message_id`);
+      return;
+    }
+
+    let msgId: bigint;
+    try { msgId = BigInt(backendMsgId); } catch { return; }
+
+    const msg = await this.prisma.insta_messages.findUnique({ where: { id: msgId } });
+    if (!msg) { this.logger.warn(`INSTA_OUTBOUND_MESSAGE_STATUS for missing message id=${msgId}`); return; }
+
+    const status = String(payload?.status ?? '').toLowerCase();
+    const mid = payload?.response?.message_id ?? null;
+    const now = new Date();
+
+    await this.prisma.insta_messages.update({
+      where: { id: msg.id },
+      data: {
+        status: status === 'sent' ? 'sent' : 'failed',
+        mid: mid ?? undefined,
+        updated_at: now,
+      },
+    });
+
+    const page = await this.prisma.insta_pages.findUnique({ where: { id: msg.insta_page_id } });
+    if (page) {
+      this.chatGateway.emitToWorkspace(page.workspace_id, 'message_status', {
+        insta_message_id: msg.id.toString(),
+        status: status === 'sent' ? 'sent' : 'failed',
+        mid: mid ?? null,
+      });
+    }
+    this.logger.log(`INSTA outbound message ${msg.id} → ${status} (mid=${mid ?? 'unknown'})`);
+  }
+
+  /**
+   * INSTA_ACCOUNT_DELETED — microservice confirmed deletion.
+   */
+  private async onInstaAccountDeleted(payload: any, event: string): Promise<void> {
+    const mongoId = payload?.account_id ?? payload?.id;
+    if (!mongoId) return;
+    const page = await this.prisma.insta_pages.findFirst({ where: { service_account_id: String(mongoId) } });
+    if (!page) return;
+
+    const newStatus = event === 'INSTA_ACCOUNT_DELETED' ? 'DELETED' : 'FAILED';
+    await this.prisma.insta_pages.update({
+      where: { id: page.id },
+      data: { status: newStatus as any, updated_at: new Date() },
+    });
+    this.chatGateway.emitToWorkspace(page.workspace_id, 'instagram.page_updated', {
+      id: page.id.toString(), status: newStatus,
+    });
+    this.logger.log(`insta_page ${page.id} → ${newStatus} (event=${event})`);
+  }
+
+  /**
+   * INSTA_COMMENT — incoming Instagram comment event.
+   */
+  private async onInstaComment(payload: any): Promise<void> {
+    const backendPageId = payload?.account?.meta?.backend_insta_page_id;
+    if (!backendPageId) return;
+
+    let pageId: bigint;
+    try { pageId = BigInt(backendPageId); } catch { return; }
+
+    const page = await this.prisma.insta_pages.findUnique({ where: { id: pageId } });
+    if (!page) return;
+
+    const change = payload?.object;
+    const senderId = change?.value?.from?.id ?? null;
+    if (!senderId) return;
+
+    const contact = await this.resolveInstaContact(page.workspace_id, senderId, null);
+    this.events.emit('message.ig_comment_reply', {
+      contactId: contact.id,
+      workspaceId: page.workspace_id,
+      postId: change?.value?.media?.id ?? change?.value?.media_id ?? null,
+      commentId: change?.value?.id ?? null,
+      text: change?.value?.text ?? null,
+    });
+  }
+
+  /**
+   * Find or create an EZCONN contact from an Instagram sender_id.
+   */
+  private async resolveInstaContact(workspaceId: bigint, igUserId: string, name: string | null) {
+    const INSTA_CHAT_MODELABLE = 'App\\Models\\Instagram\\InstaChat';
+    const CONTACT_MODELABLE = 'App\\Models\\Contact';
+    const WORKSPACE_MODELABLE = 'App\\Models\\Workspace';
+
+    // Try to find existing contact via user_accesses or insta_chats
+    const existingChat = await this.prisma.insta_chats.findFirst({
+      where: { sender_id: igUserId },
+      orderBy: { id: 'desc' },
+    });
+    if (existingChat?.contact_id) {
+      const c = await this.prisma.contacts.findUnique({ where: { id: existingChat.contact_id } });
+      if (c && !c.deleted_at) return c;
+    }
+
+    const now = new Date();
+    const fallbackName = name?.trim() || igUserId;
+    return this.prisma.contacts.create({
+      data: {
+        workspace_id: workspaceId,
+        first_name: name ? name.split(' ')[0] : null,
+        last_name: name && name.includes(' ') ? name.split(' ').slice(1).join(' ') : null,
+        full_name: fallbackName,
+        instagram_handler: igUserId,
+        source: 'INSTAGRAM',
+        status: 'ACTIVE',
+        created_at: now,
+        updated_at: now,
+      },
+    });
   }
 }
