@@ -9,7 +9,10 @@ import {
   UseGuards,
   Request,
   Param,
+  UseInterceptors,
+  UploadedFiles,
 } from '@nestjs/common';
+import { FilesInterceptor } from '@nestjs/platform-express';
 import { InboxService } from './inbox.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
 
@@ -75,13 +78,15 @@ export class InboxController {
   // ─── Send / react / seen ───────────────────────────────────────────
 
   @Post('send-message/:id')
+  @UseInterceptors(FilesInterceptor('files', 10))
   async sendMessage(
     @Param('id') id: string,
     @Body() body: any,
+    @UploadedFiles() files: Express.Multer.File[],
     @Request() req: any,
   ) {
     const userId = BigInt(req.user.sub || 1);
-    return this.service.sendMessage(BigInt(id), body, userId);
+    return this.service.sendMessage(BigInt(id), body, userId, files);
   }
 
   @Post('seen/:id')

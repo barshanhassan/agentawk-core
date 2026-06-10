@@ -70,6 +70,12 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       case 'INSTA_OUTBOUND_MESSAGE_STATUS':
         await this.onInstaOutboundMessageStatus(envelope.payload);
         return;
+      case 'INSTA_DELIVERY_STATUS':
+        await this.onInstaDeliveryStatus(envelope.payload);
+        return;
+      case 'INSTA_READ_STATUS':
+        await this.onInstaReadStatus(envelope.payload);
+        return;
       case 'INSTA_ACCOUNT_DELETED':
       case 'INSTA_ACCOUNT_DELETION_FAILED':
         await this.onInstaAccountDeleted(envelope.payload, event);
@@ -787,6 +793,9 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     // Skip echo messages
     if (messaging.message?.is_echo) return;
 
+    // Delivery and read receipts are handled by onInstaDeliveryStatus / onInstaReadStatus
+    if (messaging.delivery || messaging.read) return;
+
     const now = new Date();
     const msgObj = messaging.message ?? {};
     const mid: string | null = msgObj.mid ?? null;
@@ -794,8 +803,59 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     const msgType = msgObj.attachments?.length ? String(msgObj.attachments[0]?.type ?? 'attachment') : 'text';
     const attachmentsData = msgObj.attachments?.length ? JSON.stringify(msgObj.attachments) : null;
 
+    // Instagram webhooks never include sender name — fetch from Graph API
+    // Mirrors replyagent InstagramTrait::getInstaUserProfile($page, $sender_id)
+    let senderName: string | null = messaging.sender?.name ?? null;
+    if (!senderName && page.access_token) {
+      try {
+        const igVer = process.env.META_GRAPH_API_VERSION ?? 'v22.0';
+        const isFbPlatform = (page.platform ?? 'facebook') === 'facebook';
+        const profileApiBase = isFbPlatform ? 'https://graph.facebook.com' : 'https://graph.instagram.com';
+        const profileFields = isFbPlatform ? 'name' : 'name,username';
+        const profileRes = await fetch(
+          `${profileApiBase}/${igVer}/${senderId}?fields=${profileFields}&access_token=${page.access_token}`,
+        );
+        const profileJson = await profileRes.json();
+        this.logger.log(`IG sender profile fetch for ${senderId} (platform=${page.platform ?? 'facebook'}): ${JSON.stringify(profileJson)}`);
+        if (profileRes.ok && !profileJson.error) {
+          senderName = profileJson.name ?? profileJson.username ?? null;
+          this.logger.log(`IG sender profile for ${senderId}: name=${senderName}`);
+        } else {
+          this.logger.warn(`IG sender profile error for ${senderId}: ${JSON.stringify(profileJson?.error ?? profileJson)}`);
+        }
+      } catch (e: any) {
+        this.logger.warn(`Could not fetch IG sender profile for ${senderId}: ${e?.message}`);
+      }
+    }
+
     // Resolve or create contact
-    const contact = await this.resolveInstaContact(page.workspace_id, senderId, messaging.sender?.name ?? null);
+    const contact = await this.resolveInstaContact(page.workspace_id, senderId, senderName);
+
+    // Update contact with real name if current name is a fallback (null, sender ID, numeric, or "Unknown")
+    const needsNameUpdate = senderName && (
+      !contact.full_name ||
+      contact.full_name === senderId ||
+      contact.full_name === 'Unknown' ||
+      /^\d+$/.test(contact.full_name)
+    );
+    if (needsNameUpdate) {
+      const nameParts = senderName!.trim().split(' ');
+      await this.prisma.contacts.update({
+        where: { id: contact.id },
+        data: {
+          first_name: nameParts[0] ?? null,
+          last_name: nameParts.length > 1 ? nameParts.slice(1).join(' ') : null,
+          full_name: senderName,
+          updated_at: now,
+        },
+      });
+      // Also update insta_chats that reference this contact
+      await this.prisma.insta_chats.updateMany({
+        where: { contact_id: contact.id },
+        data: { name: senderName, updated_at: now },
+      });
+      contact.full_name = senderName!;
+    }
 
     // Resolve or create insta_chat
     let chat = await this.prisma.insta_chats.findFirst({
@@ -946,6 +1006,196 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       });
     }
     this.logger.log(`INSTA outbound message ${msg.id} → ${status} (mid=${mid ?? 'unknown'})`);
+  }
+
+  /**
+   * INSTA_DELIVERY_STATUS — Meta delivered our outgoing message to recipient.
+   */
+  private async onInstaDeliveryStatus(payload: any): Promise<void> {
+    const mids: string[] = payload?.object?.mids ?? [];
+    if (!mids.length) return;
+
+    const messages = await this.prisma.insta_messages.findMany({
+      where: { mid: { in: mids }, direction: 'OUTGOING' },
+    });
+    if (!messages.length) return;
+
+    const now = new Date();
+    await this.prisma.insta_messages.updateMany({
+      where: { mid: { in: mids }, direction: 'OUTGOING', status: { notIn: ['read', 'failed'] } },
+      data: { status: 'delivered', updated_at: now },
+    });
+
+    const pageCache = new Map<bigint, any>();
+    for (const msg of messages) {
+      let page = pageCache.get(msg.insta_page_id);
+      if (!page) {
+        page = await this.prisma.insta_pages.findUnique({ where: { id: msg.insta_page_id } });
+        if (page) pageCache.set(msg.insta_page_id, page);
+      }
+      if (page) {
+        this.chatGateway.emitToWorkspace(page.workspace_id, 'message_status', {
+          insta_message_id: msg.id.toString(),
+          status: 'delivered',
+          mid: msg.mid,
+        });
+      }
+    }
+    this.logger.log(`INSTA delivery: ${mids.length} message(s) → delivered`);
+  }
+
+  /**
+   * INSTA_READ_STATUS — recipient read our outgoing messages.
+   *
+   * Instagram now sends `read.mid` (specific message ID) rather than the older
+   * `read.watermark` (bulk timestamp). We handle both formats:
+   *   - mid present  → find that specific message + all earlier OUTGOING on same page → mark read
+   *   - watermark    → mark all OUTGOING messages created on/before that timestamp
+   *
+   * We also try to retroactively resolve the contact's real name if it is still
+   * a numeric fallback, since read receipts arrive with the sender_id.
+   */
+  private async onInstaReadStatus(payload: any): Promise<void> {
+    const mid: string | null = payload?.object?.mid ?? null;
+    const watermark: number = Number(payload?.object?.watermark ?? 0);
+    const senderId: string | null = payload?.object?.sender_id ?? null;
+
+    if (!mid && !watermark) {
+      this.logger.warn(`INSTA_READ_STATUS: no mid or watermark in payload — dropping`);
+      return;
+    }
+
+    let messages: any[] = [];
+    let pageForNameUpdate: any = null;
+
+    if (mid) {
+      // Newer Instagram format: a specific message was confirmed read.
+      const targetMsg = await this.prisma.insta_messages.findFirst({
+        where: { mid, direction: 'OUTGOING' },
+      });
+      if (!targetMsg) {
+        this.logger.warn(`INSTA_READ_STATUS: no OUTGOING message with mid=${mid}`);
+      } else {
+        messages = await this.prisma.insta_messages.findMany({
+          where: {
+            insta_page_id: targetMsg.insta_page_id,
+            direction: 'OUTGOING',
+            status: { notIn: ['read', 'failed'] },
+            created_at: { lte: targetMsg.created_at },
+          },
+        });
+        pageForNameUpdate = await this.prisma.insta_pages.findUnique({ where: { id: targetMsg.insta_page_id } });
+      }
+    } else {
+      // Older watermark-based format.
+      const backendPageId = payload?.account?.meta?.backend_insta_page_id;
+      let pageIdFilter: bigint | undefined;
+      if (backendPageId) {
+        try { pageIdFilter = BigInt(backendPageId); } catch { /* ignore */ }
+      }
+      const watermarkDate = new Date(watermark);
+      messages = await this.prisma.insta_messages.findMany({
+        where: {
+          direction: 'OUTGOING',
+          status: { notIn: ['read', 'failed'] },
+          created_at: { lte: watermarkDate },
+          ...(pageIdFilter ? { insta_page_id: pageIdFilter } : {}),
+        },
+      });
+      if (pageIdFilter) {
+        pageForNameUpdate = await this.prisma.insta_pages.findUnique({ where: { id: pageIdFilter } });
+      }
+    }
+
+    if (messages.length) {
+      const now = new Date();
+      await this.prisma.insta_messages.updateMany({
+        where: { id: { in: messages.map(m => m.id) } },
+        data: { status: 'read', updated_at: now },
+      });
+
+      const pageCache = new Map<bigint, any>();
+      for (const msg of messages) {
+        let page = pageCache.get(msg.insta_page_id);
+        if (!page) {
+          page = await this.prisma.insta_pages.findUnique({ where: { id: msg.insta_page_id } });
+          if (page) pageCache.set(msg.insta_page_id, page);
+        }
+        if (page) {
+          this.chatGateway.emitToWorkspace(page.workspace_id, 'message_status', {
+            insta_message_id: msg.id.toString(),
+            status: 'read',
+            mid: msg.mid,
+          });
+        }
+      }
+      this.logger.log(`INSTA read receipt: ${messages.length} message(s) → read (mid=${mid ?? 'n/a'} watermark=${watermark || 'n/a'})`);
+    }
+
+    // Opportunistically refresh the contact's display name if it is still a
+    // numeric sender-ID placeholder or "Unknown" — read receipts carry sender_id.
+    if (senderId && pageForNameUpdate) {
+      await this.tryUpdateInstaContactName(pageForNameUpdate, senderId);
+    }
+  }
+
+  /**
+   * Fetch the Instagram user's display name and update their contact row if the
+   * current name is still a fallback value (null / numeric sender-ID / "Unknown").
+   */
+  private async tryUpdateInstaContactName(page: any, senderId: string): Promise<void> {
+    const chat = await this.prisma.insta_chats.findFirst({
+      where: { sender_id: senderId, insta_page_id: page.id },
+    });
+    if (!chat?.contact_id) return;
+
+    const contact = await this.prisma.contacts.findUnique({ where: { id: chat.contact_id } });
+    if (!contact || contact.deleted_at) return;
+
+    const needsUpdate =
+      !contact.full_name ||
+      contact.full_name === senderId ||
+      contact.full_name === 'Unknown' ||
+      /^\d+$/.test(contact.full_name);
+    if (!needsUpdate) return;
+
+    if (!page.access_token) return;
+    try {
+      const igVer = process.env.META_GRAPH_API_VERSION ?? 'v22.0';
+      const isFbPlatform = (page.platform ?? 'facebook') === 'facebook';
+      const profileApiBase = isFbPlatform ? 'https://graph.facebook.com' : 'https://graph.instagram.com';
+      const profileFields = isFbPlatform ? 'name' : 'name,username';
+      const url = `${profileApiBase}/${igVer}/${senderId}?fields=${profileFields}&access_token=${page.access_token}`;
+      const profileRes = await fetch(url);
+      const profileJson = await profileRes.json();
+      this.logger.log(`IG profile for ${senderId} (platform=${page.platform ?? 'facebook'}): ${JSON.stringify(profileJson)}`);
+
+      if (profileRes.ok && !profileJson.error) {
+        const newName = profileJson.name ?? profileJson.username ?? null;
+        if (newName) {
+          const nameParts = String(newName).trim().split(' ');
+          const now = new Date();
+          await this.prisma.contacts.update({
+            where: { id: contact.id },
+            data: {
+              first_name: nameParts[0] ?? null,
+              last_name: nameParts.length > 1 ? nameParts.slice(1).join(' ') : null,
+              full_name: newName,
+              updated_at: now,
+            },
+          });
+          await this.prisma.insta_chats.updateMany({
+            where: { contact_id: contact.id },
+            data: { name: newName, updated_at: now },
+          });
+          this.logger.log(`Contact ${contact.id} name updated to "${newName}" (sender_id=${senderId})`);
+        }
+      } else {
+        this.logger.warn(`IG profile fetch for ${senderId} failed: ${JSON.stringify(profileJson?.error ?? profileJson)}`);
+      }
+    } catch (e: any) {
+      this.logger.warn(`IG profile fetch error for ${senderId}: ${e?.message}`);
+    }
   }
 
   /**

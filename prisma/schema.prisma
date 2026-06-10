@@ -2932,6 +2932,7 @@ model pipeline_steps {
   updated_at                                                                                 DateTime?                        @db.Timestamp(0)
   bg_color                                                                                   String                           @default("#eab308") @db.VarChar(10)
   txt_color                                                                                  String                           @default("#000000") @db.VarChar(10)
+  pipelines                                                                                  pipelines                        @relation(fields: [pl_id], references: [id])
   pipeline_opportunity_step_logs_pipeline_opportunity_step_logs_from_step_idTopipeline_steps pipeline_opportunity_step_logs[] @relation("pipeline_opportunity_step_logs_from_step_idTopipeline_steps")
   pipeline_opportunity_step_logs_pipeline_opportunity_step_logs_to_step_idTopipeline_steps   pipeline_opportunity_step_logs[] @relation("pipeline_opportunity_step_logs_to_step_idTopipeline_steps")
 
@@ -2949,6 +2950,7 @@ model pipelines {
   currency                       String                           @db.Char(5)
   created_at                     DateTime?                        @db.Timestamp(0)
   updated_at                     DateTime?                        @db.Timestamp(0)
+  pipeline_steps                 pipeline_steps[]
   pipeline_opportunity_step_logs pipeline_opportunity_step_logs[]
 
   @@index([user_id], map: "idx_pipelines_on_user_id")

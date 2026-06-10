@@ -10,6 +10,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ChatGateway } from './chat.gateway';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { RabbitMqService } from '../rabbitmq/rabbitmq.service';
+import { S3Service } from '../s3/s3.service';
+import OpenAI from 'openai';
 
 @Injectable()
 export class InboxService {
@@ -21,6 +23,7 @@ export class InboxService {
     private readonly eventEmitter: EventEmitter2,
     private readonly rabbit: RabbitMqService,
     private readonly config: ConfigService,
+    private readonly s3: S3Service,
   ) {}
 
   /**
@@ -104,9 +107,9 @@ export class InboxService {
 
     // Mode-based filtering
     if (mode === 'ASSIGNED') {
-      where.assigned_to = { not: null };
+      where.user_id = { not: null };
     } else if (mode === 'UNASSIGNED') {
-      where.assigned_to = null;
+      where.user_id = null;
     } else if (mode === 'FOLDER' && folder_id) {
       where.folder_id = BigInt(folder_id);
     }
@@ -114,15 +117,64 @@ export class InboxService {
       where.folder_id = BigInt(folder_id);
     }
 
-    // Specific agent assignment
+    // Specific agent assignment filter
     if (assigned_to) {
-      where.assigned_to = BigInt(assigned_to);
+      where.user_id = BigInt(assigned_to);
     }
 
-    // Search logic - search is tricky with polymorphic relations.
-    // For now, we filter after fetching or use available fields.
-    // Basic search on modelable_type or status if needed.
+    // Text search: find contacts matching the query, then restrict inbox to
+    // their chat rows. Runs two rounds of lookups but stays fully accurate
+    // for pagination (the WHERE clause is complete before findMany runs).
+    if (search?.trim()) {
+      const term = search.trim();
+      const matchingContacts = await this.prisma.contacts.findMany({
+        where: {
+          workspace_id: workspaceId,
+          deleted_at: null,
+          OR: [
+            { full_name: { contains: term } },
+            { first_name: { contains: term } },
+            { last_name: { contains: term } },
+          ],
+        },
+        select: { id: true },
+        take: 300,
+      });
+      const contactIds = matchingContacts.map((c) => c.id);
 
+      if (contactIds.length === 0) {
+        return { inbox: [], total: 0, page: parseInt(page), limit: take, pages: 0 };
+      }
+
+      const [waIds, tgIds, fbIds, igIds, wcIds, zapiIds] = await Promise.all([
+        this.prisma.wa_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+        this.prisma.telegram_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+        this.prisma.fb_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+        this.prisma.insta_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+        this.prisma.wc_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+        this.prisma.zapi_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+      ]);
+
+      const searchOrConditions: any[] = [];
+      if (waIds.length)   searchOrConditions.push({ modelable_type: { contains: 'WhatsappChat' }, modelable_id: { in: waIds.map((c) => c.id) } });
+      if (tgIds.length)   searchOrConditions.push({ modelable_type: { contains: 'TelegramChat' }, modelable_id: { in: tgIds.map((c) => c.id) } });
+      if (fbIds.length)   searchOrConditions.push({ modelable_type: { contains: 'FacebookChat' }, modelable_id: { in: fbIds.map((c) => c.id) } });
+      if (igIds.length)   searchOrConditions.push({ modelable_type: { contains: 'InstaChat' }, modelable_id: { in: igIds.map((c) => c.id) } });
+      if (wcIds.length)   searchOrConditions.push({ modelable_type: { contains: 'WcChat' }, modelable_id: { in: wcIds.map((c) => c.id) } });
+      if (zapiIds.length) searchOrConditions.push({ modelable_type: { contains: 'ZapiChat' }, modelable_id: { in: zapiIds.map((c) => c.id) } });
+
+      if (searchOrConditions.length === 0) {
+        return { inbox: [], total: 0, page: parseInt(page), limit: take, pages: 0 };
+      }
+
+      // Merge with any existing channel OR so both constraints apply together
+      if (where.OR) {
+        where.AND = [{ OR: where.OR }, { OR: searchOrConditions }];
+        delete where.OR;
+      } else {
+        where.OR = searchOrConditions;
+      }
+    }
 
     const [inboxes, total] = await Promise.all([
       this.prisma.inbox.findMany({
@@ -151,7 +203,7 @@ export class InboxService {
             chat = await this.prisma.telegram_chats.findUnique({ where: { id: mId } });
           } else if (mType?.includes('FacebookChat')) {
             chat = await this.prisma.fb_chats.findUnique({ where: { id: mId } });
-          } else if (mType?.includes('InstagramChat')) {
+          } else if (mType?.includes('InstaChat') || mType?.includes('InstagramChat')) {
             chat = await this.prisma.insta_chats.findUnique({ where: { id: mId } });
           } else if (mType?.includes('WebchatChat') || mType?.includes('WcChat')) {
             chat = await this.prisma.wc_chats.findUnique({ where: { id: mId } });
@@ -352,8 +404,15 @@ export class InboxService {
         chat = await this.prisma.wa_chats.findUnique({ where: { id: mId } });
       } else if (mType?.includes('TelegramChat')) {
         chat = await this.prisma.telegram_chats.findUnique({ where: { id: mId } });
+      } else if (mType?.includes('FacebookChat')) {
+        chat = await this.prisma.fb_chats.findUnique({ where: { id: mId } });
+      } else if (mType?.includes('InstagramChat') || mType?.includes('InstaChat')) {
+        chat = await this.prisma.insta_chats.findUnique({ where: { id: mId } });
+      } else if (mType?.includes('WebchatChat') || mType?.includes('WcChat')) {
+        chat = await this.prisma.wc_chats.findUnique({ where: { id: mId } });
+      } else if (mType?.includes('ZapiChat')) {
+        chat = await this.prisma.zapi_chats.findUnique({ where: { id: mId } });
       }
-      // ... Add others if needed
 
       if (chat?.contact_id) {
         enrichedItem.contacts = await this.prisma.contacts.findUnique({
@@ -417,15 +476,14 @@ export class InboxService {
       });
     }
 
-    // Enrich with Gallery Media
+    // Enrich with Gallery Media and parse inline files JSON
     const enrichedMessages = await Promise.all(
       messages.map(async (msg) => {
         const item = msg as any;
         if (msg.gallery_media_id) {
           try {
-            // Handle both BigInt and potential string IDs
-            const mediaId = typeof msg.gallery_media_id === 'string' 
-              ? BigInt(msg.gallery_media_id.split(',')[0]) // Take first if comma separated
+            const mediaId = typeof msg.gallery_media_id === 'string'
+              ? BigInt(msg.gallery_media_id.split(',')[0])
               : BigInt(msg.gallery_media_id);
 
             item.gallery_media = await this.prisma.media_gallery.findUnique({
@@ -434,6 +492,12 @@ export class InboxService {
           } catch (e) {
             this.logger.warn(`Failed to load gallery media for message ${msg.id}: ${e.message}`);
           }
+        }
+        // Parse inline files JSON stored by sendMessage (S3 uploads)
+        if (item.files && typeof item.files === 'string') {
+          try {
+            item.parsed_files = JSON.parse(item.files);
+          } catch {}
         }
         return item;
       })
@@ -448,7 +512,12 @@ export class InboxService {
   /**
    * Send message (Routes to respective social provider service)
    */
-  async sendMessage(inboxId: bigint, data: any, userId: bigint) {
+  async sendMessage(
+    inboxId: bigint,
+    data: any,
+    userId: bigint,
+    files?: Express.Multer.File[],
+  ) {
     const inbox = await this.prisma.inbox.findUnique({
       where: { id: inboxId },
     });
@@ -479,8 +548,27 @@ export class InboxService {
       `Processing outgoing message for inbox ${inboxId} (Type: ${type}, ID: ${modelableId}, mode=${composeMode}${replyToMessageId ? `, reply_to=${replyToMessageId}` : ''})`,
     );
 
-    if (!String(text).trim()) {
-      throw new BadRequestException('Message body is empty — provide message_text/text');
+    // Upload any attached files to S3 and build URL list for the message payload.
+    const uploadedFileUrls: { url: string; name: string; size: number; mime: string }[] = [];
+    if (files && files.length > 0) {
+      for (const file of files) {
+        const ext = file.originalname.split('.').pop() ?? 'bin';
+        const key = `inbox/${inboxId}/attachments/${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+        const s3Key = await this.s3.upload(file.buffer, key, file.mimetype);
+        if (s3Key) {
+          const signedUrl = await this.s3.getSignedUrl(s3Key, 3600 * 24 * 7);
+          uploadedFileUrls.push({
+            url: signedUrl ?? s3Key,
+            name: file.originalname,
+            size: file.size,
+            mime: file.mimetype,
+          });
+        }
+      }
+    }
+
+    if (!String(text).trim() && uploadedFileUrls.length === 0) {
+      throw new BadRequestException('Message body is empty — provide message_text/text or attach a file');
     }
 
     let savedMessage = null;
@@ -523,20 +611,25 @@ export class InboxService {
         );
 
         const sentAt = new Date();
+        const hasFiles = uploadedFileUrls.length > 0;
+        const fileType = hasFiles
+          ? (uploadedFileUrls[0].mime?.startsWith('image/') ? 'image'
+            : uploadedFileUrls[0].mime?.startsWith('audio/') ? 'audio'
+            : uploadedFileUrls[0].mime?.startsWith('video/') ? 'video'
+            : 'document')
+          : 'text';
+
         savedMessage = await this.prisma.wa_messages.create({
           data: {
             wa_chat_id: modelableId,
             wa_number_id: chat.wa_number_id,
             sender_id: userId,
-            text: text,
+            text: text || null,
             direction: 'OUTGOING',
-            // Note rows carry type='note'; the publish-to-Meta step below is
-            // skipped for them so the customer never receives this content.
-            type: isNote ? 'note' : 'text',
+            type: isNote ? 'note' : (hasFiles ? fileType : 'text'),
             mobile_number: chat.wa_id || '',
-            // Notes are finalised immediately; outbound real messages start
-            // pending and flip to sent/delivered via the consumer.
             status: isNote ? 'sent' : 'pending',
+            ...(hasFiles ? { files: JSON.stringify(uploadedFileUrls) } : {}),
             ...(replyToMessageId ? { replied_to_message_id: replyToMessageId as any } : {}),
             created_at: sentAt,
             updated_at: sentAt,
@@ -633,21 +726,65 @@ export class InboxService {
           });
         }
       } else if (type.includes('InstagramChat') || type.includes('InstaChat')) {
-        const chat = await this.prisma.insta_chats.findUnique({
-          where: { id: modelableId },
+        const chat = await this.prisma.insta_chats.findUnique({ where: { id: modelableId } });
+        if (!chat) throw new NotFoundException('Instagram chat not found');
+
+        const instaPage = await this.prisma.insta_pages.findUnique({ where: { id: chat.insta_page_id } });
+
+        const sentAt = new Date();
+        savedMessage = await this.prisma.insta_messages.create({
+          data: {
+            insta_chat_id: modelableId,
+            insta_page_id: chat.insta_page_id,
+            sender_id: userId,
+            text: text,
+            direction: 'OUTGOING',
+            type: isNote ? 'note' : 'text',
+            status: isNote ? 'sent' : 'pending',
+            created_at: sentAt,
+            updated_at: sentAt,
+          },
         });
-        if (chat) {
-          savedMessage = await this.prisma.insta_messages.create({
-            data: {
-              insta_chat_id: modelableId,
-              insta_page_id: chat.insta_page_id,
-              sender_id: userId,
-              text: text,
-              direction: 'OUTGOING',
-              type: 'text',
-              status: 'sent',
-            },
-          });
+
+        if (!isNote) {
+          if (!instaPage?.service_account_id) {
+            await this.prisma.insta_messages.update({
+              where: { id: savedMessage.id },
+              data: { status: 'failed', updated_at: new Date() },
+            });
+            throw new BadRequestException(
+              'Instagram account not linked to microservice. Please reconnect Instagram.',
+            );
+          }
+
+          const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
+          const igQueue = this.config.get<string>('RABBITMQ_INSTAGRAM_QUEUE') || 'instagram';
+          try {
+            await this.rabbit.publish(exchange, igQueue, {
+              event: 'INSTA_OUTBOUND_MESSAGE',
+              payload: {
+                accountId: instaPage.service_account_id,
+                context: {
+                  recipient: { id: chat.sender_id },
+                  message: { text },
+                },
+                meta: {
+                  backend_insta_message_id: savedMessage.id.toString(),
+                  backend_inbox_id: inboxId.toString(),
+                  workspace_id: instaPage.workspace_id.toString(),
+                },
+              },
+            });
+            this.logger.log(
+              `INSTA_OUTBOUND_MESSAGE published for insta_message_id=${savedMessage.id} inbox=${inboxId}`,
+            );
+          } catch (err: any) {
+            await this.prisma.insta_messages.update({
+              where: { id: savedMessage.id },
+              data: { status: 'failed', updated_at: new Date() },
+            });
+            throw new BadRequestException(`Could not queue Instagram message: ${err?.message ?? err}`);
+          }
         }
       } else if (type.includes('WebchatChat') || type.includes('WcChat')) {
         savedMessage = await this.prisma.wc_messages.create({
@@ -702,8 +839,6 @@ export class InboxService {
 
     const enrichedInbox = inbox as any;
     let contact: any = null;
-
-    // Fetch related chat and contact
     let chat: any = null;
     const mType = inbox.modelable_type;
     const mId = inbox.modelable_id;
@@ -713,25 +848,69 @@ export class InboxService {
         chat = await this.prisma.wa_chats.findUnique({ where: { id: mId } });
       } else if (mType?.includes('TelegramChat')) {
         chat = await this.prisma.telegram_chats.findUnique({ where: { id: mId } });
+      } else if (mType?.includes('FacebookChat')) {
+        chat = await this.prisma.fb_chats.findUnique({ where: { id: mId } });
+      } else if (mType?.includes('InstagramChat') || mType?.includes('InstaChat')) {
+        chat = await this.prisma.insta_chats.findUnique({ where: { id: mId } });
+      } else if (mType?.includes('WebchatChat') || mType?.includes('WcChat')) {
+        chat = await this.prisma.wc_chats.findUnique({ where: { id: mId } });
+      } else if (mType?.includes('ZapiChat')) {
+        chat = await this.prisma.zapi_chats.findUnique({ where: { id: mId } });
       }
 
       if (chat?.contact_id) {
         contact = await this.prisma.contacts.findUnique({
           where: { id: chat.contact_id },
-          // include: { tags: true } // check if tags relation exists
         });
-        
-        // If tags relation also doesn't exist, we'd need to fetch them manually too.
-        // Assuming tags might be in contact_tags table.
       }
     } catch (e) {}
 
     enrichedInbox.contacts = contact;
 
+    // Fetch contact's applied tags via tag_links
+    let contactTags: any[] = [];
+    if (contact?.id) {
+      try {
+        const tagLinks = await this.prisma.tag_links.findMany({
+          where: { linkable_type: 'App\\Models\\Contact', linkable_id: contact.id },
+        });
+        if (tagLinks.length > 0) {
+          const tagIds = tagLinks.map((tl) => tl.tag_id);
+          const tags = await this.prisma.tags.findMany({
+            where: { id: { in: tagIds } },
+            select: { id: true, name: true, bg_color: true, text_color: true },
+          });
+          contactTags = tags;
+        }
+      } catch (e) {}
+    }
+
+    // Fetch contact's custom field values
+    let customFields: any[] = [];
+    if (contact?.id) {
+      try {
+        const entities = await this.prisma.custom_field_entities.findMany({
+          where: { entity_type: 'CONTACT', entity_id: contact.id },
+          include: {
+            custom_fields: true,
+            custom_field_entity_values: true,
+          },
+        });
+        customFields = entities.map((e: any) => ({
+          id: e.custom_field_id,
+          label: e.custom_fields?.label,
+          slug: e.custom_fields?.slug,
+          value: e.custom_field_entity_values?.[0]?.value ?? null,
+        }));
+      } catch (e) {}
+    }
+
     return {
       inbox: enrichedInbox,
       contact: contact,
-      custom_fields: [], 
+      chat: chat,
+      tags: contactTags,
+      custom_fields: customFields,
     };
   }
 
@@ -857,7 +1036,7 @@ export class InboxService {
   ) {
     return this.prisma.inbox.updateMany({
       where: { id: { in: inboxIds }, workspace_id: workspaceId },
-      data: { assigned_to: assignedTo },
+      data: { user_id: assignedTo },
     });
   }
 
@@ -877,10 +1056,33 @@ export class InboxService {
     inboxId: bigint,
     status: string,
     workspaceId: bigint,
+    userId?: bigint,
   ) {
+    const now = new Date();
+    const updateData: any = { status, updated_at: now };
+
+    // Clear snooze sentinel when re-activating so the conversation
+    // reappears in the "All" view immediately.
+    if (status === 'ACTIVE') {
+      updateData.snooze = new Date(0);
+    }
+
+    // Track when a conversation enters the unassigned queue.
+    if (status === 'UNASSIGNED') {
+      updateData.queued_at = now;
+      updateData.user_id = null;
+      updateData.is_assigned = 0;
+    }
+
+    // Record who closed it and when.
+    if (status === 'COMPLETED') {
+      updateData.closed_at = now;
+      if (userId) updateData.closed_by = userId;
+    }
+
     const updated = await this.prisma.inbox.update({
       where: { id: inboxId, workspace_id: workspaceId },
-      data: { status },
+      data: updateData,
     });
 
     // When a conversation is marked done, fire the trigger event so any
@@ -1505,11 +1707,31 @@ export class InboxService {
     const text = String(body?.text ?? '').trim();
     const mode = String(body?.mode ?? 'correct').toLowerCase();
     if (!text) throw new BadRequestException('text required');
-    return {
-      success: true,
-      mode,
-      output: text, // TODO: bind to real LLM provider here.
+
+    const apiKey = this.config.get<string>('OPENAI_API_KEY');
+    if (!apiKey) {
+      // No key configured — return input unchanged so UI doesn't break
+      return { success: true, mode, output: text };
+    }
+
+    const prompts: Record<string, string> = {
+      correct: `Fix any grammar or spelling mistakes in the following message. Return only the corrected text, nothing else:\n\n${text}`,
+      expand: `Expand the following message to make it more detailed and informative. Return only the expanded text:\n\n${text}`,
+      shorten: `Make the following message shorter and more concise. Return only the shortened text:\n\n${text}`,
+      translate: `Translate the following message to English. If it is already in English, translate it to Spanish. Return only the translated text:\n\n${text}`,
     };
+
+    const prompt = prompts[mode] ?? prompts.correct;
+    const openai = new OpenAI({ apiKey });
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 1024,
+      temperature: 0.3,
+    });
+
+    const output = response.choices[0]?.message?.content?.trim() ?? text;
+    return { success: true, mode, output };
   }
 
   // ─── Destructive ───────────────────────────────────────────────────

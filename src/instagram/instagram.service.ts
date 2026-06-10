@@ -80,6 +80,11 @@ export class InstagramService {
           payload: this.buildVerifyPayload(saved, workspaceId),
         });
       }
+      if (data.platform === 'instagram' && data.access_token && (data.ig_user_id ?? existing.ig_user_id)) {
+        await this.subscribeInstaWebhook(data.ig_user_id ?? existing.ig_user_id, data.access_token).catch((e) =>
+          this.logger.warn(`Webhook subscription failed (non-fatal): ${e.message}`),
+        );
+      }
       return saved;
     }
 
@@ -110,7 +115,28 @@ export class InstagramService {
       payload: this.buildVerifyPayload(saved, workspaceId),
     });
 
+    // Subscribe per-account webhook for Instagram Business Login flow
+    if (data.platform === 'instagram' && data.access_token && data.ig_user_id) {
+      await this.subscribeInstaWebhook(data.ig_user_id, data.access_token).catch((e) =>
+        this.logger.warn(`Webhook subscription failed (non-fatal): ${e.message}`),
+      );
+    }
+
     return saved;
+  }
+
+  private async subscribeInstaWebhook(igUserId: string, accessToken: string): Promise<void> {
+    const igVer = process.env.META_GRAPH_API_VERSION ?? 'v22.0';
+    const fields = 'comments,live_comments,mentions,message_reactions,messages,messaging_optins,messaging_postbacks,messaging_referral';
+    const res = await fetch(
+      `https://graph.instagram.com/${igVer}/${igUserId}/subscribed_apps?subscribed_fields=${fields}&access_token=${accessToken}`,
+      { method: 'POST' },
+    );
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.error?.message ?? 'subscription failed');
+    }
+    this.logger.log(`Instagram webhook subscribed: ${JSON.stringify(data)}`);
   }
 
   private buildVerifyPayload(page: any, workspaceId: bigint) {
@@ -129,8 +155,8 @@ export class InstagramService {
 
   // ── Connect Instagram Business via OAuth code exchange ──────────────
   async connectBusiness(workspaceId: bigint, userId: bigint, code: string, redirectUri: string) {
-    const appId = process.env.META_APP_ID;
-    const appSecret = process.env.META_APP_SECRET;
+    const appId = process.env.META_IG_APP_ID ?? process.env.META_APP_ID;
+    const appSecret = process.env.META_IG_APP_SECRET ?? process.env.META_APP_SECRET;
     if (!appId || !appSecret) throw new BadRequestException('Meta app credentials not configured');
     if (!code) throw new BadRequestException('Authorization code required');
 
@@ -159,18 +185,47 @@ export class InstagramService {
       `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${appSecret}&access_token=${shortToken}`,
     );
     const longData = await longRes.json();
-    const longToken = longData.access_token ?? shortToken;
+    if (!longRes.ok || longData.error) {
+      this.logger.error(`Long-lived token exchange failed: ${JSON.stringify(longData?.error ?? longData)}`);
+      throw new BadRequestException(
+        `Instagram token exchange failed: ${longData?.error?.message ?? 'check META_IG_APP_SECRET in .env'}`,
+      );
+    }
+    const longToken = longData.access_token;
     const expiresIn: number = longData.expires_in ?? 0;
 
-    // 3. Fetch user profile
-    const userRes = await fetch(
-      `https://graph.instagram.com/me?fields=id,name,username,followers_count,follows_count,media_count,account_type&access_token=${longToken}`,
-    );
-    const user = await userRes.json();
+    // 3. Fetch user profile — Business Login API uses /{ig-user-id}, NOT /me
+    const igVer = process.env.META_GRAPH_API_VERSION ?? 'v22.0';
+    const igUidStr = String(igUserId);
+    let user: any = {};
+    // user_id = global Instagram Business ID (IGBID) used in webhooks entry[0].id
+    // id      = app-scoped user ID (ASID) — different per app, NOT used in webhooks
+    const profileUrlFull = `https://graph.instagram.com/${igVer}/${igUidStr}?fields=id,user_id,name,username,followers_count,follows_count,media_count,account_type&access_token=${longToken}`;
+    const profileUrlMin  = `https://graph.instagram.com/${igVer}/${igUidStr}?fields=id,user_id,name,username,media_count,account_type&access_token=${longToken}`;
+    const userRes = await fetch(profileUrlFull);
+    const userJson = await userRes.json();
+    if (userRes.ok && !userJson.error) {
+      user = userJson;
+    } else {
+      this.logger.warn(`IG profile full-fields failed during connect: ${JSON.stringify(userJson?.error ?? userJson)}`);
+      const minRes = await fetch(profileUrlMin);
+      const minJson = await minRes.json();
+      if (minRes.ok && !minJson.error) {
+        user = minJson;
+      } else {
+        this.logger.warn(`IG profile minimal-fields also failed during connect: ${JSON.stringify(minJson?.error ?? minJson)}`);
+        // Non-fatal — continue with empty profile, ig_user_id from token exchange is enough
+      }
+    }
+
+    // Prefer user_id (global IGBID) — this is what webhook entry[0].id uses
+    // Fall back to id (ASID) only if user_id not returned
+    const finalIgUserId = String(user.user_id ?? igUserId ?? user.id);
+    this.logger.log(`IG connect: ASID=${igUserId} IGBID(user_id)=${user.user_id} → storing ${finalIgUserId}`);
 
     return this.connectPage(workspaceId, userId, {
       access_token: longToken,
-      ig_user_id: String(igUserId ?? user.id),
+      ig_user_id: finalIgUserId,
       name: user.name ?? null,
       username: user.username ?? null,
       followers_count: user.followers_count ?? 0,
@@ -339,27 +394,80 @@ export class InstagramService {
     const page = await this.requirePage(workspaceId, pageId);
     const version = process.env.META_GRAPH_API_VERSION ?? 'v22.0';
 
-    const statsUrl =
-      page.platform === 'instagram'
-        ? `https://graph.instagram.com/me?fields=id,name,username,followers_count,follows_count,media_count&access_token=${page.access_token}`
-        : `https://graph.facebook.com/${version}/${page.ig_user_id}?fields=id,name,username,followers_count,follows_count,media_count&access_token=${page.access_token}`;
+    let statsData: any = null;
 
-    const res = await fetch(statsUrl);
-    if (!res.ok) throw new BadRequestException('Failed to sync account stats from Meta API');
-    const data = await res.json();
-    if (data.error) throw new BadRequestException(`Meta API: ${data.error.message}`);
+    if (page.platform === 'instagram') {
+      // graph.instagram.com Business Login API uses /{ig-user-id}, NOT /me
+      const igVer = version;
+      const igUid = page.ig_user_id;
+      if (!igUid) throw new BadRequestException('ig_user_id missing on page record — cannot sync');
 
-    return this.prisma.insta_pages.update({
+      const fullUrl = `https://graph.instagram.com/${igVer}/${igUid}?fields=id,name,username,followers_count,follows_count,media_count&access_token=${page.access_token}`;
+      const fullRes = await fetch(fullUrl);
+      const fullJson = await fullRes.json();
+
+      if (fullRes.ok && !fullJson.error) {
+        statsData = fullJson;
+        this.logger.log(`IG sync raw stats: ${JSON.stringify(fullJson)}`);
+        // Reels are NOT counted in media_count — try /media then /reels as fallback
+        if ((statsData.media_count ?? 0) === 0) {
+          const mediaEdgeUrl = `https://graph.instagram.com/${igVer}/${igUid}/media?fields=id&limit=100&access_token=${page.access_token}`;
+          const mediaEdgeRes = await fetch(mediaEdgeUrl);
+          const mediaEdgeJson = await mediaEdgeRes.json();
+          if (mediaEdgeRes.ok && !mediaEdgeJson.error && Array.isArray(mediaEdgeJson.data) && mediaEdgeJson.data.length > 0) {
+            statsData.media_count = mediaEdgeJson.data.length;
+            this.logger.log(`media_count=0 → /media edge returned ${statsData.media_count}`);
+          }
+        }
+      } else {
+        this.logger.warn(
+          `IG sync full-fields failed for page ${page.id}: ${JSON.stringify(fullJson?.error ?? fullJson)}`,
+        );
+        // Retry without followers_count/follows_count (may be unavailable for some Creator accounts)
+        const minUrl = `https://graph.instagram.com/${igVer}/${igUid}?fields=id,name,username,media_count&access_token=${page.access_token}`;
+        const minRes = await fetch(minUrl);
+        const minJson = await minRes.json();
+        if (!minRes.ok || minJson.error) {
+          this.logger.error(
+            `IG sync minimal-fields also failed for page ${page.id}: ${JSON.stringify(minJson?.error ?? minJson)}`,
+          );
+          throw new BadRequestException(
+            `Meta API: ${minJson?.error?.message ?? fullJson?.error?.message ?? 'sync failed'}`,
+          );
+        }
+        statsData = minJson;
+      }
+    } else {
+      const fbUrl = `https://graph.facebook.com/${version}/${page.ig_user_id}?fields=id,name,username,followers_count,follows_count,media_count&access_token=${page.access_token}`;
+      const fbRes = await fetch(fbUrl);
+      const fbJson = await fbRes.json();
+      if (!fbRes.ok || fbJson.error) {
+        this.logger.error(
+          `IG(FB) sync failed for page ${page.id}: ${JSON.stringify(fbJson?.error ?? fbJson)}`,
+        );
+        throw new BadRequestException(`Meta API: ${fbJson?.error?.message ?? 'sync failed'}`);
+      }
+      statsData = fbJson;
+    }
+
+    const updated = await this.prisma.insta_pages.update({
       where: { id: page.id },
       data: {
-        name: data.name ?? page.name,
-        username: data.username ?? page.username,
-        followers_count: data.followers_count ?? page.followers_count,
-        follows_count: data.follows_count ?? page.follows_count,
-        media_count: data.media_count != null ? BigInt(data.media_count) : page.media_count,
+        name: statsData.name ?? page.name,
+        username: statsData.username ?? page.username,
+        followers_count: statsData.followers_count ?? page.followers_count,
+        follows_count: statsData.follows_count ?? page.follows_count,
+        media_count: statsData.media_count != null ? BigInt(statsData.media_count) : page.media_count,
         updated_at: new Date(),
       },
     });
+    // Re-subscribe per-account webhook on every sync — corrects any stale/broken subscriptions
+    if (page.platform === 'instagram' && page.ig_user_id && page.access_token) {
+      this.subscribeInstaWebhook(page.ig_user_id, page.access_token).catch((e) =>
+        this.logger.warn(`Webhook re-subscription on sync failed (non-fatal): ${e.message}`),
+      );
+    }
+    return updated;
   }
 
   // ── Toggle AI feeder ─────────────────────────────────────────────────
