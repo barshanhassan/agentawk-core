@@ -1294,6 +1294,7 @@ export class InboxService {
     userId?: bigint,
   ) {
     const now = new Date();
+    status = typeof status === 'string' ? status.toUpperCase() : status;
     const updateData: any = { status, updated_at: now };
 
     // Clear snooze sentinel when re-activating so the conversation
@@ -2184,7 +2185,8 @@ export class InboxService {
         return { success: true };
       }
       case 'set_status': {
-        return this.updateInboxStatus(inboxId, body.status, workspaceId);
+        const normalizedStatus = typeof body.status === 'string' ? body.status.toUpperCase() : body.status;
+        return this.updateInboxStatus(inboxId, normalizedStatus, workspaceId);
       }
       case 'set_folder': {
         await this.prisma.inbox.update({
