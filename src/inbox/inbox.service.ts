@@ -12,6 +12,12 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import { RabbitMqService } from '../rabbitmq/rabbitmq.service';
 import { S3Service } from '../s3/s3.service';
 import OpenAI from 'openai';
+import { Readable, PassThrough } from 'stream';
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const ffmpeg = require('fluent-ffmpeg');
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const ffmpegPath: string = require('ffmpeg-static');
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 @Injectable()
 export class InboxService {
@@ -25,6 +31,45 @@ export class InboxService {
     private readonly config: ConfigService,
     private readonly s3: S3Service,
   ) {}
+
+  // Convert WebM/Opus (browser MediaRecorder default) to M4A (AAC in MP4 container).
+  // Instagram Platform API supports 'audio' type outbound for AAC/M4A format.
+  private async convertWebmToM4a(buffer: Buffer): Promise<Buffer> {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const os = require('os');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const path = require('path');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs');
+    const ts = Date.now();
+    const tmpIn = path.join(os.tmpdir(), `ig_audio_in_${ts}.webm`);
+    const tmpOut = path.join(os.tmpdir(), `ig_audio_out_${ts}.m4a`);
+    fs.writeFileSync(tmpIn, buffer);
+    return new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(tmpIn)
+        .noVideo()
+        .audioCodec('aac')
+        .audioBitrate('128k')
+        .output(tmpOut)
+        .on('end', () => {
+          try {
+            const data = fs.readFileSync(tmpOut);
+            resolve(data);
+          } catch (e) { reject(e); }
+          finally {
+            try { fs.unlinkSync(tmpIn); } catch {}
+            try { fs.unlinkSync(tmpOut); } catch {}
+          }
+        })
+        .on('error', (err) => {
+          try { fs.unlinkSync(tmpIn); } catch {}
+          try { fs.unlinkSync(tmpOut); } catch {}
+          reject(err);
+        })
+        .run();
+    });
+  }
 
   /**
    * Unified Inbox Listing with advanced filtering logic matching Laravel parity.
@@ -186,107 +231,176 @@ export class InboxService {
       this.prisma.inbox.count({ where }),
     ]);
 
-    // Manually join related data (Contacts, Users, Folders)
-    const enrichedInboxes = await Promise.all(
-      inboxes.map(async (inbox) => {
-        const item = inbox as any;
-        
-        // Fetch related chat based on polymorphic type
-        let chat: any = null;
-        const mType = inbox.modelable_type;
-        const mId = inbox.modelable_id;
+    // Dedup by modelable_id: if same chat has multiple inbox rows, keep most-recently-updated.
+    const chatSeen = new Map<string, typeof inboxes[0]>();
+    for (const inv of inboxes) {
+      const key = `${inv.modelable_type}:${String(inv.modelable_id)}`;
+      const existing = chatSeen.get(key);
+      if (!existing || (inv.updated_at && (!existing.updated_at || inv.updated_at > existing.updated_at))) {
+        chatSeen.set(key, inv);
+      }
+    }
+    const dedupedInboxes = Array.from(chatSeen.values());
 
-        try {
-          if (mType?.includes('WhatsappChat')) {
-            chat = await this.prisma.wa_chats.findUnique({ where: { id: mId } });
-          } else if (mType?.includes('TelegramChat')) {
-            chat = await this.prisma.telegram_chats.findUnique({ where: { id: mId } });
-          } else if (mType?.includes('FacebookChat')) {
-            chat = await this.prisma.fb_chats.findUnique({ where: { id: mId } });
-          } else if (mType?.includes('InstaChat') || mType?.includes('InstagramChat')) {
-            chat = await this.prisma.insta_chats.findUnique({ where: { id: mId } });
-          } else if (mType?.includes('WebchatChat') || mType?.includes('WcChat')) {
-            chat = await this.prisma.wc_chats.findUnique({ where: { id: mId } });
+    // ─── Batch-load all related data (replaces per-item N+1 queries) ───────────
+    const waIds: bigint[] = [], tgIds: bigint[] = [], fbIds: bigint[] = [],
+          igIds: bigint[] = [], wcIds: bigint[] = [];
+    for (const inv of dedupedInboxes) {
+      const t = (inv.modelable_type ?? '').toLowerCase();
+      if (t.includes('whatsapp')) waIds.push(inv.modelable_id);
+      else if (t.includes('telegram')) tgIds.push(inv.modelable_id);
+      else if (t.includes('facebook') || t.includes('fbchat')) fbIds.push(inv.modelable_id);
+      else if (t.includes('insta')) igIds.push(inv.modelable_id);
+      else if (t.includes('wc') || t.includes('webchat')) wcIds.push(inv.modelable_id);
+    }
+
+    const [waChats, tgChats, fbChats, igChats, wcChats] = await Promise.all([
+      waIds.length ? this.prisma.wa_chats.findMany({ where: { id: { in: waIds } } }) : Promise.resolve([]),
+      tgIds.length ? this.prisma.telegram_chats.findMany({ where: { id: { in: tgIds } } }) : Promise.resolve([]),
+      fbIds.length ? this.prisma.fb_chats.findMany({ where: { id: { in: fbIds } } }) : Promise.resolve([]),
+      igIds.length ? this.prisma.insta_chats.findMany({ where: { id: { in: igIds } } }) : Promise.resolve([]),
+      wcIds.length ? this.prisma.wc_chats.findMany({ where: { id: { in: wcIds } } }) : Promise.resolve([]),
+    ]);
+
+    const waMap = new Map((waChats as any[]).map((c: any) => [String(c.id), c]));
+    const tgMap = new Map((tgChats as any[]).map((c: any) => [String(c.id), c]));
+    const fbMap = new Map((fbChats as any[]).map((c: any) => [String(c.id), c]));
+    const igMap = new Map((igChats as any[]).map((c: any) => [String(c.id), c]));
+    const wcMap = new Map((wcChats as any[]).map((c: any) => [String(c.id), c]));
+
+    // Collect contact IDs from all chats
+    const allContactIds = new Set<bigint>();
+    for (const c of [...waChats, ...tgChats, ...fbChats, ...igChats, ...wcChats] as any[]) {
+      if (c.contact_id) allContactIds.add(c.contact_id);
+    }
+    const contactIdArr = Array.from(allContactIds);
+
+    // Which channel types appear in this page (for mobile-number lookup)
+    const neededChannels = new Set<string>();
+    for (const inv of dedupedInboxes) {
+      const t = (inv.modelable_type ?? '').toLowerCase();
+      if (t.includes('whatsapp')) neededChannels.add('whatsapp');
+      else if (t.includes('telegram')) neededChannels.add('telegram');
+      else if (t.includes('insta')) neededChannels.add('instagram');
+    }
+
+    const assignedUserIds = (dedupedInboxes as any[]).filter((i: any) => i.user_id).map((i: any) => i.user_id as bigint);
+    const assignedFolderIds = (dedupedInboxes as any[]).filter((i: any) => i.folder_id).map((i: any) => i.folder_id as bigint);
+
+    const chatablePairs = (dedupedInboxes as any[])
+      .filter((inv: any) => inv.modelable_type && inv.modelable_id)
+      .map((inv: any) => ({ chatable_type: inv.modelable_type as string, chatable_id: inv.modelable_id as bigint }));
+
+    const [allContacts, allUsers, allFolders, allLastMsgs, allMobiles] = await Promise.all([
+      contactIdArr.length
+        ? this.prisma.contacts.findMany({ where: { id: { in: contactIdArr } } })
+        : Promise.resolve([]),
+      assignedUserIds.length
+        ? this.prisma.users.findMany({ where: { id: { in: assignedUserIds } } })
+        : Promise.resolve([]),
+      assignedFolderIds.length
+        ? this.prisma.inbox_folders.findMany({ where: { id: { in: assignedFolderIds } } })
+        : Promise.resolve([]),
+      chatablePairs.length
+        ? this.prisma.contact_last_messages.findMany({
+            where: { OR: chatablePairs },
+            orderBy: { created_at: 'desc' },
+            select: { message: true, message_type: true, created_at: true, chatable_type: true, chatable_id: true },
+          })
+        : Promise.resolve([]),
+      contactIdArr.length && neededChannels.size
+        ? this.prisma.contact_mobiles.findMany({
+            where: {
+              modelable_type: 'App\\Models\\Contact',
+              modelable_id: { in: contactIdArr },
+              ownership_type: 'App\\Models\\Workspace',
+              ownership_id: workspaceId,
+              type: { in: Array.from(neededChannels) },
+            },
+            orderBy: { is_primary: 'desc' },
+          })
+        : Promise.resolve([]),
+    ]);
+
+    const contactMap = new Map((allContacts as any[]).map((c: any) => [String(c.id), c]));
+    const userMap    = new Map((allUsers    as any[]).map((u: any) => [String(u.id), u]));
+    const folderMap  = new Map((allFolders  as any[]).map((f: any) => [String(f.id), f]));
+
+    // last message per (chatable_type, chatable_id) — already ordered DESC, first = most recent
+    const lastMsgMap = new Map<string, any>();
+    for (const msg of allLastMsgs as any[]) {
+      const k = `${msg.chatable_type}:${String(msg.chatable_id)}`;
+      if (!lastMsgMap.has(k)) lastMsgMap.set(k, msg);
+    }
+
+    // mobile per "contactId:channelType" — primary first due to orderBy
+    const mobileMap = new Map<string, string>();
+    for (const m of allMobiles as any[]) {
+      const k = `${String(m.modelable_id)}:${m.type}`;
+      if (!mobileMap.has(k)) mobileMap.set(k, m.full_mobile_number ?? '');
+    }
+
+    // ─── Enrich synchronously — zero extra DB queries ───────────────────────────
+    const enrichedInboxes = (dedupedInboxes as any[]).map((inbox: any) => {
+      const item = { ...inbox } as any;
+      const mType = inbox.modelable_type ?? '';
+      const mId   = String(inbox.modelable_id);
+      const t     = mType.toLowerCase();
+
+      let chat: any = null;
+      let channelType: string | null = null;
+      if      (t.includes('whatsapp'))                    { chat = waMap.get(mId); channelType = 'whatsapp'; }
+      else if (t.includes('telegram'))                    { chat = tgMap.get(mId); channelType = 'telegram'; }
+      else if (t.includes('facebook') || t.includes('fb')) { chat = fbMap.get(mId); }
+      else if (t.includes('insta'))                       { chat = igMap.get(mId); channelType = 'instagram'; }
+      else if (t.includes('wc') || t.includes('webchat')) { chat = wcMap.get(mId); }
+
+      if (chat?.contact_id) {
+        const contact = contactMap.get(String(chat.contact_id));
+        if (contact) {
+          item.contacts = { ...contact } as any;
+          if (channelType) {
+            const mobile = mobileMap.get(`${String(chat.contact_id)}:${channelType}`);
+            if (mobile) item.contacts.mobile_number = mobile;
           }
-
-          // Fetch contact if we found a chat with contact_id
-          if (chat?.contact_id) {
-            item.contacts = await this.prisma.contacts.findUnique({
-              where: { id: chat.contact_id },
-            });
-
-            // Pull the contact's mobile number so the inbox card has something to
-            // show next to the name (Conversation.phoneNumber in the frontend).
-            // Workspace-scoped + matching the chat's channel (e.g. type='whatsapp').
-            const channelType = mType?.toLowerCase().includes('whatsapp')
-              ? 'whatsapp'
-              : mType?.toLowerCase().includes('telegram')
-              ? 'telegram'
-              : mType?.toLowerCase().includes('insta')
-              ? 'instagram'
-              : null;
-            if (channelType) {
-              const mobile = await this.prisma.contact_mobiles.findFirst({
-                where: {
-                  modelable_type: 'App\\Models\\Contact',
-                  modelable_id: chat.contact_id,
-                  ownership_type: 'App\\Models\\Workspace',
-                  ownership_id: inbox.workspace_id,
-                  type: channelType,
-                },
-                orderBy: { is_primary: 'desc' },
-              });
-              if (mobile && item.contacts) {
-                item.contacts.mobile_number = mobile.full_mobile_number ?? null;
-              }
-            }
-          }
-
-          // Last message snippet for the inbox card. contact_last_messages is
-          // already keyed by (chatable_type, chatable_id) so a single query
-          // gives us the most recent line of the conversation.
-          if (mType && mId) {
-            const lastMsg = await this.prisma.contact_last_messages.findFirst({
-              where: { chatable_type: mType, chatable_id: mId },
-              orderBy: { created_at: 'desc' },
-              select: { message: true, message_type: true, created_at: true },
-            });
-            item.last_message_text = lastMsg?.message ?? null;
-            item.last_message_type = lastMsg?.message_type ?? null;
-          }
-
-          // Unread count proxy: inbox.is_read is 0 when an inbound message has
-          // landed since the user last opened the thread. A precise per-message
-          // read tracker ships in a later phase.
-          item.unread_count = inbox.is_read === 0 ? 1 : 0;
-        } catch (err) {
-          console.error(`Error fetching polymorphic data for inbox ${inbox.id}:`, err.message);
         }
+      }
 
-        // Fetch user if assigned
-        if (inbox.user_id) {
-          item.users = await this.prisma.users.findUnique({
-            where: { id: inbox.user_id },
-          });
+      const lastMsg = lastMsgMap.get(`${mType}:${String(inbox.modelable_id)}`);
+      item.last_message_text = lastMsg?.message ?? null;
+      item.last_message_type = lastMsg?.message_type ?? null;
+      item.unread_count = inbox.is_read === 0 ? 1 : 0;
+
+      if (inbox.user_id)   item.users          = userMap.get(String(inbox.user_id))     ?? null;
+      if (inbox.folder_id) item.inbox_folders  = folderMap.get(String(inbox.folder_id)) ?? null;
+
+      return item;
+    });
+
+    // ─── Secondary dedup for Instagram ─────────────────────────────────────────
+    // Legacy race-condition may have created multiple insta_chat rows per customer.
+    // Group by contact_id; keep the most-recently-updated inbox per contact.
+    const igContactSeen = new Map<string, any>();
+    const nonIgResult: any[] = [];
+    for (const item of enrichedInboxes) {
+      const t = (item.modelable_type ?? '').toLowerCase();
+      if (t.includes('insta')) {
+        const cKey = item.contacts?.id ? `ig:${String(item.contacts.id)}` : null;
+        if (!cKey) { nonIgResult.push(item); continue; }
+        const existing = igContactSeen.get(cKey);
+        if (!existing || (item.updated_at && (!existing.updated_at || item.updated_at > existing.updated_at))) {
+          igContactSeen.set(cKey, item);
         }
-
-        // Fetch folder if assigned
-        if (inbox.folder_id) {
-          item.inbox_folders = await this.prisma.inbox_folders.findUnique({
-            where: { id: inbox.folder_id },
-          });
-        }
-
-        return item;
-      }),
+      } else {
+        nonIgResult.push(item);
+      }
+    }
+    const finalInboxes = [...nonIgResult, ...igContactSeen.values()].sort(
+      (a: any, b: any) => (b.updated_at?.getTime?.() ?? 0) - (a.updated_at?.getTime?.() ?? 0),
     );
 
-
-    console.log(`Found ${inboxes.length} records for workspace ${workspaceId.toString()}`);
-
-
     return {
-      inbox: enrichedInboxes,
+      inbox: finalInboxes,
       total,
       page: parseInt(page),
       limit: take,
@@ -499,9 +613,59 @@ export class InboxService {
             item.parsed_files = JSON.parse(item.files);
           } catch {}
         }
+        // Instagram inbound/echo: payload has [{type, media:{fileUrl(direct S3 URL),...}}]
+        // Bucket is private — generate signed URLs so the browser can display them.
+        if (!item.parsed_files && item.payload && typeof item.payload === 'string' && item.insta_chat_id) {
+          try {
+            const attachments = JSON.parse(item.payload);
+            if (Array.isArray(attachments) && attachments.length && attachments[0]?.media?.fileUrl) {
+              item.parsed_files = await Promise.all(attachments.map(async (a: any) => {
+                const rawUrl: string = a.media.fileUrl ?? '';
+                let url = rawUrl;
+                if (rawUrl.includes('.amazonaws.com/')) {
+                  const s3Key = rawUrl.split('.amazonaws.com/')[1];
+                  url = (await this.s3.getSignedUrl(s3Key, 3600 * 24 * 7)) ?? rawUrl;
+                }
+                return {
+                  url,
+                  name: a.media.originalName ?? a.media.fileName ?? 'attachment',
+                  size: Number(a.media.fileSize ?? 0),
+                  mime: a.media.mimeType ?? a.media.contentType ?? 'application/octet-stream',
+                };
+              }));
+            }
+          } catch {}
+        }
+        // Instagram outbound from Ezconn: data has [{url(signed S3 URL), name, size, mime}]
+        if (!item.parsed_files && item.data && typeof item.data === 'string' && item.insta_chat_id) {
+          try {
+            const dataFiles = JSON.parse(item.data);
+            if (Array.isArray(dataFiles) && dataFiles.length && dataFiles[0]?.url) {
+              item.parsed_files = dataFiles;
+            }
+          } catch {}
+        }
         return item;
       })
     );
+
+    // Batch-load reactions for all messages and attach
+    const msgIds = enrichedMessages.map((m: any) => BigInt(m.id));
+    if (msgIds.length > 0) {
+      const messageType = this.messageTypeFor(type ?? '');
+      const allReactions = await this.prisma.message_reactions.findMany({
+        where: { message_type: messageType, message_id: { in: msgIds } },
+      });
+      const reactionsMap = new Map<string, any[]>();
+      for (const r of allReactions) {
+        const k = String(r.message_id);
+        if (!reactionsMap.has(k)) reactionsMap.set(k, []);
+        reactionsMap.get(k)!.push({ reaction: r.reaction, direction: r.direction });
+      }
+      for (const m of enrichedMessages) {
+        (m as any).reactions = reactionsMap.get(String(m.id)) ?? [];
+      }
+    }
 
     return { messages: enrichedMessages.reverse(), page: parseInt(page), limit: take };
   }
@@ -551,20 +715,39 @@ export class InboxService {
     // Upload any attached files to S3 and build URL list for the message payload.
     const uploadedFileUrls: { url: string; name: string; size: number; mime: string }[] = [];
     if (files && files.length > 0) {
-      for (const file of files) {
-        const ext = file.originalname.split('.').pop() ?? 'bin';
-        const key = `inbox/${inboxId}/attachments/${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-        const s3Key = await this.s3.upload(file.buffer, key, file.mimetype);
-        if (s3Key) {
-          const signedUrl = await this.s3.getSignedUrl(s3Key, 3600 * 24 * 7);
-          uploadedFileUrls.push({
-            url: signedUrl ?? s3Key,
-            name: file.originalname,
-            size: file.size,
-            mime: file.mimetype,
-          });
+      this.logger.log(`[UPLOAD] ${files.length} file(s): ${files.map(f => `${f.originalname}(${f.size}B)`).join(', ')}`);
+      const uploadResults = await Promise.all(files.map(async (file, idx) => {
+        // Instagram supports M4A (AAC) for audio type outbound — convert WebM to M4A
+        if (
+          type && type.toLowerCase().includes('insta') &&
+          file.mimetype && file.mimetype.startsWith('audio/') &&
+          (file.mimetype.includes('webm') || file.originalname?.toLowerCase().endsWith('.webm'))
+        ) {
+          try {
+            this.logger.log(`[IG AUDIO] Converting ${file.originalname} (${file.mimetype}) → m4a`);
+            file.buffer = await this.convertWebmToM4a(file.buffer);
+            file.originalname = file.originalname.replace(/\.webm$/i, '.m4a');
+            file.mimetype = 'audio/mp4';
+            file.size = file.buffer.length;
+            this.logger.log(`[IG AUDIO] Converted ok size=${file.size}B`);
+          } catch (convErr) {
+            this.logger.warn(`[IG AUDIO] WebM→M4a conversion failed (${convErr.message}) — uploading original`);
+          }
         }
-      }
+        const key = `inbox/${inboxId}/attachments/${Date.now()}-${idx}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+        const s3Key = await this.s3.upload(file.buffer, key, file.mimetype);
+        if (!s3Key) {
+          throw new BadRequestException(
+            `File upload to S3 failed: ${this.s3.lastError ?? 'check AWS credentials/bucket config'}`,
+          );
+        }
+        const signedUrl = await this.s3.getSignedUrl(s3Key, 3600 * 24 * 7);
+        if (!signedUrl) {
+          throw new BadRequestException('Failed to generate signed URL after S3 upload');
+        }
+        return { url: signedUrl, name: file.originalname, size: file.size, mime: file.mimetype };
+      }));
+      uploadedFileUrls.push(...uploadResults);
     }
 
     if (!String(text).trim() && uploadedFileUrls.length === 0) {
@@ -645,25 +828,36 @@ export class InboxService {
         const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
         const whatsappQueue = this.config.get<string>('RABBITMQ_WHATSAPP_QUEUE') || 'whatsapp';
         try {
-          // Build the WhatsApp Cloud-API payload. When reply_to is set, attach
-          // a `context.message_id` so the customer sees their original message
-          // quoted above the agent's reply (native WhatsApp quoted-reply UX).
-          const waContext: any = {
-            messaging_product: 'whatsapp',
-            to: chat.wa_id,
-            type: 'text',
-            text: { body: text },
-          };
-          if (replyToMessageId) {
-            try {
-              const repliedTo = await this.prisma.wa_messages.findUnique({
-                where: { id: BigInt(replyToMessageId) },
-                select: { wamid: true } as any,
-              });
-              if ((repliedTo as any)?.wamid) {
-                waContext.context = { message_id: (repliedTo as any).wamid };
-              }
-            } catch {}
+          // Build the WhatsApp Cloud-API payload.
+          // Media: image/audio/video/document each have their own top-level key.
+          // Text: fallback with optional quoted-reply context.
+          const waContext: any = { messaging_product: 'whatsapp', to: chat.wa_id };
+          if (hasFiles) {
+            const mediaUrl = uploadedFileUrls[0].url;
+            waContext.type = fileType; // 'image' | 'audio' | 'video' | 'document'
+            if (fileType === 'image') {
+              waContext.image = { link: mediaUrl };
+            } else if (fileType === 'audio') {
+              waContext.audio = { link: mediaUrl };
+            } else if (fileType === 'video') {
+              waContext.video = { link: mediaUrl };
+            } else {
+              waContext.document = { link: mediaUrl, filename: uploadedFileUrls[0].name };
+            }
+          } else {
+            waContext.type = 'text';
+            waContext.text = { body: text };
+            if (replyToMessageId) {
+              try {
+                const repliedTo = await this.prisma.wa_messages.findUnique({
+                  where: { id: BigInt(replyToMessageId) },
+                  select: { wamid: true } as any,
+                });
+                if ((repliedTo as any)?.wamid) {
+                  waContext.context = { message_id: (repliedTo as any).wamid };
+                }
+              } catch {}
+            }
           }
 
           await this.rabbit.publish(exchange, whatsappQueue, {
@@ -732,15 +926,42 @@ export class InboxService {
         const instaPage = await this.prisma.insta_pages.findUnique({ where: { id: chat.insta_page_id } });
 
         const sentAt = new Date();
+        const hasFiles = uploadedFileUrls.length > 0;
+        const igFileType = hasFiles
+          ? (uploadedFileUrls[0].mime?.startsWith('image/') ? 'image'
+            : uploadedFileUrls[0].mime?.startsWith('audio/') ? 'audio'
+            : uploadedFileUrls[0].mime?.startsWith('video/') ? 'video'
+            : 'file')
+          : 'text';
+
+        // Instagram DM API limits: image 8 MB, video 25 MB; documents not supported
+        if (hasFiles) {
+          const fileSizeBytes = uploadedFileUrls[0].size;
+          const isImage = igFileType === 'image';
+          const isVideo = igFileType === 'video';
+          if (igFileType === 'file') {
+            throw new BadRequestException(
+              `Instagram does not support document attachments. Only images, videos, and audio files can be sent via Instagram DM.`,
+            );
+          }
+          if (isImage && fileSizeBytes > 8 * 1024 * 1024) {
+            throw new BadRequestException(`Image too large for Instagram (${Math.round(fileSizeBytes / 1024)}KB). Instagram DM limit is 8MB.`);
+          }
+          if (isVideo && fileSizeBytes > 25 * 1024 * 1024) {
+            throw new BadRequestException(`Video too large for Instagram (${Math.round(fileSizeBytes / 1024)}KB). Instagram DM limit is 25MB.`);
+          }
+        }
+
         savedMessage = await this.prisma.insta_messages.create({
           data: {
             insta_chat_id: modelableId,
             insta_page_id: chat.insta_page_id,
             sender_id: userId,
-            text: text,
+            text: text || null,
             direction: 'OUTGOING',
-            type: isNote ? 'note' : 'text',
+            type: isNote ? 'note' : igFileType,
             status: isNote ? 'sent' : 'pending',
+            ...(hasFiles ? { data: JSON.stringify(uploadedFileUrls) } : {}),
             created_at: sentAt,
             updated_at: sentAt,
           },
@@ -757,6 +978,20 @@ export class InboxService {
             );
           }
 
+          // Build Instagram message payload — text or media attachment
+          let igMessage: any;
+          if (hasFiles) {
+            this.logger.log(`[IG OUTBOUND] type=${igFileType} size=${uploadedFileUrls[0].size} url=${uploadedFileUrls[0].url?.substring(0, 100)}...`);
+            igMessage = {
+              attachment: {
+                type: igFileType,
+                payload: { url: uploadedFileUrls[0].url, is_reusable: true },
+              },
+            };
+          } else {
+            igMessage = { text };
+          }
+
           const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
           const igQueue = this.config.get<string>('RABBITMQ_INSTAGRAM_QUEUE') || 'instagram';
           try {
@@ -766,7 +1001,7 @@ export class InboxService {
                 accountId: instaPage.service_account_id,
                 context: {
                   recipient: { id: chat.sender_id },
-                  message: { text },
+                  message: igMessage,
                 },
                 meta: {
                   backend_insta_message_id: savedMessage.id.toString(),
@@ -1362,33 +1597,124 @@ export class InboxService {
       },
     });
 
+    const isInstagram = (inbox.modelable_type ?? '').toLowerCase().includes('insta');
+    let result: any;
+    let igOp: 'add' | 'remove' | null = null;
+    let igEmoji: string | null = null;
+
     if (existing) {
       if (!reaction || existing.reaction === reaction) {
         await this.prisma.message_reactions.delete({ where: { id: existing.id } });
-        return { success: true, action: 'removed' };
+        result = { success: true, action: 'removed' };
+        igOp = 'remove';
+        igEmoji = existing.reaction;
+      } else {
+        const updated = await this.prisma.message_reactions.update({
+          where: { id: existing.id },
+          data: { reaction, updated_at: new Date() },
+        });
+        result = { success: true, action: 'updated', reaction: updated };
+        igOp = 'add';
+        igEmoji = reaction;
       }
-      const updated = await this.prisma.message_reactions.update({
-        where: { id: existing.id },
-        data: { reaction, updated_at: new Date() },
+    } else {
+      if (!reaction) return { success: true, action: 'noop' };
+      const created = await this.prisma.message_reactions.create({
+        data: {
+          workspace_id: workspaceId,
+          sender_id: userId,
+          message_type: messageType,
+          message_id: messageId,
+          reaction,
+          direction: 'OUTGOING',
+          communication_mode: 'INBOX',
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
       });
-      return { success: true, action: 'updated', reaction: updated };
+      result = { success: true, action: 'added', reaction: created };
+      igOp = 'add';
+      igEmoji = reaction;
     }
 
-    if (!reaction) return { success: true, action: 'noop' };
-    const created = await this.prisma.message_reactions.create({
-      data: {
-        workspace_id: workspaceId,
-        sender_id: userId,
-        message_type: messageType,
-        message_id: messageId,
-        reaction,
-        direction: 'OUTGOING',
-        communication_mode: 'INBOX',
-        created_at: new Date(),
-        updated_at: new Date(),
-      },
+    // Push reaction to Instagram Platform API (fire-and-forget)
+    if (isInstagram && igOp && igEmoji) {
+      this.pushInstagramReaction(inbox.modelable_id, messageId, igOp, igEmoji).catch((e: any) =>
+        this.logger.warn(`[IG REACTION] push failed: ${e?.message ?? e}`),
+      );
+    }
+
+    return result;
+  }
+
+  /** Map a raw emoji to Instagram's reaction name (matches webhook reaction field). */
+  /** Map emoji to Instagram reaction payload fields.
+   *  Standard reactions use the named type; everything else uses type="other" + emoji field
+   *  (mirrors how Instagram's own webhooks report custom emoji reactions). */
+  private emojiToIgReactionPayload(emoji: string): Record<string, string> {
+    const standard: Record<string, string> = {
+      '❤️': 'love', '❤': 'love', '😍': 'love', '🥰': 'love', '😘': 'love',
+      '💕': 'love', '💖': 'love', '💗': 'love', '💓': 'love', '💞': 'love',
+      '🧡': 'love', '💛': 'love', '💚': 'love', '💙': 'love', '💜': 'love',
+      '😂': 'haha', '🤣': 'haha', '😆': 'haha', '😹': 'haha', '😁': 'haha',
+      '😄': 'haha', '😃': 'haha', '😀': 'haha', '😅': 'haha', '🤭': 'haha',
+      '😮': 'wow', '😲': 'wow', '😯': 'wow', '🤯': 'wow', '😱': 'wow',
+      '🫢': 'wow', '🫣': 'wow', '😳': 'wow', '🥴': 'wow', '🤩': 'wow',
+      '😢': 'sad', '😭': 'sad', '😔': 'sad', '😟': 'sad', '🙁': 'sad',
+      '😞': 'sad', '😣': 'sad', '😩': 'sad', '😫': 'sad', '🥺': 'sad',
+      '😠': 'angry', '😡': 'angry', '🤬': 'angry', '😤': 'angry', '👿': 'angry',
+    };
+    const named = standard[emoji];
+    if (named) return { reaction: named };
+    // For any other emoji, use Instagram's "other" type with the actual emoji character
+    // (same format Instagram uses in its own reaction webhooks)
+    return { reaction: 'other', emoji };
+  }
+
+  /** Forward agent reaction to Instagram via Graph API using sender_action format. */
+  private async pushInstagramReaction(
+    chatId: bigint,
+    messageId: bigint,
+    op: 'add' | 'remove',
+    emoji: string,
+  ): Promise<void> {
+    const chat = await this.prisma.insta_chats.findUnique({ where: { id: chatId } });
+    if (!chat) return;
+    const page = await this.prisma.insta_pages.findUnique({ where: { id: chat.insta_page_id } });
+    if (!page?.access_token || !page.ig_user_id) return;
+    const msg = await this.prisma.insta_messages.findUnique({ where: { id: messageId } });
+    if (!msg?.mid) {
+      this.logger.warn(`[IG REACTION] no mid for insta_message ${messageId} — reaction not sent`);
+      return;
+    }
+    const igVer = this.config.get<string>('META_GRAPH_API_VERSION') ?? 'v22.0';
+    const apiBase = (page.platform ?? 'facebook') === 'facebook'
+      ? 'https://graph.facebook.com'
+      : 'https://graph.instagram.com';
+
+    // Instagram Messaging API uses sender_action format (not message.reaction)
+    const body: any = {
+      recipient: { id: chat.sender_id },
+      sender_action: op === 'remove' ? 'unreact' : 'react',
+    };
+    if (op !== 'remove') {
+      body.payload = { message_id: msg.mid, ...this.emojiToIgReactionPayload(emoji) };
+    } else {
+      body.payload = { message_id: msg.mid };
+    }
+
+    this.logger.log(`[IG REACTION] sending: ${JSON.stringify(body)}`);
+
+    const res = await fetch(`${apiBase}/${igVer}/me/messages?access_token=${encodeURIComponent(page.access_token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
-    return { success: true, action: 'added', reaction: created };
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(JSON.stringify(err));
+    }
+    this.logger.log(`[IG REACTION] ${op} ${emoji} → ok`);
   }
 
   // ─── Reminders (24h-window WhatsApp + Telegram + Z-API) ────────────

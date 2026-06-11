@@ -83,6 +83,9 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       case 'INSTA_COMMENT':
         await this.onInstaComment(envelope.payload);
         return;
+      case 'INSTA_ECHO_MESSAGE':
+        await this.onInstaEchoMessage(envelope.payload);
+        return;
       case 'INSTA_REFERRAL':
       case 'INSTA_POSTBACK':
         this.logger.debug(`Instagram event ${event} received (automation triggers pending)`);
@@ -796,6 +799,70 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     // Delivery and read receipts are handled by onInstaDeliveryStatus / onInstaReadStatus
     if (messaging.delivery || messaging.read) return;
 
+    // Reaction events — save to message_reactions and notify UI, but don't create a message row
+    if (messaging.reaction) {
+      const reactObj = messaging.reaction;
+      if (reactObj.mid) {
+        try {
+          const now2 = new Date();
+          const targetMsg = await this.prisma.insta_messages.findFirst({
+            where: { mid: reactObj.mid },
+          });
+          if (targetMsg) {
+            const msgType = 'App\\Models\\Instagram\\InstagramMessage';
+            if (reactObj.action === 'unreact') {
+              await this.prisma.message_reactions.deleteMany({
+                where: { message_type: msgType, message_id: targetMsg.id, direction: 'INCOMING' },
+              });
+            } else {
+              const existingReaction = await this.prisma.message_reactions.findFirst({
+                where: { message_type: msgType, message_id: targetMsg.id, direction: 'INCOMING' },
+              });
+              if (existingReaction) {
+                await this.prisma.message_reactions.update({
+                  where: { id: existingReaction.id },
+                  data: { reaction: reactObj.emoji ?? reactObj.reaction, updated_at: now2 },
+                });
+              } else {
+                await this.prisma.message_reactions.create({
+                  data: {
+                    workspace_id: page.workspace_id,
+                    message_type: msgType,
+                    message_id: targetMsg.id,
+                    reaction: reactObj.emoji ?? reactObj.reaction,
+                    direction: 'INCOMING',
+                    communication_mode: 'INBOX',
+                    created_at: now2,
+                    updated_at: now2,
+                  },
+                });
+              }
+            }
+            // Emit socket so frontend refreshes the message thread
+            const instaChat = await this.prisma.insta_chats.findFirst({
+              where: { insta_page_id: page.id, sender_id: senderId },
+            });
+            if (instaChat) {
+              const instaInbox = await this.prisma.inbox.findFirst({
+                where: { modelable_type: 'App\\Models\\Instagram\\InstaChat', modelable_id: instaChat.id, status: { not: 'DELETED' } },
+              });
+              if (instaInbox) {
+                this.chatGateway.emitToWorkspace(page.workspace_id, 'message_reaction', {
+                  inbox_id: instaInbox.id.toString(),
+                  message_id: targetMsg.id.toString(),
+                  reaction: reactObj.emoji ?? reactObj.reaction,
+                  action: reactObj.action,
+                });
+              }
+            }
+          }
+        } catch (e: any) {
+          this.logger.warn(`[IG REACTION] inbound save failed: ${e?.message}`);
+        }
+      }
+      return;
+    }
+
     const now = new Date();
     const msgObj = messaging.message ?? {};
     const mid: string | null = msgObj.mid ?? null;
@@ -857,9 +924,11 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       contact.full_name = senderName!;
     }
 
-    // Resolve or create insta_chat
+    // Resolve or create insta_chat. Always pick the OLDEST record to handle any
+    // duplicate chats that may exist from prior race conditions.
     let chat = await this.prisma.insta_chats.findFirst({
       where: { insta_page_id: page.id, sender_id: senderId },
+      orderBy: { created_at: 'asc' },
     });
     if (!chat) {
       chat = await this.prisma.insta_chats.create({
@@ -877,6 +946,16 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
           updated_at: now,
         },
       });
+      // Race-condition guard: another concurrent handler may have created the chat
+      // at the same time. If so, prefer the oldest record and discard ours.
+      const oldest = await this.prisma.insta_chats.findFirst({
+        where: { insta_page_id: page.id, sender_id: senderId },
+        orderBy: { created_at: 'asc' },
+      });
+      if (oldest && oldest.id !== chat.id) {
+        await this.prisma.insta_chats.delete({ where: { id: chat.id } }).catch(() => {});
+        chat = oldest;
+      }
     } else {
       await this.prisma.insta_chats.update({
         where: { id: chat.id },
@@ -902,10 +981,12 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       },
     });
 
-    // Inbox row
+    // Inbox row — only reuse a non-DELETED inbox. If the previous inbox was
+    // soft-deleted (user cleared it), create a fresh one so re-messaging
+    // customer appears as a new conversation, not an invisible update.
     const INSTA_CHAT_MODELABLE = 'App\\Models\\Instagram\\InstaChat';
     const existingInbox = await this.prisma.inbox.findFirst({
-      where: { modelable_type: INSTA_CHAT_MODELABLE, modelable_id: chat.id },
+      where: { modelable_type: INSTA_CHAT_MODELABLE, modelable_id: chat.id, status: { not: 'DELETED' } },
     });
     let inboxRow: any;
     if (!existingInbox) {
@@ -934,6 +1015,7 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
           is_read: 0,
           last_updated: now,
           updated_at: now,
+          // COMPLETED = re-open as UNASSIGNED; ACTIVE/UNASSIGNED = keep current status
           status: existingInbox.status === 'COMPLETED' ? 'UNASSIGNED' : existingInbox.status,
         },
       });
@@ -1005,7 +1087,188 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
         mid: mid ?? null,
       });
     }
+    if (status !== 'sent') {
+      this.logger.warn(`INSTA outbound message ${msg.id} FAILED — reason: ${payload?.reason ?? 'unknown'} | meta_error: ${JSON.stringify(payload?.response ?? null)}`);
+    }
     this.logger.log(`INSTA outbound message ${msg.id} → ${status} (mid=${mid ?? 'unknown'})`);
+  }
+
+  /**
+   * INSTA_ECHO_MESSAGE — message sent from the business's phone/Instagram app.
+   * Meta fires is_echo=true; instagram-master now publishes this as INSTA_ECHO_MESSAGE.
+   * We store it as an OUTGOING message so it appears in the Ezconn inbox.
+   */
+  private async onInstaEchoMessage(payload: any): Promise<void> {
+    const backendPageId = payload?.account?.meta?.backend_insta_page_id;
+    const messaging = payload?.object;
+    if (!backendPageId || !messaging) {
+      this.logger.warn(`INSTA_ECHO_MESSAGE missing backend_insta_page_id or object`);
+      return;
+    }
+
+    let pageId: bigint;
+    try { pageId = BigInt(backendPageId); } catch {
+      this.logger.warn(`INSTA_ECHO_MESSAGE unparseable backend_insta_page_id=${backendPageId}`);
+      return;
+    }
+
+    const page = await this.prisma.insta_pages.findUnique({ where: { id: pageId } });
+    if (!page) { this.logger.warn(`INSTA_ECHO_MESSAGE no insta_page id=${pageId}`); return; }
+
+    // For echo: sender = business IG user, recipient = customer
+    const customerId: string = messaging.recipient?.id;
+    if (!customerId) { this.logger.warn(`INSTA_ECHO_MESSAGE missing recipient.id`); return; }
+
+    const msgObj = messaging.message ?? {};
+    const mid: string | null = msgObj.mid ?? null;
+    const text: string | null = msgObj.text ?? null;
+    const msgType = msgObj.attachments?.length
+      ? String(msgObj.attachments[0]?.type ?? 'attachment')
+      : 'text';
+    const attachmentsData = msgObj.attachments?.length ? JSON.stringify(msgObj.attachments) : null;
+
+    const now = new Date();
+
+    // Deduplicate by mid
+    if (mid) {
+      const existing = await this.prisma.insta_messages.findFirst({
+        where: { mid, direction: 'OUTGOING' },
+      });
+      if (existing) {
+        this.logger.log(`INSTA_ECHO_MESSAGE duplicate mid=${mid} — skipped`);
+        return;
+      }
+    }
+
+    // Resolve or create contact for the customer
+    const contact = await this.resolveInstaContact(page.workspace_id, customerId, null);
+
+    // Find or create insta_chat — customer is sender_id. Always pick the OLDEST record.
+    let chat = await this.prisma.insta_chats.findFirst({
+      where: { insta_page_id: page.id, sender_id: customerId },
+      orderBy: { created_at: 'asc' },
+    });
+    if (!chat) {
+      chat = await this.prisma.insta_chats.create({
+        data: {
+          insta_page_id: page.id,
+          user_id: page.user_id,
+          contact_id: contact.id,
+          sender_id: customerId,
+          name: contact.full_name ?? null,
+          recipient_id: page.ig_user_id ?? '',
+          last_interacted_at: now,
+          last_client_interaction: now,
+          input_attempts: 0n,
+          created_at: now,
+          updated_at: now,
+        },
+      });
+      // Race-condition guard: prefer the oldest record if a concurrent create raced us.
+      const oldest = await this.prisma.insta_chats.findFirst({
+        where: { insta_page_id: page.id, sender_id: customerId },
+        orderBy: { created_at: 'asc' },
+      });
+      if (oldest && oldest.id !== chat.id) {
+        await this.prisma.insta_chats.delete({ where: { id: chat.id } }).catch(() => {});
+        chat = oldest;
+      }
+    } else {
+      await this.prisma.insta_chats.update({
+        where: { id: chat.id },
+        data: { last_interacted_at: now, updated_at: now },
+      });
+    }
+
+    // If this echo matches a recently-sent Ezconn message, skip creating a duplicate.
+    // Two sub-cases handled:
+    //   (a) mid still null  — STATUS_UPDATE not yet processed (race: echo arrived first via HTTP,
+    //       status update still queued in RabbitMQ)
+    //   (b) mid already set — STATUS_UPDATE processed between CHECK 1 and here; CHECK 1 was
+    //       evaluated while mid was still null so it passed, but by now the mid is set
+    if (mid) {
+      const cutoff = new Date(now.getTime() - 2 * 60 * 1000);
+      const ezconnSent = await this.prisma.insta_messages.findFirst({
+        where: {
+          insta_chat_id: chat.id,
+          direction: 'OUTGOING',
+          sender_id: { not: null },
+          created_at: { gte: cutoff },
+          OR: [
+            { mid: null },  // (a) pending — STATUS_UPDATE not yet processed
+            { mid },        // (b) race — STATUS_UPDATE ran between CHECK 1 and here
+          ],
+        },
+        orderBy: { created_at: 'desc' },
+      });
+      if (ezconnSent) {
+        if (!ezconnSent.mid) {
+          await this.prisma.insta_messages.update({
+            where: { id: ezconnSent.id },
+            data: { mid, updated_at: now },
+          });
+        }
+        this.logger.log(`INSTA_ECHO_MESSAGE matched Ezconn msg=${ezconnSent.id} → skipping duplicate`);
+        return;
+      }
+    }
+
+    // Save as OUTGOING message
+    const message = await this.prisma.insta_messages.create({
+      data: {
+        insta_page_id: page.id,
+        insta_chat_id: chat.id,
+        type: msgType,
+        direction: 'OUTGOING',
+        text,
+        status: 'sent',
+        mid,
+        payload: attachmentsData ?? JSON.stringify(messaging),
+        timestamp: messaging.timestamp ? String(messaging.timestamp) : null,
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    // Find or create inbox row — is_read=1 because we sent it
+    const INSTA_CHAT_MODELABLE = 'App\\Models\\Instagram\\InstaChat';
+    const existingInbox = await this.prisma.inbox.findFirst({
+      where: { modelable_type: INSTA_CHAT_MODELABLE, modelable_id: chat.id },
+    });
+    let inboxRow: any;
+    if (!existingInbox) {
+      inboxRow = await this.prisma.inbox.create({
+        data: {
+          workspace_id: page.workspace_id,
+          user_id: null,
+          assigned_by: null,
+          type: 'INSTAGRAM',
+          status: 'UNASSIGNED',
+          is_read: 1,
+          is_assigned: 0,
+          snooze: new Date(0),
+          modelable_type: INSTA_CHAT_MODELABLE,
+          modelable_id: chat.id,
+          queued_at: now,
+          last_updated: now,
+          created_at: now,
+          updated_at: now,
+        },
+      });
+    } else {
+      inboxRow = await this.prisma.inbox.update({
+        where: { id: existingInbox.id },
+        data: { last_updated: now, updated_at: now, is_read: 1 },
+      });
+    }
+
+    // Broadcast so UI updates live
+    this.chatGateway.emitToWorkspace(page.workspace_id, 'new_message', {
+      inbox_id: inboxRow.id.toString(),
+      message: { text },
+    });
+
+    this.logger.log(`INSTA echo saved: chat=${chat.id} message=${message.id} mid=${mid} customer=${customerId}`);
   }
 
   /**

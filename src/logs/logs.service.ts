@@ -544,6 +544,32 @@ export class LogsService {
           lastMessage: msg ? { text: msg.text, direction: msg.direction, at: (msg as any).created_at } : null,
         };
       }
+      if (lower.includes('instagram') || lower.includes('insta')) {
+        const chat = await this.prisma.insta_chats.findUnique({ where: { id: modelableId } });
+        const msg = await this.prisma.insta_messages.findFirst({
+          where: { insta_chat_id: modelableId },
+          orderBy: { id: 'desc' },
+        });
+        const contact = chat?.contact_id
+          ? await this.prisma.contacts.findUnique({ where: { id: chat.contact_id } })
+          : null;
+        const contactName =
+          contact?.full_name ??
+          (contact ? `${contact.first_name ?? ''} ${contact.last_name ?? ''}`.trim() : null) ??
+          (chat as any)?.name ??
+          null;
+        return {
+          contact: contactName
+            ? { id: contact?.id?.toString() ?? '', name: contactName }
+            : chat
+              ? { id: '', name: (chat as any).name ?? (chat as any).sender_id ?? 'Unknown' }
+              : null,
+          contact_number: null,
+          lastMessage: msg
+            ? { text: (msg as any).text ?? '', direction: (msg as any).direction, at: (msg as any).created_at }
+            : null,
+        };
+      }
       return null;
     } catch {
       return null;
@@ -563,6 +589,9 @@ export class LogsService {
       }
       if (lower.includes('zapi')) {
         return this.prisma.zapi_messages.count({ where: { zapi_chat_id: modelableId } });
+      }
+      if (lower.includes('instagram') || lower.includes('insta')) {
+        return this.prisma.insta_messages.count({ where: { insta_chat_id: modelableId } });
       }
       return 0;
     } catch {
@@ -593,6 +622,14 @@ export class LogsService {
       if (lower.includes('zapi')) {
         const rows = await this.prisma.zapi_messages.findMany({
           where: { zapi_chat_id: modelableId },
+          orderBy: { id: 'desc' },
+          take: limit,
+        });
+        return rows.map(this.projectMessage);
+      }
+      if (lower.includes('instagram') || lower.includes('insta')) {
+        const rows = await this.prisma.insta_messages.findMany({
+          where: { insta_chat_id: modelableId },
           orderBy: { id: 'desc' },
           take: limit,
         });
