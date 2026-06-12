@@ -1091,7 +1091,7 @@ export class InboxService {
   /**
    * Profile Actions: Tags, Custom Fields, Contact Updates
    */
-  async getProfileData(inboxId: bigint) {
+  async getProfileData(inboxId: bigint, workspaceId?: bigint) {
     const inbox = await this.prisma.inbox.findUnique({
       where: { id: inboxId },
     });
@@ -1145,25 +1145,58 @@ export class InboxService {
       } catch (e) {}
     }
 
-    // Fetch contact's custom field values
+    // Fetch ALL workspace CONTACT custom fields (always), then merge per-contact
+    // values only when a contact is linked. Two separate try blocks so a value
+    // fetch failure never collapses the field definitions themselves.
+    // NOTE: schema has no explicit Prisma @relation between custom_field_entities
+    // and custom_field_entity_values, so we must NOT use `include` — manual join.
     let customFields: any[] = [];
-    if (contact?.id) {
-      try {
-        const entities = await this.prisma.custom_field_entities.findMany({
-          where: { entity_type: 'CONTACT', entity_id: contact.id },
-          include: {
-            custom_fields: true,
-            custom_field_entity_values: true,
-          },
+    try {
+      const wsId = workspaceId ?? (inbox as any).workspace_id;
+      if (wsId) {
+        const allFields = await this.prisma.custom_fields.findMany({
+          where: { workspace_id: wsId, for: 'CONTACT' },
+          orderBy: { created_at: 'asc' },
         });
-        customFields = entities.map((e: any) => ({
-          id: e.custom_field_id,
-          label: e.custom_fields?.label,
-          slug: e.custom_fields?.slug,
-          value: e.custom_field_entity_values?.[0]?.value ?? null,
+        const fieldIds = allFields.map((f: any) => f.id);
+        const props = fieldIds.length
+          ? await this.prisma.custom_field_properties.findMany({ where: { custom_field_id: { in: fieldIds } } })
+          : [];
+
+        // Build fields with null values first (always succeeds)
+        customFields = (allFields as any[]).map((f) => ({
+          id: f.id.toString(),
+          label: f.label,
+          slug: f.slug,
+          content_type: f.content_type,
+          input_type: f.input_type,
+          has_properties: f.has_properties,
+          properties: props.filter((p: any) => p.custom_field_id === f.id),
+          value: null,
         }));
-      } catch (e) {}
-    }
+
+        // Overlay per-contact values in a separate try so any failure still
+        // returns the field definitions (with null values).
+        if (contact?.id && fieldIds.length) {
+          try {
+            const entities = await this.prisma.custom_field_entities.findMany({
+              where: { entity_type: 'CONTACT', entity_id: contact.id, custom_field_id: { in: fieldIds } },
+            });
+            const entityIds = (entities as any[]).map((e) => e.id);
+            const vals = entityIds.length
+              ? await this.prisma.custom_field_entity_values.findMany({ where: { cf_entity_id: { in: entityIds } } })
+              : [];
+            const entityToField = new Map((entities as any[]).map((e) => [e.id.toString(), e.custom_field_id.toString()]));
+            const valueMap = new Map<string, string>();
+            for (const v of vals as any[]) {
+              const fid = entityToField.get(v.cf_entity_id.toString());
+              if (fid && v.value != null) valueMap.set(fid, v.value);
+            }
+            customFields = customFields.map((f) => ({ ...f, value: valueMap.get(f.id) ?? null }));
+          } catch (_ve) {}
+        }
+      }
+    } catch (e) {}
 
     return {
       inbox: enrichedInbox,
@@ -2228,14 +2261,19 @@ export class InboxService {
             },
           });
         }
-        await this.prisma.tag_links.create({
-          data: {
-            linkable_type: 'App\\Models\\Contact',
-            linkable_id: contactId,
-            tag_id: tag.id,
-            name: tag.name,
-          },
+        const alreadyLinked = await this.prisma.tag_links.findFirst({
+          where: { linkable_type: 'App\\Models\\Contact', linkable_id: contactId, tag_id: tag.id },
         });
+        if (!alreadyLinked) {
+          await this.prisma.tag_links.create({
+            data: {
+              linkable_type: 'App\\Models\\Contact',
+              linkable_id: contactId,
+              tag_id: tag.id,
+              name: tag.name,
+            },
+          });
+        }
         this.eventEmitter.emit('contact.tag_applied', {
           contactId,
           tagId: tag.id,

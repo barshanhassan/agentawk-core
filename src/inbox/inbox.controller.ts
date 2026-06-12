@@ -71,8 +71,9 @@ export class InboxController {
   }
 
   @Get('get-profile-data/:id')
-  async getProfileData(@Param('id') id: string) {
-    return this.service.getProfileData(BigInt(id));
+  async getProfileData(@Param('id') id: string, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.getProfileData(BigInt(id), workspaceId);
   }
 
   // ─── Send / react / seen ───────────────────────────────────────────

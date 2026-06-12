@@ -39,6 +39,12 @@ export class NotificationsController {
     return this.notifications.markAllRead('App\\Models\\User', userId);
   }
 
+  @Delete('all')
+  removeAll(@Request() req: any) {
+    const userId = BigInt(req.user.sub || req.user.id || 0);
+    return this.notifications.deleteAll('App\\Models\\User', userId);
+  }
+
   @Delete(':id')
   remove(@Param('id') id: string, @Request() req: any) {
     const userId = BigInt(req.user.sub || req.user.id || 0);

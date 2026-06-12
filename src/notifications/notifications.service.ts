@@ -90,6 +90,13 @@ export class NotificationsService {
     return { success: true };
   }
 
+  async deleteAll(notifiableType: string, notifiableId: bigint) {
+    await this.prisma.notifications.deleteMany({
+      where: { notifiable_type: notifiableType, notifiable_id: notifiableId },
+    });
+    return { success: true };
+  }
+
   // ─── Write API ─────────────────────────────────────────────────────
 
   async create(input: NotificationCreateInput) {

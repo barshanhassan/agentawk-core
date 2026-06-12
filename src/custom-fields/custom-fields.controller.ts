@@ -72,6 +72,14 @@ export class CustomFieldsController {
     return this.service.getCountries();
   }
 
+  @Post('contact/:contactId/value')
+  async setContactFieldValue(
+    @Param('contactId') contactId: string,
+    @Body() body: { field_id: string; value: string },
+  ) {
+    return this.service.upsertFieldValue('CONTACT', BigInt(contactId), BigInt(body.field_id), body.value);
+  }
+
   @Post(':id/toggle-feeder')
   async toggleFeeder(@Param('id') id: string, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
