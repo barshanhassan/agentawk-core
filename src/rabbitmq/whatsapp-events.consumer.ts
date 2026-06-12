@@ -5,6 +5,7 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChatGateway } from '../inbox/chat.gateway';
 import { RabbitMqService } from './rabbitmq.service';
+import { S3Service } from '../s3/s3.service';
 
 const WHATSAPP_CHAT_MODELABLE = 'App\\Models\\Whatsapp\\WhatsappChat';
 const WHATSAPP_MESSAGE_MODELABLE = 'App\\Models\\Whatsapp\\WhatsappMessage';
@@ -31,6 +32,7 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     private readonly chatGateway: ChatGateway,
     private readonly config: ConfigService,
     private readonly events: EventEmitter2,
+    private readonly s3: S3Service,
   ) {}
 
   onApplicationBootstrap() {
@@ -59,6 +61,19 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
         return;
       case 'WA_MESSAGE_STATUS':
         await this.onMessageStatus(envelope.payload);
+        return;
+      // ── Baileys / QR-code session events ──────────────────────────
+      case 'WA_CALL':
+        await this.onWaCall(envelope.payload);
+        return;
+      case 'WA_QR_CODE':
+        await this.onWaQrCode(envelope.payload);
+        return;
+      case 'WA_QR_CONNECTED':
+        await this.onWaQrConnected(envelope.payload);
+        return;
+      case 'WA_QR_DISCONNECTED':
+        await this.onWaQrDisconnected(envelope.payload);
         return;
       // ── Instagram events ───────────────────────────────────────────
       case 'INSTA_VERIFICATION_RESULT':
@@ -392,6 +407,265 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // Baileys / QR-code session event handlers
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * WA_CALL — Baileys emitted a call event on a QR-code session.
+   * Payload: { accountId (backend wa_account id string), call: { id, from, status, isVideo, timestamp } }
+   *
+   * We create a wa_messages row with type='call' so it appears in the inbox
+   * thread, then broadcast `new_message` to the workspace.
+   * Only 'ringing' / 'timeout' events create rows; 'accept' / 'reject' / 'offer'
+   * are ignored because they refer to the same call already saved.
+   */
+  private async onWaCall(payload: any): Promise<void> {
+    const call = payload?.call;
+    const accountIdStr = payload?.accountId;
+    if (!call || !accountIdStr) {
+      this.logger.warn(`WA_CALL missing accountId or call data — dropping`);
+      return;
+    }
+
+    // Only persist on the events that introduce a new call notification
+    if (!['ringing', 'timeout', 'offer'].includes(call.status)) {
+      this.logger.debug(`WA_CALL status=${call.status} skipped (not a new-call trigger)`);
+      return;
+    }
+
+    let accountId: bigint;
+    try { accountId = BigInt(accountIdStr); } catch {
+      this.logger.warn(`WA_CALL unparseable accountId=${accountIdStr}`);
+      return;
+    }
+
+    const account = await this.prisma.wa_accounts.findUnique({ where: { id: accountId } });
+    if (!account) {
+      this.logger.warn(`WA_CALL no wa_accounts row for id=${accountId}`);
+      return;
+    }
+
+    // Derive caller's full mobile from Baileys `from` (format: "923001234567@s.whatsapp.net")
+    const fromRaw: string = String(call.from ?? '');
+    const waId = fromRaw.split('@')[0].replace(/[^0-9]/g, '');
+    const fullMobile = waId ? `+${waId}` : fromRaw;
+
+    if (!waId) {
+      this.logger.warn(`WA_CALL cannot parse caller from=${fromRaw} — dropping`);
+      return;
+    }
+
+    // Find the phone number row (first active number on this account)
+    const phoneNumber = await this.prisma.wa_phone_numbers.findFirst({
+      where: { wa_account_id: account.id, status: { not: 'DELETED' } },
+    });
+    if (!phoneNumber) {
+      this.logger.warn(`WA_CALL no wa_phone_numbers row for account ${account.id}`);
+      return;
+    }
+
+    const contact = await this.resolveContact({
+      workspaceId: account.workspace_id,
+      fullMobile,
+      waId,
+      profileName: null,
+    });
+
+    const now = new Date();
+
+    // Upsert chat
+    const chat = await this.prisma.wa_chats.upsert({
+      where: {
+        wa_account_id_wa_number_id_wa_id: {
+          wa_account_id: account.id,
+          wa_number_id: phoneNumber.id,
+          wa_id: fullMobile,
+        },
+      },
+      update: { last_client_interaction: now, last_interacted_at: now, updated_at: now },
+      create: {
+        wa_account_id: account.id,
+        wa_number_id: phoneNumber.id,
+        user_id: account.user_id,
+        contact_id: contact.id,
+        profile_name: null,
+        wa_id: fullMobile,
+        is_primary: true,
+        input_attempts: 0n,
+        last_client_interaction: now,
+        last_interacted_at: now,
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    const callText = call.status === 'timeout'
+      ? `📵 Missed ${call.isVideo ? 'video ' : ''}call`
+      : `📞 Incoming ${call.isVideo ? 'video ' : ''}call`;
+
+    const callMsg = await this.prisma.wa_messages.create({
+      data: {
+        wa_number_id: phoneNumber.id,
+        wa_chat_id: chat.id,
+        mobile_number: fullMobile,
+        type: 'call',
+        direction: 'INCOMING',
+        text: callText,
+        status: call.status === 'timeout' ? 'missed' : 'received',
+        wamid: call.id ? String(call.id) : null,
+        timestamp: call.timestamp ? String(call.timestamp) : null,
+        payload: JSON.stringify(call),
+        communication_mode: 'INBOX',
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    // Inbox row
+    const existingInbox = await this.prisma.inbox.findFirst({
+      where: { modelable_type: WHATSAPP_CHAT_MODELABLE, modelable_id: chat.id },
+    });
+    let inboxRow: any;
+    if (!existingInbox) {
+      inboxRow = await this.prisma.inbox.create({
+        data: {
+          workspace_id: account.workspace_id,
+          user_id: null,
+          assigned_by: null,
+          type: 'WHATSAPP',
+          status: 'UNASSIGNED',
+          is_read: 0,
+          is_assigned: 0,
+          snooze: new Date(0),
+          modelable_type: WHATSAPP_CHAT_MODELABLE,
+          modelable_id: chat.id,
+          queued_at: now,
+          last_updated: now,
+          created_at: now,
+          updated_at: now,
+        },
+      });
+    } else {
+      inboxRow = await this.prisma.inbox.update({
+        where: { id: existingInbox.id },
+        data: {
+          is_read: 0,
+          last_updated: now,
+          updated_at: now,
+          status: existingInbox.status === 'COMPLETED' ? 'UNASSIGNED' : existingInbox.status,
+        },
+      });
+    }
+
+    this.chatGateway.emitToWorkspace(account.workspace_id, 'new_message', {
+      inbox_id: inboxRow.id.toString(),
+      message: {
+        id: callMsg.id.toString(),
+        direction: 'INCOMING',
+        text: callText,
+        type: 'call',
+        status: callMsg.status,
+        reactions: [],
+        parsed_files: [],
+        created_at: callMsg.created_at?.toISOString?.() ?? now.toISOString(),
+        updated_at: callMsg.updated_at?.toISOString?.() ?? now.toISOString(),
+      },
+    });
+
+    this.logger.log(`WA_CALL saved: account=${account.id} from=${fullMobile} status=${call.status}`);
+  }
+
+  /**
+   * WA_QR_CODE — Baileys has generated a QR code for a new session.
+   * Forward it to the workspace so the settings page can render it.
+   * Payload: { accountId (backend wa_account id), qr (base64/svg string), meta }
+   */
+  private async onWaQrCode(payload: any): Promise<void> {
+    const accountIdStr = payload?.accountId;
+    const qr = payload?.qr;
+    if (!accountIdStr || !qr) {
+      this.logger.warn(`WA_QR_CODE missing accountId or qr — dropping`);
+      return;
+    }
+
+    let accountId: bigint;
+    try { accountId = BigInt(accountIdStr); } catch {
+      this.logger.warn(`WA_QR_CODE unparseable accountId=${accountIdStr}`);
+      return;
+    }
+
+    const account = await this.prisma.wa_accounts.findUnique({ where: { id: accountId } });
+    if (!account) {
+      this.logger.warn(`WA_QR_CODE no wa_accounts row for id=${accountId}`);
+      return;
+    }
+
+    this.chatGateway.emitToWorkspace(account.workspace_id, 'whatsapp.qr_code', {
+      account_id: accountId.toString(),
+      qr,
+    });
+
+    this.logger.log(`WA_QR_CODE forwarded to workspace ${account.workspace_id} for account ${accountId}`);
+  }
+
+  /**
+   * WA_QR_CONNECTED — user scanned QR and session is live.
+   * Flip wa_accounts.status → ACTIVE.
+   */
+  private async onWaQrConnected(payload: any): Promise<void> {
+    const accountIdStr = payload?.accountId;
+    if (!accountIdStr) return;
+
+    let accountId: bigint;
+    try { accountId = BigInt(accountIdStr); } catch { return; }
+
+    const now = new Date();
+    const updated = await this.prisma.wa_accounts.update({
+      where: { id: accountId },
+      data: { status: 'ACTIVE', updated_at: now },
+    });
+
+    this.chatGateway.emitToWorkspace(updated.workspace_id, 'whatsapp.account_updated', {
+      id: accountId.toString(),
+      status: 'ACTIVE',
+    });
+
+    this.logger.log(`WA_QR_CONNECTED: wa_account ${accountId} → ACTIVE`);
+  }
+
+  /**
+   * WA_QR_DISCONNECTED — Baileys session closed (logged out or network error).
+   * Flip wa_accounts.status → DISCONNECTED; if logged_out also clear service_account_id.
+   */
+  private async onWaQrDisconnected(payload: any): Promise<void> {
+    const accountIdStr = payload?.accountId;
+    if (!accountIdStr) return;
+
+    let accountId: bigint;
+    try { accountId = BigInt(accountIdStr); } catch { return; }
+
+    const now = new Date();
+    const loggedOut = payload?.logged_out === true;
+
+    const updated = await this.prisma.wa_accounts.update({
+      where: { id: accountId },
+      data: {
+        status: 'DISCONNECTED',
+        updated_at: now,
+        ...(loggedOut ? { service_account_id: '' } : {}),
+      },
+    });
+
+    this.chatGateway.emitToWorkspace(updated.workspace_id, 'whatsapp.account_updated', {
+      id: accountId.toString(),
+      status: 'DISCONNECTED',
+      logged_out: loggedOut,
+    });
+
+    this.logger.log(`WA_QR_DISCONNECTED: wa_account ${accountId} → DISCONNECTED (logged_out=${loggedOut}, reason=${payload?.reason})`);
+  }
+
   /**
    * Process a single inbound WhatsApp message:
    *   1. Resolve wa_account (waba_id) + wa_phone_number (wa_number_id).
@@ -479,8 +753,51 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       },
     });
 
-    // 4. Insert wa_messages row
+    // 4a. Handle emoji reactions — save to message_reactions + socket, do NOT create a message row
     const messageType = String(msg.type ?? 'text').toLowerCase();
+    if (messageType === 'reaction') {
+      const reactObj = msg.reaction;
+      if (reactObj?.message_id) {
+        const targetMsg = await this.prisma.wa_messages.findFirst({ where: { wamid: String(reactObj.message_id) } });
+        if (targetMsg) {
+          const emoji = reactObj.emoji ?? '';
+          if (emoji === '') {
+            await this.prisma.message_reactions.deleteMany({
+              where: { message_type: WHATSAPP_MESSAGE_MODELABLE, message_id: targetMsg.id, direction: 'INCOMING' },
+            });
+          } else {
+            const existing = await this.prisma.message_reactions.findFirst({
+              where: { message_type: WHATSAPP_MESSAGE_MODELABLE, message_id: targetMsg.id, direction: 'INCOMING' },
+            });
+            if (existing) {
+              await this.prisma.message_reactions.update({ where: { id: existing.id }, data: { reaction: emoji, updated_at: now } });
+            } else {
+              await this.prisma.message_reactions.create({
+                data: {
+                  workspace_id: account.workspace_id,
+                  message_type: WHATSAPP_MESSAGE_MODELABLE,
+                  message_id: targetMsg.id,
+                  reaction: emoji,
+                  direction: 'INCOMING',
+                  communication_mode: 'INBOX',
+                  created_at: now,
+                  updated_at: now,
+                },
+              });
+            }
+          }
+          this.chatGateway.emitToWorkspace(account.workspace_id, 'message_reaction', {
+            wa_message_id: targetMsg.id.toString(),
+            wamid: reactObj.message_id,
+            reaction: emoji || null,
+            action: emoji === '' ? 'removed' : 'added',
+          });
+        }
+      }
+      return;
+    }
+
+    // 4b. Insert wa_messages row
     const text = msg.text?.body ?? null;
     const insertedMessage = await this.prisma.wa_messages.create({
       data: {
@@ -554,6 +871,13 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       });
     }
 
+    // 6b. Download inbound media from Meta → S3 (fire-and-forget, non-blocking)
+    const MEDIA_TYPES = ['image', 'video', 'audio', 'voice', 'document', 'sticker'];
+    if (MEDIA_TYPES.includes(messageType)) {
+      this.downloadWaMediaToS3(insertedMessage.id, msg, account.access_token, account.workspace_id, inboxRow.id)
+        .catch((e) => this.logger.warn(`[WA MEDIA] download failed for wa_message ${insertedMessage.id}: ${e?.message ?? e}`));
+    }
+
     // 7. Real-time broadcast — frontend subscribes per workspace room.
     // We emit TWO events so future consumers can pick whichever shape they prefer:
     //   - `new_message`: generic event the existing ConversationsInbox page already listens to
@@ -564,7 +888,17 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     const inboxIdStr = inboxRow.id.toString();
     this.chatGateway.emitToWorkspace(account.workspace_id, 'new_message', {
       inbox_id: inboxIdStr,
-      message: { text },
+      message: {
+        id: insertedMessage.id.toString(),
+        direction: 'INCOMING',
+        text,
+        type: messageType,
+        status: 'received',
+        reactions: [],
+        parsed_files: messageType === 'text' ? [] : null,
+        created_at: insertedMessage.created_at?.toISOString?.() ?? new Date().toISOString(),
+        updated_at: insertedMessage.updated_at?.toISOString?.() ?? new Date().toISOString(),
+      },
     });
     this.chatGateway.emitToWorkspace(account.workspace_id, 'whatsapp.message.inbound', {
       account_id: account.id.toString(),
@@ -696,6 +1030,90 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
    * Falls back to FALLBACK_COUNTRY_ID when nothing matches (e.g., countries table
    * empty or unusual phone code). A proper parser ships in Phase 5B.
    */
+  /**
+   * Download inbound WhatsApp media from Meta Graph API and store in S3.
+   * Updates wa_messages.files with [{url, name, size, mime}] so getMessages()
+   * returns it as parsed_files automatically.
+   * Called fire-and-forget — errors are logged but don't fail the message save.
+   */
+  private async downloadWaMediaToS3(
+    messageId: bigint,
+    msg: any,
+    accessToken: string,
+    workspaceId: bigint,
+    inboxId: bigint,
+  ): Promise<void> {
+    const version = this.config.get<string>('META_GRAPH_API_VERSION') ?? 'v22.0';
+    const type = String(msg.type ?? '').toLowerCase();
+    const mediaObj = msg[type] ?? {};
+    const mediaId = mediaObj.id;
+    if (!mediaId || !accessToken) return;
+
+    // 1. Get media metadata + temporary download URL from Graph API
+    const urlRes = await fetch(`https://graph.facebook.com/${version}/${mediaId}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!urlRes.ok) {
+      this.logger.warn(`[WA MEDIA] metadata fetch failed for ${mediaId}: HTTP ${urlRes.status}`);
+      return;
+    }
+    const urlData = await urlRes.json();
+    const downloadUrl: string = urlData.url;
+    if (!downloadUrl) {
+      this.logger.warn(`[WA MEDIA] no url in metadata for ${mediaId}`);
+      return;
+    }
+
+    // 2. Download binary
+    const binRes = await fetch(downloadUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!binRes.ok) {
+      this.logger.warn(`[WA MEDIA] binary download failed for ${mediaId}: HTTP ${binRes.status}`);
+      return;
+    }
+    const buffer = Buffer.from(await binRes.arrayBuffer());
+
+    // 3. Determine MIME type + file name
+    const mimeType: string = urlData.mime_type ?? mediaObj.mime_type ?? 'application/octet-stream';
+    const extPart = mimeType.split('/')[1]?.split(';')[0] ?? 'bin';
+    const baseName = mediaObj.filename ?? (mediaObj.sha256 ? mediaObj.sha256.substring(0, 8) : `media-${Date.now()}`);
+    const fileName = `${baseName}.${extPart}`.replace(/[^a-zA-Z0-9._-]/g, '_');
+
+    // 4. Upload to S3
+    const s3Key = await this.s3.upload(buffer, `whatsapp/${workspaceId}/${messageId}/${fileName}`, mimeType);
+    if (!s3Key) {
+      this.logger.warn(`[WA MEDIA] S3 upload failed for wa_message ${messageId}: ${this.s3.lastError}`);
+      return;
+    }
+
+    // 5. Signed URL (7-day expiry — re-generated on each getMessages() call if needed)
+    const signedUrl = await this.s3.getSignedUrl(s3Key, 3600 * 24 * 7);
+    if (!signedUrl) return;
+
+    // 6. Persist to wa_messages.files — store s3Key so getMessages() can refresh the signed URL later
+    const fileEntry = {
+      url: signedUrl,
+      s3Key,
+      name: mediaObj.filename ?? baseName,
+      size: Number(urlData.file_size ?? buffer.length),
+      mime: mimeType,
+    };
+    await this.prisma.wa_messages.update({
+      where: { id: messageId },
+      data: { files: JSON.stringify([fileEntry]), updated_at: new Date() },
+    });
+
+    // 7. Notify open conversations so the image/video renders without refresh
+    this.chatGateway.emitToWorkspace(workspaceId, 'message_media_ready', {
+      inbox_id: inboxId.toString(),
+      wa_message_id: messageId.toString(),
+      parsed_files: [fileEntry],
+    });
+
+    this.logger.log(`[WA MEDIA] stored wa_message ${messageId}: ${fileName} (${buffer.length}B)`);
+  }
+
   private async detectCountryId(waId: string): Promise<bigint> {
     const digits = waId.replace(/[^0-9]/g, '');
     for (const len of [3, 2, 1]) {
@@ -1024,7 +1442,17 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     // Broadcast
     this.chatGateway.emitToWorkspace(page.workspace_id, 'new_message', {
       inbox_id: inboxRow.id.toString(),
-      message: { text },
+      message: {
+        id: message.id.toString(),
+        direction: 'INCOMING',
+        text,
+        type: msgType,
+        status: 'received',
+        reactions: [],
+        parsed_files: msgType === 'text' ? [] : null,
+        created_at: message.created_at?.toISOString?.() ?? new Date().toISOString(),
+        updated_at: message.updated_at?.toISOString?.() ?? new Date().toISOString(),
+      },
     });
     this.chatGateway.emitToWorkspace(page.workspace_id, 'instagram.message.inbound', {
       page_id: page.id.toString(),
@@ -1265,7 +1693,17 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     // Broadcast so UI updates live
     this.chatGateway.emitToWorkspace(page.workspace_id, 'new_message', {
       inbox_id: inboxRow.id.toString(),
-      message: { text },
+      message: {
+        id: message.id.toString(),
+        direction: 'OUTGOING',
+        text,
+        type: msgType,
+        status: 'sent',
+        reactions: [],
+        parsed_files: msgType === 'text' ? [] : null,
+        created_at: message.created_at?.toISOString?.() ?? new Date().toISOString(),
+        updated_at: message.updated_at?.toISOString?.() ?? new Date().toISOString(),
+      },
     });
 
     this.logger.log(`INSTA echo saved: chat=${chat.id} message=${message.id} mid=${mid} customer=${customerId}`);

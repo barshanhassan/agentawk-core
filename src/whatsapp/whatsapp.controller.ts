@@ -270,4 +270,27 @@ export class WhatsappController {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     return this.whatsappService.tokenStatus(workspaceId);
   }
+
+  /**
+   * POST /whatsapp/qr-register — create a QR-code WhatsApp account row and
+   * instruct the WhatsApp microservice to start a Baileys session. The
+   * microservice emits WA_QR_CODE back so the frontend can render the scan QR.
+   * Body: { phone: string, name: string }
+   */
+  @Post('qr-register')
+  async qrRegister(@Request() req, @Body() body: { phone?: string; name?: string }) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    const userId = BigInt(req.user.sub || req.user.id || 0);
+    return this.whatsappService.qrRegister(workspaceId, userId, body);
+  }
+
+  /**
+   * POST /whatsapp/qr-disconnect/:account_id — disconnect a QR-code session
+   * and remove the Baileys credentials from the microservice.
+   */
+  @Post('qr-disconnect/:account_id')
+  async qrDisconnect(@Param('account_id') accountId: string, @Request() req) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.whatsappService.qrDisconnect(workspaceId, BigInt(accountId));
+  }
 }

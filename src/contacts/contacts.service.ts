@@ -1598,4 +1598,94 @@ export class ContactsService {
     out.push(cur);
     return out;
   }
+
+  /**
+   * Global simple search — mirrors replyagent's POST /contact/search/simple.
+   * type: first_name | last_name | full_name | id | whatsapp | phone | email | instagram | messenger
+   */
+  async simpleSearch(workspaceId: bigint, term: string, type: string) {
+    const t = term.trim();
+    if (!t) return { contacts: [] };
+
+    let contactIds: bigint[] | null = null;
+
+    if (type === 'whatsapp' || type === 'phone') {
+      const slug = type === 'whatsapp' ? 'whatsapp' : 'mobile';
+      const mobiles = await this.prisma.contact_mobiles.findMany({
+        where: {
+          ownership_type: 'App\\Models\\Contact',
+          full_mobile_number: { contains: t },
+          slug,
+        },
+        select: { ownership_id: true },
+        take: 50,
+      });
+      contactIds = mobiles.map((m) => m.ownership_id);
+    } else if (type === 'email') {
+      const emails = await this.prisma.contact_emails.findMany({
+        where: { email: { contains: t } },
+        select: { ownership_id: true },
+        take: 50,
+      });
+      contactIds = emails.map((e) => e.ownership_id);
+    } else if (type === 'instagram') {
+      const chats = await this.prisma.insta_chats.findMany({
+        where: {
+          OR: [
+            { name: { contains: t } },
+            { username: { contains: t } },
+          ],
+        },
+        select: { contact_id: true },
+        take: 50,
+      });
+      contactIds = chats.filter((c) => c.contact_id).map((c) => c.contact_id as bigint);
+    } else if (type === 'messenger') {
+      const chats = await this.prisma.fb_chats.findMany({
+        where: {
+          OR: [
+            { first_name: { contains: t } },
+            { last_name: { contains: t } },
+          ],
+        },
+        select: { contact_id: true },
+        take: 50,
+      });
+      contactIds = chats.filter((c) => c.contact_id).map((c) => c.contact_id as bigint);
+    }
+
+    const where: any = {
+      workspace_id: workspaceId,
+      deleted_at: null,
+      status: 'ACTIVE',
+    };
+
+    if (contactIds !== null) {
+      if (contactIds.length === 0) return { contacts: [] };
+      where.id = { in: contactIds };
+    } else if (type === 'id') {
+      try { where.id = BigInt(t); } catch { return { contacts: [] }; }
+    } else if (type === 'first_name') {
+      where.first_name = { contains: t };
+    } else if (type === 'last_name') {
+      where.last_name = { contains: t };
+    } else {
+      where.full_name = { contains: t };
+    }
+
+    const contacts = await this.prisma.contacts.findMany({
+      where,
+      take: 20,
+      orderBy: { updated_at: 'desc' },
+    });
+
+    return {
+      contacts: contacts.map((c) => ({
+        id: c.id.toString(),
+        full_name: c.full_name || `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim() || 'Unknown',
+        first_name: c.first_name,
+        last_name: c.last_name,
+      })),
+    };
+  }
 }

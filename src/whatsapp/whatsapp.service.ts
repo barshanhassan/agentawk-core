@@ -1369,4 +1369,108 @@ export class WhatsappService {
       },
     };
   }
+
+  /**
+   * Create a QR-code WhatsApp account row and instruct the microservice to
+   * start a Baileys session. The microservice emits WA_QR_CODE back via
+   * RabbitMQ, which the backend forwards to the workspace via WebSocket so
+   * the frontend can render the QR.
+   */
+  async qrRegister(
+    workspaceId: bigint,
+    userId: bigint,
+    payload: { phone?: string; name?: string },
+  ) {
+    const phone = payload?.phone?.trim() ?? '';
+    const name = payload?.name?.trim() || 'WhatsApp QR';
+
+    await this.assertChannelCapacity(workspaceId);
+
+    const now = new Date();
+    const placeholderWabaId = `qr_${workspaceId}_${now.getTime()}`;
+
+    const account = await this.prisma.wa_accounts.create({
+      data: {
+        workspace_id: workspaceId,
+        user_id: userId,
+        waba_id: placeholderWabaId,
+        name,
+        currency: 'USD',
+        timezone_id: '0',
+        message_template_namespace: '',
+        access_token: '',
+        status: 'PENDING',
+        service_account_id: '',
+        onboard_platform: 'qr_code',
+        is_migrated: 0,
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    // Create a placeholder phone number row (updated when Baileys connects)
+    await this.prisma.wa_phone_numbers.create({
+      data: {
+        wa_account_id: account.id,
+        wa_number_id: `qr_${account.id}`,
+        display_phone_number: phone || 'Pending',
+        phone_number: phone || '',
+        pin_code: '000000',
+        verified_name: name,
+        code_verification_status: 'NOT_VERIFIED',
+        status: 'PENDING',
+        quality_rating: 'UNKNOWN',
+        platform_type: 'QR_CODE',
+        auto_reply_interval: '247',
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    // Tell the microservice to start a Baileys session
+    const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
+    const whatsappQueue = this.config.get<string>('RABBITMQ_WHATSAPP_QUEUE') || 'whatsapp';
+    await this.rabbit.publish(exchange, whatsappQueue, {
+      event: 'WA_QR_REGISTER',
+      payload: {
+        accountId: account.id.toString(),
+        meta: { backend_wa_account_id: account.id.toString() },
+      },
+    });
+
+    this.logger.log(`qrRegister: created wa_account ${account.id} (workspace=${workspaceId}), WA_QR_REGISTER published`);
+
+    return {
+      account_id: account.id.toString(),
+      status: 'PENDING',
+      message: 'Baileys session starting — listen for whatsapp.qr_code socket event',
+    };
+  }
+
+  /**
+   * Disconnect a QR-code session. Tells the microservice to stop the Baileys
+   * session, then marks the account DELETED.
+   */
+  async qrDisconnect(workspaceId: bigint, accountId: bigint) {
+    const account = await this.prisma.wa_accounts.findFirst({
+      where: { id: accountId, workspace_id: workspaceId, onboard_platform: 'qr_code', deleted_at: null },
+    });
+    if (!account) throw new NotFoundException('QR-code WhatsApp account not found');
+
+    const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
+    const whatsappQueue = this.config.get<string>('RABBITMQ_WHATSAPP_QUEUE') || 'whatsapp';
+    await this.rabbit.publish(exchange, whatsappQueue, {
+      event: 'WA_QR_DISCONNECT',
+      payload: { accountId: accountId.toString() },
+    });
+
+    const now = new Date();
+    await this.prisma.wa_accounts.update({
+      where: { id: accountId },
+      data: { status: 'DISCONNECTED', deleted_at: now, updated_at: now },
+    });
+
+    this.logger.log(`qrDisconnect: wa_account ${accountId} disconnected and soft-deleted`);
+    return { success: true };
+  }
 }

@@ -195,6 +195,17 @@ export class ContactsController {
     return this.service.getContactForMerge(workspaceId, BigInt(id));
   }
 
+  /** POST /api/contacts/search/simple — body: { search, type } */
+  @Post('search/simple')
+  async simpleSearch(@Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.simpleSearch(
+      workspaceId,
+      String(body.search ?? ''),
+      String(body.type ?? 'full_name'),
+    );
+  }
+
   /** POST /api/contacts/search-destination — body: { current_contact_id, key } */
   @Post('search-destination')
   async searchDestination(@Body() body: any, @Request() req: any) {

@@ -137,8 +137,23 @@ export class NotificationsService {
    * narrow by inbox.assigned_to once assignment is wired in inbox flow.
    */
   @OnEvent('message.inbound')
-  async onInboundMessage(payload: { workspaceId: bigint; inboxId: bigint; channel?: string }) {
+  async onInboundMessage(payload: { workspaceId: bigint; inboxId: bigint; contactId?: bigint; channel?: string; text?: string }) {
     if (!payload?.workspaceId) return;
+
+    let contactName = 'Unknown';
+    if (payload.contactId) {
+      const contact = await this.prisma.contacts.findUnique({
+        where: { id: payload.contactId },
+        select: { full_name: true, first_name: true, last_name: true },
+      });
+      if (contact) {
+        contactName =
+          contact.full_name ||
+          `${contact.first_name || ''} ${contact.last_name || ''}`.trim() ||
+          'Customer';
+      }
+    }
+
     const users = await this.prisma.users.findMany({
       where: {
         modelable_type: 'App\\Models\\Workspace',
@@ -155,8 +170,12 @@ export class NotificationsService {
         notifiableType: 'App\\Models\\User',
         notifiableId: u.id,
         data: {
+          title: `New message from ${contactName}`,
+          message: payload.text ?? '',
           inbox_id: payload.inboxId.toString(),
           channel: payload.channel ?? 'unknown',
+          contact_name: contactName,
+          action_url: '/conversations/inbox',
         },
         triggerableType: 'App\\Models\\Inbox',
         triggerableId: payload.inboxId,

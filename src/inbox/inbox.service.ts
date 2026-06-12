@@ -607,10 +607,20 @@ export class InboxService {
             this.logger.warn(`Failed to load gallery media for message ${msg.id}: ${e.message}`);
           }
         }
-        // Parse inline files JSON stored by sendMessage (S3 uploads)
+        // Parse inline files JSON stored by sendMessage (S3 uploads) or WA inbound media download.
+        // If entry has s3Key, refresh the signed URL so it never expires for the viewer.
         if (item.files && typeof item.files === 'string') {
           try {
-            item.parsed_files = JSON.parse(item.files);
+            const rawFiles = JSON.parse(item.files);
+            if (Array.isArray(rawFiles)) {
+              item.parsed_files = await Promise.all(rawFiles.map(async (f: any) => {
+                if (f.s3Key) {
+                  const freshUrl = await this.s3.getSignedUrl(f.s3Key, 3600 * 24 * 7);
+                  return { ...f, url: freshUrl ?? f.url };
+                }
+                return f;
+              }));
+            }
           } catch {}
         }
         // Instagram inbound/echo: payload has [{type, media:{fileUrl(direct S3 URL),...}}]
@@ -1046,9 +1056,24 @@ export class InboxService {
 
       // Real-time emission so the open chat updates instantly. For WhatsApp the
       // bubble shows status='pending' until WA_OUTBOUND_MESSAGE_STATUS flips it.
+      // We normalize the shape here (no raw BigInt fields) so socket.io can
+      // JSON-serialize it without throwing.
+      const sm = savedMessage as any;
+      let smParsedFiles: any = null;
+      try { smParsedFiles = sm?.files ? JSON.parse(sm.files) : null; } catch { smParsedFiles = null; }
       this.chatGateway.emitToWorkspace(inbox.workspace_id, 'new_message', {
         inbox_id: inboxId.toString(),
-        message: savedMessage,
+        message: {
+          id: sm?.id?.toString?.() ?? null,
+          direction: 'OUTGOING',
+          text: sm?.text ?? null,
+          type: sm?.type ?? 'text',
+          status: sm?.status ?? 'pending',
+          reactions: [],
+          parsed_files: smParsedFiles,
+          created_at: sm?.created_at?.toISOString?.() ?? new Date().toISOString(),
+          updated_at: sm?.updated_at?.toISOString?.() ?? new Date().toISOString(),
+        },
       });
 
       return {
@@ -1645,6 +1670,14 @@ export class InboxService {
       );
     }
 
+    // Push reaction to WhatsApp Cloud API (fire-and-forget)
+    const isWhatsApp = (inbox.modelable_type ?? '').toLowerCase().includes('whatsappchat');
+    if (isWhatsApp && igOp && igEmoji) {
+      this.pushWhatsAppReaction(inbox.modelable_id, messageId, igOp, igEmoji).catch((e: any) =>
+        this.logger.warn(`[WA REACTION] push failed: ${e?.message ?? e}`),
+      );
+    }
+
     return result;
   }
 
@@ -1716,6 +1749,44 @@ export class InboxService {
       throw new Error(JSON.stringify(err));
     }
     this.logger.log(`[IG REACTION] ${op} ${emoji} → ok`);
+  }
+
+  /** Forward agent reaction to WhatsApp Cloud API. */
+  private async pushWhatsAppReaction(
+    chatId: bigint,
+    messageId: bigint,
+    op: 'add' | 'remove',
+    emoji: string,
+  ): Promise<void> {
+    const chat = await this.prisma.wa_chats.findUnique({ where: { id: chatId } });
+    if (!chat) return;
+    const account = await this.prisma.wa_accounts.findUnique({ where: { id: chat.wa_account_id } });
+    if (!account?.access_token) return;
+    const phone = await this.prisma.wa_phone_numbers.findFirst({ where: { wa_account_id: account.id } });
+    if (!phone?.wa_number_id) return;
+    const msg = await this.prisma.wa_messages.findUnique({ where: { id: messageId } });
+    if (!msg?.wamid) {
+      this.logger.warn(`[WA REACTION] no wamid for wa_message ${messageId} — reaction not sent`);
+      return;
+    }
+    const version = this.config.get<string>('META_GRAPH_API_VERSION') ?? 'v22.0';
+    const body = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: chat.wa_id,
+      type: 'reaction',
+      reaction: { message_id: msg.wamid, emoji: op === 'remove' ? '' : emoji },
+    };
+    const res = await fetch(`https://graph.facebook.com/${version}/${phone.wa_number_id}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${account.access_token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err?.error?.message ?? `HTTP ${res.status}`);
+    }
+    this.logger.log(`[WA REACTION] ${op} ${emoji} on wamid ${msg.wamid} → ${chat.wa_id}`);
   }
 
   // ─── Reminders (24h-window WhatsApp + Telegram + Z-API) ────────────
