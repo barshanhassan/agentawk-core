@@ -797,8 +797,26 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       return;
     }
 
-    // 4b. Insert wa_messages row
-    const text = msg.text?.body ?? null;
+    // 4b. Insert wa_messages row — with idempotency guard to prevent duplicate rows
+    // when the Meta webhook also hits /webhooks-inbound/whatsapp and the
+    // WhatsappWebhookParserService already persisted this wamid.
+    const incomingWamid = msg.id ? String(msg.id) : null;
+    if (incomingWamid) {
+      const already = await this.prisma.wa_messages.findFirst({ where: { wamid: incomingWamid }, select: { id: true } });
+      if (already) {
+        this.logger.debug(`[WA consumer] wamid ${incomingWamid} already persisted (id=${already.id}) — skipping duplicate`);
+        return;
+      }
+    }
+
+    // Extract text parity with WhatsappWebhookParserService so both paths produce
+    // the same content even when the consumer creates the row first.
+    let text: string | null = null;
+    if (messageType === 'text') text = msg.text?.body ?? null;
+    else if (messageType === 'button') text = msg.button?.text ?? null;
+    else if (messageType === 'interactive') text = JSON.stringify(msg.interactive ?? {});
+    else if (['image', 'audio', 'video', 'document'].includes(messageType)) text = msg[messageType]?.caption ?? null;
+
     const insertedMessage = await this.prisma.wa_messages.create({
       data: {
         wa_number_id: phoneNumber.id,
@@ -808,7 +826,7 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
         direction: 'INCOMING',
         text,
         status: 'received',
-        wamid: msg.id ? String(msg.id) : null,
+        wamid: incomingWamid,
         timestamp: msg.timestamp ? String(msg.timestamp) : null,
         payload: JSON.stringify(msg),
         communication_mode: 'INBOX',

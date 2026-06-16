@@ -22,26 +22,28 @@ export class RolesService {
     });
 
     // Group by immediate parent slug (one level up from leaf)
-    const groups: Record<string, { slug: string; name: string; description: string; children: any[] }> = {};
+    const groups: Record<string, { slug: string; name: string; description: string; icon: string | null; tooltip: string | null; children: any[] }> = {};
 
     for (const perm of allPerms) {
       if (perm.parent_id === parent.id) {
         // This is a group-level permission (e.g. agency.users.*)
         if (!groups[perm.slug]) {
-          groups[perm.slug] = { slug: perm.slug, name: perm.name, description: perm.description || '', children: [] };
+          groups[perm.slug] = { slug: perm.slug, name: perm.name, description: perm.description || '', icon: perm.icon || null, tooltip: perm.tooltip || null, children: [] };
         }
       } else {
         // Leaf permission — find its group parent
         const groupParent = allPerms.find(p => p.id === perm.parent_id);
         if (groupParent) {
           if (!groups[groupParent.slug]) {
-            groups[groupParent.slug] = { slug: groupParent.slug, name: groupParent.name, description: groupParent.description || '', children: [] };
+            groups[groupParent.slug] = { slug: groupParent.slug, name: groupParent.name, description: groupParent.description || '', icon: groupParent.icon || null, tooltip: groupParent.tooltip || null, children: [] };
           }
           groups[groupParent.slug].children.push({
             id: this.toStr(perm.id),
             slug: perm.slug,
             name: perm.name,
             description: perm.description || '',
+            tooltip: perm.tooltip || null,
+            icon: perm.icon || null,
           });
         }
       }

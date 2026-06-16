@@ -61,6 +61,11 @@ export class AgencyService {
       },
     });
 
+    const mobile = await this.prisma.contact_mobiles.findFirst({
+      where: { modelable_type: 'App\\Models\\Agency', modelable_id: agencyId },
+      select: { full_mobile_number: true },
+    });
+
     // Resolve all 4 logo URLs + favicon → signed URLs.
     // Replyagent Branding accessor parity: logo_light, logo_light_small, logo_dark, logo_dark_small, favicon.
     const resolveById = async (id: bigint | null | undefined): Promise<string> => {
@@ -98,7 +103,8 @@ export class AgencyService {
           logo_small: logoSmallUrl, // legacy alias (= logo_light_small)
           favicon: faviconUrl,
         } : null,
-        address: address ? this.serialize(address) : null
+        address: address ? this.serialize(address) : null,
+        phone: mobile?.full_mobile_number ?? '',
       }
     };
   }
@@ -145,6 +151,42 @@ export class AgencyService {
       }
     }
 
+    // GAP 5: persist phone into contact_mobiles
+    if (data.phone) {
+      const country = data.phone_country_iso2
+        ? await this.prisma.countries.findFirst({ where: { iso2: String(data.phone_country_iso2) }, select: { id: true, phone_code: true } })
+        : null;
+      const phoneRow = {
+        full_mobile_number: String(data.phone),
+        mobile_number: String(data.phone),
+        national_mobile_number: String(data.phone),
+        country_code: country?.phone_code ?? null,
+        country_id: country?.id ?? 1n,
+        slug: 'mobile',
+        type: 'agency',
+        is_primary: 1,
+        updated_at: new Date(),
+      };
+      const existingMobile = await this.prisma.contact_mobiles.findFirst({
+        where: { modelable_type: 'App\\Models\\Agency', modelable_id: agencyId },
+        select: { id: true },
+      });
+      if (existingMobile) {
+        await this.prisma.contact_mobiles.update({ where: { id: existingMobile.id }, data: phoneRow });
+      } else {
+        await this.prisma.contact_mobiles.create({
+          data: {
+            modelable_type: 'App\\Models\\Agency',
+            modelable_id: agencyId,
+            ownership_type: 'App\\Models\\Agency',
+            ownership_id: agencyId,
+            ...phoneRow,
+            created_at: new Date(),
+          },
+        });
+      }
+    }
+
     await this.logAgencyEvent(agencyId, 'agency_updated', data.user_id, 'App\\Models\\Agency', agencyId, data);
 
     return { success: true, agency: this.serialize(updated) };
@@ -163,27 +205,39 @@ export class AgencyService {
     };
 
     if (agency.customer_id) {
-      await this.chargebee.updateCustomerBillingAddress(agency.customer_id, billingAddress);
+      try {
+        await this.chargebee.updateCustomerBillingAddress(agency.customer_id, billingAddress);
+      } catch (err) {
+        this.logger.warn(`Chargebee billing address sync failed: ${err.message}`);
+      }
     }
 
-    // Update local address
-    await this.prisma.addresses.upsert({
-      where: { id: data.address?.id || 0 }, // Simplified
-      update: {
-        street: data.address?.street,
-        city: data.address?.city,
-        state: data.address?.state,
-        zip: data.address?.zip,
-      },
-      create: {
-        addressable_id: agencyId,
-        addressable_type: 'App\\Models\\Agency',
-        street: data.address?.street,
-        city: data.address?.city,
-        state: data.address?.state,
-        zip: data.address?.zip,
-      },
+    // GAP 1+2: fix upsert — find by agency first, then update or create; persist country_iso2
+    const addr = data.address ?? {};
+    const addressFields = {
+      street: addr.street ?? null,
+      city: addr.city ?? null,
+      state: addr.state ?? null,
+      zip: addr.zip ?? null,
+      country_iso2: addr.country_iso2 ?? null,
+      updated_at: new Date(),
+    };
+    const existingAddress = await this.prisma.addresses.findFirst({
+      where: { addressable_id: agencyId, addressable_type: 'App\\Models\\Agency' },
+      select: { id: true },
     });
+    if (existingAddress) {
+      await this.prisma.addresses.update({ where: { id: existingAddress.id }, data: addressFields });
+    } else {
+      await this.prisma.addresses.create({
+        data: {
+          addressable_id: agencyId,
+          addressable_type: 'App\\Models\\Agency',
+          ...addressFields,
+          created_at: new Date(),
+        },
+      });
+    }
 
     await this.logAgencyEvent(
       agencyId,
@@ -380,6 +434,25 @@ export class AgencyService {
 
     if (!agency) throw new NotFoundException('Agency not found');
 
+    // GAP 1: name uniqueness per agency
+    const nameExists = await this.prisma.workspaces.findFirst({
+      where: { agency_id: agencyId, name: data.name, deleted_at: null },
+      select: { id: true },
+    });
+    if (nameExists) throw new BadRequestException('A workspace with this name already exists in your agency.');
+
+    // GAP 2: subdomain/slug uniqueness across all workspaces
+    const slugExists = await this.prisma.workspaces.findFirst({
+      where: { slug: data.slug, deleted_at: null },
+      select: { id: true },
+    });
+    if (slugExists) throw new BadRequestException('This subdomain is already taken. Please choose a different one.');
+
+    // GAP 3: agents_limit guard
+    if (data.allow_agents && (data.agents_limit ?? 4) <= 0) {
+      throw new BadRequestException('Agent limit must be greater than 0 when agents are enabled.');
+    }
+
     const subscription = await this.prisma.billing_subscriptions.findFirst({
       where: { agency_id: agencyId, deleted_at: null },
     });
@@ -514,6 +587,22 @@ export class AgencyService {
     });
     if (!workspace)
       throw new NotFoundException('Workspace not found in this agency');
+
+    // GAP 4: name uniqueness on update (exclude current workspace)
+    if (data.name && data.name !== workspace.name) {
+      const nameExists = await this.prisma.workspaces.findFirst({
+        where: { agency_id: agencyId, name: data.name, deleted_at: null, NOT: { id: workspaceId } },
+        select: { id: true },
+      });
+      if (nameExists) throw new BadRequestException('A workspace with this name already exists in your agency.');
+    }
+
+    // GAP 3: agents_limit guard on update
+    const willAllowAgents = data.allow_agents ?? workspace.allow_agents;
+    const willAgentsLimit = data.agents_limit ?? Number(workspace.agents_limit);
+    if (willAllowAgents && willAgentsLimit <= 0) {
+      throw new BadRequestException('Agent limit must be greater than 0 when agents are enabled.');
+    }
 
     // Agent reassignment (agency_agent_id holds the agency-level user id).
     const oldAgentId = workspace.agency_agent_id;
@@ -763,7 +852,6 @@ export class AgencyService {
     const updateData: any = {
       first_name: data.first_name,
       last_name: data.last_name,
-      email: data.email,
       updated_at: new Date(),
     };
     if (data.language) updateData.locale = data.language;
@@ -835,6 +923,11 @@ export class AgencyService {
     if (target?.is_owner) {
       throw new BadRequestException('The agency owner cannot be deleted');
     }
+
+    // Clean up role assignments before hard-deleting (no FK cascade in Prisma schema).
+    await this.prisma.acl_roleables.deleteMany({
+      where: { roleable_id: memberId, roleable_type: 'App\\Models\\User' },
+    });
 
     const deleted = await this.prisma.users.deleteMany({
       where: { id: memberId, modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
