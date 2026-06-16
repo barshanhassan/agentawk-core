@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Query, UseGuards, Request } from '@nestjs/common';
+import { Controller, Get, Delete, Param, Query, UseGuards, Request } from '@nestjs/common';
 import { LogsService } from './logs.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
 
@@ -22,6 +22,14 @@ export class LogsController {
       date_from: q.date_from,
       date_to: q.date_to,
     });
+  }
+
+  @Delete('conversations/:id')
+  async deleteConversation(@Param('id') id: string, @Request() req: any) {
+    return this.service.deleteConversation(
+      BigInt(req.user.workspace_id || 1),
+      BigInt(id),
+    );
   }
 
   @Get('conversations/:id')

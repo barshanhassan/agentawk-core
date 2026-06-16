@@ -30,6 +30,7 @@ export class AuthService {
     const isCentral =
       !hostname.includes('agency.localhost') &&
       (hostname.includes('web.app') ||
+        hostname.includes('vercel.app') ||
         hostname.includes('localhost') ||
         hostname.includes('run.app'));
     const useTenantScope =
@@ -293,7 +294,7 @@ export class AuthService {
     } catch (error) {
       console.error(error);
       throw new InternalServerErrorException(
-        'Registration failed: ' + error.message,
+        'Registration failed: ' + (error instanceof Error ? error.message : String(error)),
       );
     }
   }

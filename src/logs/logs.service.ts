@@ -51,7 +51,8 @@ export class LogsService {
     const where: any = { workspace_id: workspaceId };
 
     // Multi-status filter — frontend can send "ACTIVE,COMPLETED" to get the
-    // union. Single value still works.
+    // union. Single value still works. Default excludes DELETED rows so they
+    // only appear when the user explicitly filters for them.
     if (q.status) {
       const statuses = String(q.status)
         .split(',')
@@ -59,6 +60,8 @@ export class LogsService {
         .filter(Boolean);
       if (statuses.length === 1) where.status = statuses[0];
       else if (statuses.length > 1) where.status = { in: statuses };
+    } else {
+      where.status = { not: 'DELETED' };
     }
 
     // Date range — clamps on inbox.created_at (the conversation's start).
@@ -100,6 +103,21 @@ export class LogsService {
       : items;
 
     return { logs: filtered, total, page, limit };
+  }
+
+  /** Soft-delete a conversation log by marking it DELETED. */
+  async deleteConversation(workspaceId: bigint, inboxId: bigint) {
+    const row = await this.prisma.inbox.findFirst({
+      where: { id: inboxId, workspace_id: workspaceId },
+    });
+    if (!row) {
+      throw new NotFoundException({ success: false, message: 'Conversation not found' });
+    }
+    await this.prisma.inbox.update({
+      where: { id: inboxId },
+      data: { status: 'DELETED' },
+    });
+    return { success: true };
   }
 
   /**
@@ -274,7 +292,7 @@ export class LogsService {
     }
 
     const [total, unassigned, active, completed] = await Promise.all([
-      this.prisma.inbox.count({ where: { workspace_id: workspaceId, ...dateClause } }),
+      this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: { not: 'DELETED' as any }, ...dateClause } }),
       this.prisma.inbox.count({
         where: { workspace_id: workspaceId, status: 'UNASSIGNED' as any, ...dateClause },
       }),
