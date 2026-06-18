@@ -33,14 +33,40 @@ export class TasksService {
 
     const tasks = await this.prisma.tasks.findMany({
       where,
-      include: {
-        contacts: true,
-        companies: true,
-      },
       orderBy: { datetime: 'asc' },
     });
 
-    return { success: true, tasks };
+    if (!tasks.length) return { success: true, tasks: [] };
+
+    // Manual joins — tasks model has no @relation fields in Prisma
+    const contactIds = [...new Set(tasks.map((t) => t.contact_id).filter(Boolean))] as bigint[];
+    const companyIds = [...new Set(tasks.map((t) => t.company_id).filter(Boolean))] as bigint[];
+    const userIds = [...new Set(tasks.map((t) => t.user_id).filter(Boolean))] as bigint[];
+
+    const [contacts, companies, users] = await Promise.all([
+      contactIds.length
+        ? this.prisma.contacts.findMany({ where: { id: { in: contactIds } }, select: { id: true, full_name: true, first_name: true, last_name: true } })
+        : Promise.resolve([]),
+      companyIds.length
+        ? this.prisma.companies.findMany({ where: { id: { in: companyIds } }, select: { id: true, name: true } })
+        : Promise.resolve([]),
+      userIds.length
+        ? this.prisma.users.findMany({ where: { id: { in: userIds } }, select: { id: true, name: true, email: true } })
+        : Promise.resolve([]),
+    ]);
+
+    const contactMap = new Map(contacts.map((c) => [c.id.toString(), c]));
+    const companyMap = new Map(companies.map((c) => [c.id.toString(), c]));
+    const userMap = new Map(users.map((u) => [u.id.toString(), u]));
+
+    const enriched = tasks.map((t) => ({
+      ...t,
+      contacts: t.contact_id ? (contactMap.get(t.contact_id.toString()) ?? null) : null,
+      companies: t.company_id ? (companyMap.get(t.company_id.toString()) ?? null) : null,
+      users: t.user_id ? (userMap.get(t.user_id.toString()) ?? null) : null,
+    }));
+
+    return { success: true, tasks: enriched };
   }
 
   /**

@@ -11,6 +11,7 @@ const WHATSAPP_CHAT_MODELABLE = 'App\\Models\\Whatsapp\\WhatsappChat';
 const WHATSAPP_MESSAGE_MODELABLE = 'App\\Models\\Whatsapp\\WhatsappMessage';
 const WHATSAPP_NUMBER_MODELABLE = 'App\\Models\\Whatsapp\\WhatsappNumber';
 const CONTACT_MODELABLE = 'App\\Models\\Contact';
+const MOBILE_CONTACT_MODELABLE = 'App\\Models\\Contact\\MobileContact';
 const WORKSPACE_MODELABLE = 'App\\Models\\Workspace';
 const FALLBACK_COUNTRY_ID = 1n; // TODO: derive from phone_code prefix; covered in Phase 5B.
 
@@ -146,10 +147,11 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
 
     const msg = await this.prisma.wa_messages.findFirst({ where: { wamid } });
     if (!msg) {
-      // Most likely the row was created by a different backend instance or
-      // wamid persistence is lagging behind. Log and bail — the next status
-      // event will likely succeed once the row catches up.
-      this.logger.warn(`WA_MESSAGE_STATUS for unknown wamid=${wamid} (status=${newStatus})`);
+      // Most likely the row was created by a different backend instance, wamid
+      // persistence is lagging behind, or the message was deleted (e.g. its
+      // contact/chat was removed) so a late read-receipt has nothing to match.
+      // Benign — drop to debug so it doesn't show up as a scary WARN.
+      this.logger.debug(`WA_MESSAGE_STATUS for unknown wamid=${wamid} (status=${newStatus})`);
       return;
     }
 
@@ -681,31 +683,45 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
    *     display_phone_number, message: { id, type, timestamp, text?, image?, ... } }
    */
   private async onInboundMessage(payload: any): Promise<void> {
-    if (!payload?.account?.businessAccountId || !payload?.phone_number_id || !payload?.contact_id || !payload?.message) {
+    if (!payload?.phone_number_id || !payload?.contact_id || !payload?.message) {
       this.logger.warn(`WA_INBOUND_MESSAGE missing required fields — dropping. Payload keys: ${Object.keys(payload ?? {}).join(',')}`);
       return;
     }
 
-    const wabaId = String(payload.account.businessAccountId);
     const metaPhoneNumberId = String(payload.phone_number_id);
     const waId = String(payload.contact_id); // customer's WhatsApp ID (phone digits, no +)
     const profileName = payload.contact_name ? String(payload.contact_name) : null;
     const msg = payload.message;
 
-    // 1. Account + phone number lookup
-    const account = await this.prisma.wa_accounts.findFirst({
-      where: { waba_id: wabaId, deleted_at: null },
+    // Early wamid idempotency check — must run before any DB writes so the
+    // WhatsappWebhookParserService path (direct Meta webhook) and this RabbitMQ
+    // consumer path don't both create contacts for the same inbound message.
+    const incomingWamid = msg?.id ? String(msg.id) : null;
+    if (incomingWamid) {
+      const already = await this.prisma.wa_messages.findFirst({ where: { wamid: incomingWamid }, select: { id: true } });
+      if (already) {
+        this.logger.debug(`[WA consumer] wamid ${incomingWamid} already persisted (id=${already.id}) — skipping duplicate`);
+        return;
+      }
+    }
+
+    // 1. Account + phone number lookup — use phone_number_id as primary key because
+    //    it is always correct from the Meta webhook; businessAccountId from the
+    //    microservice MongoDB account can be stale if an old test document is still
+    //    registered as the override_callback_uri recipient for this WABA.
+    const phoneNumber = await this.prisma.wa_phone_numbers.findFirst({
+      where: { wa_number_id: metaPhoneNumberId },
     });
-    if (!account) {
-      this.logger.warn(`No wa_accounts row for waba_id=${wabaId} — message dropped. Run manual onboarding or wait for Phase 5B.`);
+    if (!phoneNumber) {
+      this.logger.warn(`No wa_phone_numbers row for wa_number_id=${metaPhoneNumberId} — message dropped.`);
       return;
     }
 
-    const phoneNumber = await this.prisma.wa_phone_numbers.findFirst({
-      where: { wa_number_id: metaPhoneNumberId, wa_account_id: account.id },
+    const account = await this.prisma.wa_accounts.findFirst({
+      where: { id: phoneNumber.wa_account_id, deleted_at: null },
     });
-    if (!phoneNumber) {
-      this.logger.warn(`No wa_phone_numbers row for wa_number_id=${metaPhoneNumberId} on account ${account.id} — message dropped.`);
+    if (!account) {
+      this.logger.warn(`No wa_accounts row for id=${phoneNumber.wa_account_id} — message dropped.`);
       return;
     }
 
@@ -797,17 +813,8 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       return;
     }
 
-    // 4b. Insert wa_messages row — with idempotency guard to prevent duplicate rows
-    // when the Meta webhook also hits /webhooks-inbound/whatsapp and the
-    // WhatsappWebhookParserService already persisted this wamid.
-    const incomingWamid = msg.id ? String(msg.id) : null;
-    if (incomingWamid) {
-      const already = await this.prisma.wa_messages.findFirst({ where: { wamid: incomingWamid }, select: { id: true } });
-      if (already) {
-        this.logger.debug(`[WA consumer] wamid ${incomingWamid} already persisted (id=${already.id}) — skipping duplicate`);
-        return;
-      }
-    }
+    // 4b. Insert wa_messages row (wamid idempotency is enforced at the top of this
+    // handler now, before any DB writes, so no second check needed here).
 
     // Extract text parity with WhatsappWebhookParserService so both paths produce
     // the same content even when the consumer creates the row first.
@@ -957,8 +964,35 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       });
     }
 
+    // Opt the contact in for WhatsApp on this number so the profile shows an
+    // "opted in" badge (replyagent ContactHelper::optInWhatsapp on inbound).
+    this.optInWhatsapp(contact.id, phoneNumber.id, fullMobile).catch((e) =>
+      this.logger.warn(`[WA OPTIN] failed: ${e?.message ?? e}`),
+    );
+
     const referral = msg?.referral;
     if (referral && (referral.source_type === 'ad' || referral.source_type === 'ctwa_ad')) {
+      // Persist the ad-click so it shows in the contact's AD CLICKS panel.
+      // Mirrors replyagent WhatsappHelper: new Referral() field mapping.
+      this.prisma.referrals
+        .create({
+          data: {
+            workspace_id: account.workspace_id,
+            contact_id: contact.id,
+            modelable_type: WHATSAPP_MESSAGE_MODELABLE,
+            modelable_id: insertedMessage.id,
+            ad_id: String(referral.source_id ?? referral.source?.id ?? referral.ad_id ?? ''),
+            title: referral.headline ?? null,
+            subtitle: referral.body ?? null,
+            source: referral.source_type ?? 'ad',
+            type: referral.source_type ?? 'ad',
+            data: JSON.stringify(referral),
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+        })
+        .catch((e) => this.logger.warn(`[WA REFERRAL] persist failed: ${e?.message ?? e}`));
+
       this.events.emit('message.wa_ad_clicked', {
         contactId: contact.id,
         workspaceId: account.workspace_id,
@@ -975,6 +1009,49 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
   }
 
   /**
+   * Create a WhatsApp ChannelOpt for the contact's number if one doesn't exist
+   * (replyagent ContactHelper::optInWhatsapp → ChannelOpt::optIn). Linked to the
+   * specific MobileContact row (contactable) so the profile can show a per-number
+   * "opted in" badge.
+   */
+  private async optInWhatsapp(contactId: bigint, waNumberId: bigint, fullMobile: string) {
+    const noPlus = fullMobile.startsWith('+') ? fullMobile.slice(1) : fullMobile;
+    // Match by contact id + number only. The modelable_type filter is intentionally
+    // omitted: backslash-escaped morph strings compare unreliably here, and
+    // (modelable_id = this contact) + (this number) already identifies the row.
+    const mobile = await this.prisma.contact_mobiles.findFirst({
+      where: {
+        modelable_id: contactId,
+        full_mobile_number: { in: [fullMobile, noPlus] },
+      },
+      select: { id: true },
+    });
+    if (!mobile) return;
+    const exists = await this.prisma.channel_opts.findFirst({
+      where: {
+        contact_id: contactId,
+        channel: 'whatsapp',
+        contactable_type: MOBILE_CONTACT_MODELABLE,
+        contactable_id: mobile.id,
+      },
+      select: { id: true },
+    });
+    if (exists) return;
+    await this.prisma.channel_opts.create({
+      data: {
+        contact_id: contactId,
+        channel: 'whatsapp',
+        modelable_id: waNumberId,
+        modelable_type: WHATSAPP_NUMBER_MODELABLE,
+        contactable_id: mobile.id,
+        contactable_type: MOBILE_CONTACT_MODELABLE,
+        created_at: new Date(),
+        updated_at: new Date(),
+      },
+    });
+  }
+
+  /**
    * Find an existing contact by mobile number (workspace-scoped), otherwise create one.
    * Mirrors gateway PHP's WhatsappHelper::getChat() contact lookup, simplified — for
    * the country-detection logic we fall back to FALLBACK_COUNTRY_ID; proper parsing
@@ -988,21 +1065,32 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
   }) {
     const { workspaceId, fullMobile, waId, profileName } = args;
 
-    const altMobile = waId.startsWith('+') ? waId : `+${waId}`;
-    const existingMobile = await this.prisma.contact_mobiles.findFirst({
+    // Search both +CCNNN and CCNNN formats for backward compatibility with records
+    // created before normalisation was enforced. fullMobile always has + at this point.
+    const fullMobileNoPlus = fullMobile.startsWith('+') ? fullMobile.slice(1) : fullMobile;
+    const matchingMobiles = await this.prisma.contact_mobiles.findMany({
       where: {
         ownership_type: WORKSPACE_MODELABLE,
         ownership_id: workspaceId,
         modelable_type: CONTACT_MODELABLE,
-        OR: [{ full_mobile_number: fullMobile }, { full_mobile_number: altMobile }],
+        OR: [{ full_mobile_number: fullMobile }, { full_mobile_number: fullMobileNoPlus }],
       },
+      select: { modelable_id: true },
     });
 
-    if (existingMobile) {
-      const c = await this.prisma.contacts.findUnique({
-        where: { id: existingMobile.modelable_id },
+    // A number can accumulate stale contact_mobiles rows pointing at soft-deleted
+    // contacts (every time a duplicate was manually deleted, its mobile row stayed).
+    // The old code did findFirst() then bailed on deleted_at — but findFirst always
+    // returned the OLDEST (deleted) row, so every inbound created a brand-new
+    // contact and the next inbound hit the same deleted row again. Instead, scan
+    // ALL matches and reuse the oldest LIVE contact; only create if none survive.
+    if (matchingMobiles.length) {
+      const ids = matchingMobiles.map((m) => m.modelable_id);
+      const live = await this.prisma.contacts.findFirst({
+        where: { id: { in: ids }, deleted_at: null },
+        orderBy: { id: 'asc' },
       });
-      if (c && !c.deleted_at) return c;
+      if (live) return live;
     }
 
     const countryId = await this.detectCountryId(waId);

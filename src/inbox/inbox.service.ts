@@ -32,6 +32,18 @@ export class InboxService {
     private readonly s3: S3Service,
   ) {}
 
+  // In-memory signed URL cache — key: s3Key, value: {url, expiresAt ms}
+  private readonly signedUrlCache = new Map<string, { url: string; expiresAt: number }>();
+
+  private async getCachedSignedUrl(s3Key: string, ttlSeconds = 604800): Promise<string> {
+    const now = Date.now();
+    const cached = this.signedUrlCache.get(s3Key);
+    if (cached && cached.expiresAt > now + 3600_000) return cached.url; // >1hr left → reuse
+    const url = await this.s3.getSignedUrl(s3Key, ttlSeconds);
+    if (url) this.signedUrlCache.set(s3Key, { url, expiresAt: now + ttlSeconds * 1000 });
+    return url ?? '';
+  }
+
   // Convert WebM/Opus (browser MediaRecorder default) to M4A (AAC in MP4 container).
   // Instagram Platform API supports 'audio' type outbound for AAC/M4A format.
   private async convertWebmToM4a(buffer: Buffer): Promise<Buffer> {
@@ -590,33 +602,50 @@ export class InboxService {
       });
     }
 
+    // Batch-load gallery media — one query instead of N
+    const galleryIds = messages
+      .filter((m: any) => m.gallery_media_id)
+      .map((m: any) => {
+        try {
+          return typeof m.gallery_media_id === 'string'
+            ? BigInt((m.gallery_media_id as string).split(',')[0])
+            : BigInt(m.gallery_media_id);
+        } catch { return null; }
+      })
+      .filter(Boolean) as bigint[];
+
+    const galleryMap = new Map<string, any>();
+    if (galleryIds.length > 0) {
+      const galleryItems = await this.prisma.media_gallery.findMany({ where: { id: { in: galleryIds } } });
+      for (const gi of galleryItems) galleryMap.set(String(gi.id), gi);
+    }
+
     // Enrich with Gallery Media and parse inline files JSON
     const enrichedMessages = await Promise.all(
       messages.map(async (msg) => {
         const item = msg as any;
+
+        // Use batched gallery map — no per-message DB query
         if (msg.gallery_media_id) {
           try {
             const mediaId = typeof msg.gallery_media_id === 'string'
-              ? BigInt(msg.gallery_media_id.split(',')[0])
+              ? BigInt((msg.gallery_media_id as string).split(',')[0])
               : BigInt(msg.gallery_media_id);
-
-            item.gallery_media = await this.prisma.media_gallery.findUnique({
-              where: { id: mediaId }
-            });
+            item.gallery_media = galleryMap.get(String(mediaId)) ?? null;
           } catch (e) {
             this.logger.warn(`Failed to load gallery media for message ${msg.id}: ${e.message}`);
           }
         }
-        // Parse inline files JSON stored by sendMessage (S3 uploads) or WA inbound media download.
-        // If entry has s3Key, refresh the signed URL so it never expires for the viewer.
+
+        // Parse inline files JSON — use cached signed URLs to avoid S3 API on every poll
         if (item.files && typeof item.files === 'string') {
           try {
             const rawFiles = JSON.parse(item.files);
             if (Array.isArray(rawFiles)) {
               item.parsed_files = await Promise.all(rawFiles.map(async (f: any) => {
                 if (f.s3Key) {
-                  const freshUrl = await this.s3.getSignedUrl(f.s3Key, 3600 * 24 * 7);
-                  return { ...f, url: freshUrl ?? f.url };
+                  const freshUrl = await this.getCachedSignedUrl(f.s3Key);
+                  return { ...f, url: freshUrl || f.url };
                 }
                 return f;
               }));
@@ -624,7 +653,6 @@ export class InboxService {
           } catch {}
         }
         // Instagram inbound/echo: payload has [{type, media:{fileUrl(direct S3 URL),...}}]
-        // Bucket is private — generate signed URLs so the browser can display them.
         if (!item.parsed_files && item.payload && typeof item.payload === 'string' && item.insta_chat_id) {
           try {
             const attachments = JSON.parse(item.payload);
@@ -634,7 +662,7 @@ export class InboxService {
                 let url = rawUrl;
                 if (rawUrl.includes('.amazonaws.com/')) {
                   const s3Key = rawUrl.split('.amazonaws.com/')[1];
-                  url = (await this.s3.getSignedUrl(s3Key, 3600 * 24 * 7)) ?? rawUrl;
+                  url = (await this.getCachedSignedUrl(s3Key)) || rawUrl;
                 }
                 return {
                   url,
@@ -744,6 +772,23 @@ export class InboxService {
             this.logger.warn(`[IG AUDIO] WebM→M4a conversion failed (${convErr.message}) — uploading original`);
           }
         }
+        // WhatsApp does not support audio/webm — convert to M4A (AAC) which WhatsApp supports
+        if (
+          type && type.toLowerCase().includes('whatsapp') &&
+          file.mimetype && file.mimetype.startsWith('audio/') &&
+          (file.mimetype.includes('webm') || file.originalname?.toLowerCase().endsWith('.webm'))
+        ) {
+          try {
+            this.logger.log(`[WA AUDIO] Converting ${file.originalname} (${file.mimetype}) → m4a`);
+            file.buffer = await this.convertWebmToM4a(file.buffer);
+            file.originalname = file.originalname.replace(/\.webm$/i, '.m4a');
+            file.mimetype = 'audio/mp4';
+            file.size = file.buffer.length;
+            this.logger.log(`[WA AUDIO] Converted ok size=${file.size}B`);
+          } catch (convErr) {
+            this.logger.warn(`[WA AUDIO] WebM→M4a conversion failed (${convErr.message}) — uploading original`);
+          }
+        }
         const key = `inbox/${inboxId}/attachments/${Date.now()}-${idx}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
         const s3Key = await this.s3.upload(file.buffer, key, file.mimetype);
         if (!s3Key) {
@@ -774,25 +819,18 @@ export class InboxService {
         //   2. wa_messages row at status='pending' (so the chat UI shows the bubble immediately)
         //   3. Publish WA_OUTBOUND_MESSAGE on ra/whatsapp — microservice calls Meta
         //   4. Microservice echoes WA_OUTBOUND_MESSAGE_STATUS → consumer updates row to sent/failed
-        const chat = await this.prisma.wa_chats.findUnique({
-          where: { id: modelableId },
-        });
+        const chat = await this.prisma.wa_chats.findUnique({ where: { id: modelableId } });
         if (!chat) {
           this.logger.error(`No wa_chats record found for ID ${modelableId}`);
           throw new NotFoundException('WhatsApp chat not found');
         }
-        const phone = await this.prisma.wa_phone_numbers.findUnique({
-          where: { id: chat.wa_number_id },
-        });
-        if (!phone) {
-          throw new NotFoundException('WhatsApp phone number not found for this chat');
-        }
-        const account = await this.prisma.wa_accounts.findUnique({
-          where: { id: chat.wa_account_id },
-        });
-        if (!account) {
-          throw new NotFoundException('WhatsApp account not found for this chat');
-        }
+        // Parallel lookup — saves ~1s vs 3 sequential queries
+        const [phone, account] = await Promise.all([
+          this.prisma.wa_phone_numbers.findUnique({ where: { id: chat.wa_number_id } }),
+          this.prisma.wa_accounts.findUnique({ where: { id: chat.wa_account_id } }),
+        ]);
+        if (!phone) throw new NotFoundException('WhatsApp phone number not found for this chat');
+        if (!account) throw new NotFoundException('WhatsApp account not found for this chat');
         if (!account.meta_account_id) {
           throw new BadRequestException(
             'WhatsApp account is not registered with the microservice yet (meta_account_id missing). Re-run "Connect Manually" on the WhatsApp settings page so registration completes.',
@@ -835,69 +873,82 @@ export class InboxService {
           return { success: true, message: savedMessage, note: true };
         }
 
-        const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
-        const whatsappQueue = this.config.get<string>('RABBITMQ_WHATSAPP_QUEUE') || 'whatsapp';
-        try {
-          // Build the WhatsApp Cloud-API payload.
-          // Media: image/audio/video/document each have their own top-level key.
-          // Text: fallback with optional quoted-reply context.
-          const waContext: any = { messaging_product: 'whatsapp', to: chat.wa_id };
-          if (hasFiles) {
-            const mediaUrl = uploadedFileUrls[0].url;
-            waContext.type = fileType; // 'image' | 'audio' | 'video' | 'document'
-            if (fileType === 'image') {
-              waContext.image = { link: mediaUrl };
-            } else if (fileType === 'audio') {
-              waContext.audio = { link: mediaUrl };
-            } else if (fileType === 'video') {
-              waContext.video = { link: mediaUrl };
-            } else {
-              waContext.document = { link: mediaUrl, filename: uploadedFileUrls[0].name };
-            }
-          } else {
-            waContext.type = 'text';
-            waContext.text = { body: text };
-            if (replyToMessageId) {
-              try {
-                const repliedTo = await this.prisma.wa_messages.findUnique({
-                  where: { id: BigInt(replyToMessageId) },
-                  select: { wamid: true } as any,
-                });
-                if ((repliedTo as any)?.wamid) {
-                  waContext.context = { message_id: (repliedTo as any).wamid };
-                }
-              } catch {}
-            }
-          }
-
-          await this.rabbit.publish(exchange, whatsappQueue, {
-            event: 'WA_OUTBOUND_MESSAGE',
-            payload: {
-              accountId: account.meta_account_id,
-              phoneNumberId: phone.wa_number_id,
-              context: waContext,
-              // Correlation tag — comes back via WA_OUTBOUND_MESSAGE_STATUS so the
-              // consumer can flip THIS row to sent/failed instead of guessing.
-              meta: {
-                backend_wa_message_id: savedMessage.id.toString(),
-                backend_inbox_id: inboxId.toString(),
-                workspace_id: account.workspace_id.toString(),
-              },
+        // ── EMIT SOCKET IMMEDIATELY after DB save (before rabbit.publish) ──
+        // This is what makes the message appear instantly in the sender's UI.
+        // rabbit.publish runs in the background — the user doesn't need to wait.
+        {
+          const sm2 = savedMessage as any;
+          let sm2Files: any = null;
+          try { sm2Files = sm2?.files ? JSON.parse(sm2.files) : null; } catch {}
+          this.chatGateway.emitToWorkspace(inbox.workspace_id, 'new_message', {
+            inbox_id: inboxId.toString(),
+            message: {
+              id: sm2?.id?.toString?.() ?? null,
+              direction: 'OUTGOING',
+              text: sm2?.text ?? null,
+              type: sm2?.type ?? 'text',
+              status: 'pending',
+              reactions: [],
+              parsed_files: sm2Files,
+              created_at: sm2?.created_at?.toISOString?.() ?? new Date().toISOString(),
+              updated_at: sm2?.updated_at?.toISOString?.() ?? new Date().toISOString(),
             },
           });
-          this.logger.log(
-            `WA_OUTBOUND_MESSAGE published for wa_message_id=${savedMessage.id} inbox=${inboxId}`,
-          );
-        } catch (err: any) {
-          // Don't lose the row — mark it failed locally so the user sees a ❌.
+        }
+
+        const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
+        const whatsappQueue = this.config.get<string>('RABBITMQ_WHATSAPP_QUEUE') || 'whatsapp';
+
+        // Build waContext first (may involve one DB lookup for reply-to)
+        const waContext: any = { messaging_product: 'whatsapp', to: chat.wa_id };
+        if (hasFiles) {
+          const mediaUrl = uploadedFileUrls[0].url;
+          waContext.type = fileType;
+          if (fileType === 'image') waContext.image = { link: mediaUrl };
+          else if (fileType === 'audio') waContext.audio = { link: mediaUrl };
+          else if (fileType === 'video') waContext.video = { link: mediaUrl };
+          else waContext.document = { link: mediaUrl, filename: uploadedFileUrls[0].name };
+        } else {
+          waContext.type = 'text';
+          waContext.text = { body: text };
+          if (replyToMessageId) {
+            try {
+              const repliedTo = await this.prisma.wa_messages.findUnique({
+                where: { id: BigInt(replyToMessageId) },
+                select: { wamid: true } as any,
+              });
+              if ((repliedTo as any)?.wamid) waContext.context = { message_id: (repliedTo as any).wamid };
+            } catch {}
+          }
+        }
+
+        // Publish to RabbitMQ — fire-and-forget, mark failed on error
+        this.rabbit.publish(exchange, whatsappQueue, {
+          event: 'WA_OUTBOUND_MESSAGE',
+          payload: {
+            accountId: account.meta_account_id,
+            phoneNumberId: phone.wa_number_id,
+            context: waContext,
+            meta: {
+              backend_wa_message_id: savedMessage.id.toString(),
+              backend_inbox_id: inboxId.toString(),
+              workspace_id: account.workspace_id.toString(),
+            },
+          },
+        }).then(() => {
+          this.logger.log(`WA_OUTBOUND_MESSAGE published for wa_message_id=${savedMessage.id}`);
+        }).catch(async (err: any) => {
+          this.logger.error(`rabbit.publish failed: ${err?.message ?? err}`);
           await this.prisma.wa_messages.update({
             where: { id: savedMessage.id },
             data: { status: 'failed', error_data: String(err?.message ?? err) },
+          }).catch(() => {});
+          this.chatGateway.emitToWorkspace(inbox.workspace_id, 'message_status', {
+            wa_message_id: savedMessage.id.toString(),
+            inbox_id: inboxId.toString(),
+            status: 'failed',
           });
-          throw new BadRequestException(
-            `Could not queue WhatsApp message: ${err?.message ?? err}`,
-          );
-        }
+        });
       } else if (type.includes('TelegramChat')) {
         savedMessage = await this.prisma.telegram_messages.create({
           data: {
@@ -1043,21 +1094,10 @@ export class InboxService {
         });
       }
 
-      // Update inbox last message and timestamp
-      await this.prisma.inbox.update({
-        where: { id: inboxId },
-        data: {
-          updated_at: new Date(),
-          last_updated: new Date(),
-        },
-      });
-
       this.logger.log(`Message persisted for inbox ${inboxId} (channel: ${type})`);
 
-      // Real-time emission so the open chat updates instantly. For WhatsApp the
-      // bubble shows status='pending' until WA_OUTBOUND_MESSAGE_STATUS flips it.
-      // We normalize the shape here (no raw BigInt fields) so socket.io can
-      // JSON-serialize it without throwing.
+      // Emit socket IMMEDIATELY after message is saved — before inbox.update so UI
+      // updates as fast as possible (replyagent parity).
       const sm = savedMessage as any;
       let smParsedFiles: any = null;
       try { smParsedFiles = sm?.files ? JSON.parse(sm.files) : null; } catch { smParsedFiles = null; }
@@ -1075,6 +1115,12 @@ export class InboxService {
           updated_at: sm?.updated_at?.toISOString?.() ?? new Date().toISOString(),
         },
       });
+
+      // Fire-and-forget inbox timestamp update — don't block the response
+      this.prisma.inbox.update({
+        where: { id: inboxId },
+        data: { updated_at: new Date(), last_updated: new Date() },
+      }).catch((e) => this.logger.warn(`inbox.update failed for ${inboxId}: ${e.message}`));
 
       return {
         success: true,
@@ -1198,12 +1244,47 @@ export class InboxService {
       }
     } catch (e) {}
 
+    // Fetch contact's opportunities with pipeline + step names
+    let opportunities: any[] = [];
+    if (contact?.id) {
+      try {
+        const wsId = workspaceId ?? (inbox as any).workspace_id;
+        const opps = await this.prisma.pipeline_opportunities.findMany({
+          where: { contact_id: contact.id, workspace_id: wsId },
+          orderBy: { created_at: 'desc' },
+          take: 20,
+        });
+        if (opps.length > 0) {
+          const stepIds = [...new Set(opps.map((o: any) => o.pl_step_id))];
+          const plIds = [...new Set(opps.map((o: any) => o.pl_id))];
+          const [steps, pls] = await Promise.all([
+            this.prisma.pipeline_steps.findMany({ where: { id: { in: stepIds } }, select: { id: true, name: true, bg_color: true, txt_color: true } }),
+            this.prisma.pipelines.findMany({ where: { id: { in: plIds } }, select: { id: true, name: true, currency: true } }),
+          ]);
+          const stepMap = new Map((steps as any[]).map((s) => [s.id.toString(), s]));
+          const plMap = new Map((pls as any[]).map((p) => [p.id.toString(), p]));
+          opportunities = opps.map((o: any) => ({
+            id: o.id.toString(),
+            title: o.title,
+            value: o.value,
+            currency: o.currency,
+            status: o.status,
+            closing_date: o.closing_date,
+            probability: o.probability,
+            step: stepMap.get(o.pl_step_id.toString()) ?? null,
+            pipeline: plMap.get(o.pl_id.toString()) ?? null,
+          }));
+        }
+      } catch (e) {}
+    }
+
     return {
       inbox: enrichedInbox,
       contact: contact,
       chat: chat,
       tags: contactTags,
       custom_fields: customFields,
+      opportunities,
     };
   }
 
@@ -2000,12 +2081,24 @@ export class InboxService {
    */
   async startWhatsappChat(workspaceId: bigint, userId: bigint, body: any) {
     if (!body?.contact_id) throw new BadRequestException('contact_id required');
-    if (!body?.wa_account_id || !body?.wa_number_id) {
-      throw new BadRequestException('wa_account_id and wa_number_id required');
+    if (!body?.wa_number_id) {
+      throw new BadRequestException('wa_number_id required');
     }
     const contactId = BigInt(body.contact_id);
-    const waAccountId = BigInt(body.wa_account_id);
     const waNumberId = BigInt(body.wa_number_id);
+    // The /all-channels picker only carries the number id, so derive the account
+    // from the number when the caller didn't pass wa_account_id explicitly.
+    let waAccountId: bigint;
+    if (body?.wa_account_id) {
+      waAccountId = BigInt(body.wa_account_id);
+    } else {
+      const num = await this.prisma.wa_phone_numbers.findFirst({
+        where: { id: waNumberId },
+        select: { wa_account_id: true },
+      });
+      if (!num?.wa_account_id) throw new BadRequestException('Invalid wa_number_id');
+      waAccountId = num.wa_account_id;
+    }
 
     const mobile = await this.prisma.contact_mobiles.findFirst({
       where: {
@@ -2014,11 +2107,20 @@ export class InboxService {
       },
       orderBy: [{ is_primary: 'desc' }],
     });
-    const waId = String(mobile?.full_mobile_number ?? mobile?.mobile_number ?? '').replace(/[^0-9]/g, '');
-    if (!waId) throw new BadRequestException('Contact has no phone number');
+    const rawMobile = String(mobile?.full_mobile_number ?? mobile?.mobile_number ?? '').trim();
+    const digits = rawMobile.replace(/[^0-9]/g, '');
+    if (!digits) throw new BadRequestException('Contact has no phone number');
+    // Inbound (onInboundMessage) stores wa_id WITH a leading "+". The old lookup
+    // used digits-only, so it never matched the existing chat and created a
+    // duplicate empty conversation. Match BOTH forms and create in the "+" form.
+    const waIdPlus = `+${digits}`;
 
     let chat = await this.prisma.wa_chats.findFirst({
-      where: { wa_account_id: waAccountId, wa_number_id: waNumberId, wa_id: waId },
+      where: {
+        wa_account_id: waAccountId,
+        wa_number_id: waNumberId,
+        wa_id: { in: [waIdPlus, digits] },
+      },
     });
     if (!chat) {
       chat = await this.prisma.wa_chats.create({
@@ -2026,17 +2128,23 @@ export class InboxService {
           wa_account_id: waAccountId,
           wa_number_id: waNumberId,
           contact_id: contactId,
-          wa_id: waId,
+          user_id: userId,
+          wa_id: waIdPlus,
           created_at: new Date(),
           updated_at: new Date(),
         } as any,
       });
     }
 
+    // Look up by (type + chat id) — NOT by modelable_type. The old code used the
+    // WRONG morph string ('App\Models\WhatsappChat'); inbound uses
+    // 'App\Models\Whatsapp\WhatsappChat', so the lookup never matched the real
+    // inbox and a duplicate empty conversation was created. type='WHATSAPP' +
+    // modelable_id already identifies the row uniquely.
     let inbox = await this.prisma.inbox.findFirst({
       where: {
         workspace_id: workspaceId,
-        modelable_type: 'App\\Models\\WhatsappChat',
+        type: 'WHATSAPP',
         modelable_id: chat.id,
       },
     });
@@ -2051,7 +2159,9 @@ export class InboxService {
           assigned_by: userId,
           assigned_on: new Date(),
           snooze: new Date(0),
-          modelable_type: 'App\\Models\\WhatsappChat',
+          // Correct morph string — matches whatsapp-events.consumer so the inbox
+          // list renders this conversation the same as an inbound one.
+          modelable_type: 'App\\Models\\Whatsapp\\WhatsappChat',
           modelable_id: chat.id,
           last_updated: new Date(),
           created_at: new Date(),
@@ -2301,6 +2411,24 @@ export class InboxService {
         await this.prisma.inbox.update({
           where: { id: inboxId },
           data: { folder_id: body.folder_id ? BigInt(body.folder_id) : null },
+        });
+        return { success: true };
+      }
+      case 'pause_automation': {
+        if (!contactId) throw new BadRequestException('No contact');
+        const minutes = Math.max(1, Number(body.minutes ?? 15));
+        const pausedTill = new Date(Date.now() + minutes * 60_000);
+        await this.prisma.contacts.update({
+          where: { id: contactId },
+          data: { automations_paused_till: pausedTill },
+        });
+        return { success: true, paused_till: pausedTill.toISOString() };
+      }
+      case 'resume_automation': {
+        if (!contactId) throw new BadRequestException('No contact');
+        await this.prisma.contacts.update({
+          where: { id: contactId },
+          data: { automations_paused_till: null },
         });
         return { success: true };
       }

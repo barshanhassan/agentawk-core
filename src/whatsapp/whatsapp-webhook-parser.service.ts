@@ -86,7 +86,10 @@ export class WhatsappWebhookParserService {
     value: any,
     msg: any,
   ) {
-    const fromWaId: string = msg.from;
+    const fromWaIdRaw: string = msg.from;
+    // Normalise to +CCNNN — must match the consumer (whatsapp-events.consumer.ts) so
+    // wa_chats rows keyed on wa_id are shared between both inbound paths.
+    const fromWaId: string = fromWaIdRaw.startsWith('+') ? fromWaIdRaw : `+${fromWaIdRaw}`;
     const wamid: string = msg.id;
     const type: string = msg.type ?? 'text';
 
@@ -211,18 +214,29 @@ export class WhatsappWebhookParserService {
     waId: string,
     profileName?: string,
   ) {
-    const fullMobile = waId.startsWith('+') ? waId.slice(1) : waId;
+    // Always normalise to +CCNNN format — matches the consumer (whatsapp-events.consumer.ts)
+    // so both paths look up and store the same canonical string. Previously this
+    // stripped the leading + which caused duplicate contacts (each path created its own).
+    const fullMobile = waId.startsWith('+') ? waId : `+${waId}`;
+    const fullMobileNoPlus = fullMobile.slice(1); // fallback search for old records stored without +
 
-    const mobile = await this.prisma.contact_mobiles.findFirst({
+    const matchingMobiles = await this.prisma.contact_mobiles.findMany({
       where: {
-        full_mobile_number: fullMobile,
         ownership_type: 'App\\Models\\Workspace',
         ownership_id: workspaceId,
+        OR: [{ full_mobile_number: fullMobile }, { full_mobile_number: fullMobileNoPlus }],
       },
+      select: { modelable_id: true },
     });
-    if (mobile?.modelable_id) {
-      const c = await this.prisma.contacts.findUnique({ where: { id: mobile.modelable_id } });
-      if (c) return c;
+    // Reuse the oldest LIVE contact; ignore mobiles whose contact was soft-deleted
+    // (otherwise a stale deleted row makes every inbound create a duplicate).
+    if (matchingMobiles.length) {
+      const ids = matchingMobiles.map((m) => m.modelable_id).filter(Boolean);
+      const live = await this.prisma.contacts.findFirst({
+        where: { id: { in: ids }, deleted_at: null },
+        orderBy: { id: 'asc' },
+      });
+      if (live) return live;
     }
 
     // Create contact + mobile binding

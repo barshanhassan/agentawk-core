@@ -53,25 +53,34 @@ export class ContactsService {
       take: 50, // Default pagination limit for now
     });
 
-    // Fetch tags manually to avoid Prisma relation errors
+    // Fetch tags + primary mobile in parallel
     const contactIds = contacts.map(c => c.id);
-    const tagLinks = contactIds.length > 0 ? await this.prisma.tag_links.findMany({
-      where: {
-        linkable_type: 'App\\Models\\Contact',
-        linkable_id: { in: contactIds }
-      }
-    }) : [];
+    const [tagLinks, mobiles] = await Promise.all([
+      contactIds.length > 0 ? this.prisma.tag_links.findMany({
+        where: { linkable_type: 'App\\Models\\Contact', linkable_id: { in: contactIds } },
+      }) : Promise.resolve([]),
+      contactIds.length > 0 ? this.prisma.contact_mobiles.findMany({
+        where: {
+          modelable_type: 'App\\Models\\Contact',
+          modelable_id: { in: contactIds },
+          ownership_type: 'App\\Models\\Workspace',
+          ownership_id: workspaceId,
+        },
+        orderBy: [{ is_primary: 'desc' }, { id: 'asc' }],
+      }) : Promise.resolve([]),
+    ]);
 
-    // Attach tag_links to contacts in the format the frontend expects
-    const contactsWithTags = contacts.map(contact => {
+    const contactsWithData = contacts.map(contact => {
       const contactTags = tagLinks.filter(tl => tl.linkable_id === contact.id);
+      const primaryMobile = mobiles.find(m => m.modelable_id === contact.id);
       return {
         ...contact,
-        tag_links: contactTags.map(tl => ({ tags: { name: tl.name } }))
+        tag_links: contactTags.map(tl => ({ tags: { name: tl.name } })),
+        primary_mobile: primaryMobile?.full_mobile_number ?? null,
       };
     });
 
-    return { success: true, contacts: contactsWithTags };
+    return { success: true, contacts: contactsWithData };
   }
 
   /**
@@ -103,11 +112,17 @@ export class ContactsService {
       emails,
       tasksCount,
       bookingsCount,
+      opportunitiesCount,
       customFields,
       tasks,
       bookings,
+      rawOpportunities,
       twilioAccounts,
       supportNumberRow,
+      companyContacts,
+      adClicks,
+      adClicksCount,
+      channelOpts,
     ] = await Promise.all([
       this.prisma.tag_links.findMany({
         where: { linkable_type: 'App\\Models\\Contact', linkable_id: contact.id },
@@ -128,6 +143,9 @@ export class ContactsService {
       this.prisma.bookings
         .count({ where: { workspace_id: workspaceId, contact_id: contact.id } })
         .catch(() => 0),
+      this.prisma.pipeline_opportunities
+        .count({ where: { contact_id: contact.id, workspace_id: workspaceId } })
+        .catch(() => 0),
       this.customFieldsService
         .getEntityValues('Contact', contact.id)
         .catch(() => [] as any[]),
@@ -146,6 +164,13 @@ export class ContactsService {
           take: 5,
         })
         .catch(() => [] as any[]),
+      this.prisma.pipeline_opportunities
+        .findMany({
+          where: { contact_id: contact.id, workspace_id: workspaceId },
+          orderBy: { created_at: 'desc' },
+          take: 5,
+        })
+        .catch(() => [] as any[]),
       // Workspace's twilio accounts — needed to scope the calls count below.
       this.prisma.twilio_accounts
         .findMany({ where: { workspace_id: workspaceId, deleted_at: null }, select: { id: true } })
@@ -158,14 +183,59 @@ export class ContactsService {
           select: { sn_number: true },
         })
         .catch(() => null),
+      // Other contacts in the same company (CONTACTS sidebar section).
+      contact.company_id
+        ? this.prisma.contacts
+            .findMany({
+              where: { company_id: contact.company_id, deleted_at: null, id: { not: contact.id } },
+              take: 10,
+              orderBy: { id: 'asc' },
+              select: { id: true, first_name: true, last_name: true, full_name: true },
+            })
+            .catch(() => [] as any[])
+        : Promise.resolve([] as any[]),
+      // AD CLICKS — Meta ad-click referrals captured on inbound (replyagent: referrals table).
+      this.prisma.referrals
+        .findMany({
+          where: { contact_id: contact.id, workspace_id: workspaceId },
+          orderBy: { id: 'desc' },
+          take: 20,
+        })
+        .catch(() => [] as any[]),
+      this.prisma.referrals
+        .count({ where: { contact_id: contact.id, workspace_id: workspaceId } })
+        .catch(() => 0),
+      // Per-field opt-ins — channel_opts.contactable points at the mobile/email row.
+      this.prisma.channel_opts
+        .findMany({
+          where: { contact_id: contact.id },
+          select: { id: true, channel: true, contactable_type: true, contactable_id: true },
+        })
+        .catch(() => [] as any[]),
     ]);
 
+    // Index per-field opt-ins by the contactable (mobile / email) row id so each
+    // serialized number / email can carry an `opted_in` flag + the optin id (for unsubscribe).
+    const MOBILE_CONTACTABLE = 'App\\Models\\Contact\\MobileContact';
+    const EMAIL_CONTACTABLE = 'App\\Models\\Contact\\EmailContact';
+    const optinByMobile = new Map<string, any>();
+    const optinByEmail = new Map<string, any>();
+    for (const o of channelOpts as any[]) {
+      if (!o.contactable_id) continue;
+      const key = o.contactable_id.toString();
+      if (o.contactable_type === MOBILE_CONTACTABLE) optinByMobile.set(key, o);
+      else if (o.contactable_type === EMAIL_CONTACTABLE) optinByEmail.set(key, o);
+    }
+    const withMobileOptin = (m: any) => {
+      const o = optinByMobile.get(m.id.toString());
+      return { ...this.serializeMobile(m), opted_in: !!o, optin_id: o ? o.id.toString() : null };
+    };
     const phones = allMobiles
       .filter((m) => String(m.type ?? 'phone').toLowerCase() !== 'whatsapp')
-      .map((m) => this.serializeMobile(m));
+      .map(withMobileOptin);
     const whatsapps = allMobiles
       .filter((m) => String(m.type ?? '').toLowerCase() === 'whatsapp')
-      .map((m) => this.serializeMobile(m));
+      .map(withMobileOptin);
     const supportNumberTask = supportNumberRow?.sn_number ?? null;
 
     // ─── Wave B — the two lookups that depend on Wave A results ──────
@@ -177,7 +247,7 @@ export class ContactsService {
       new Set(tasks.map((t) => t.user_id).filter((x): x is bigint => !!x)),
     );
 
-    const [taskUsers, callsCount] = await Promise.all([
+    const [taskUsers, callsCount, callsList] = await Promise.all([
       taskUserIds.length
         ? this.prisma.users.findMany({
             where: { id: { in: taskUserIds } },
@@ -194,8 +264,54 @@ export class ContactsService {
             })
             .catch(() => 0)
         : Promise.resolve(0),
+      allNumbers.length && twilioAccountIds.length
+        ? this.prisma.twilio_call_logs
+            .findMany({
+              where: {
+                twilio_account_id: { in: twilioAccountIds },
+                OR: [{ from_number: { in: allNumbers } }, { to_number: { in: allNumbers } }],
+              },
+              orderBy: { created_at: 'desc' },
+              take: 5,
+            })
+            .catch(() => [] as any[])
+        : Promise.resolve([] as any[]),
     ]);
     const taskUserById = new Map(taskUsers.map((u) => [u.id.toString(), u]));
+
+    // Enrich opportunities with step + pipeline names (same pattern as inbox.service).
+    let enrichedOpportunities: any[] = [];
+    if ((rawOpportunities as any[]).length > 0) {
+      try {
+        const stepIds = [...new Set((rawOpportunities as any[]).map((o) => o.pl_step_id))];
+        const plIds   = [...new Set((rawOpportunities as any[]).map((o) => o.pl_id))];
+        const [steps, pls] = await Promise.all([
+          this.prisma.pipeline_steps.findMany({
+            where: { id: { in: stepIds } },
+            select: { id: true, name: true, bg_color: true, txt_color: true },
+          }),
+          this.prisma.pipelines.findMany({
+            where: { id: { in: plIds } },
+            select: { id: true, name: true, currency: true },
+          }),
+        ]);
+        const stepMap = new Map((steps as any[]).map((s) => [s.id.toString(), s]));
+        const plMap   = new Map((pls as any[]).map((p) => [p.id.toString(), p]));
+        enrichedOpportunities = (rawOpportunities as any[]).map((o) => ({
+          id: o.id.toString(),
+          title: o.title,
+          name: o.title,
+          value: o.value ? Number(o.value) : 0,
+          currency: o.currency,
+          status: o.status,
+          closing_date: o.closing_date,
+          probability: o.probability,
+          pipeline_step_name: stepMap.get(o.pl_step_id?.toString())?.name ?? null,
+          step: stepMap.get(o.pl_step_id?.toString()) ?? null,
+          pipeline: plMap.get(o.pl_id?.toString()) ?? null,
+        }));
+      } catch { /* best-effort */ }
+    }
 
     return {
       success: true,
@@ -205,13 +321,18 @@ export class ContactsService {
         tags: tagLinks.map((tl) => tl.name),
         phones,
         whatsapps,
-        emails: emails.map((e) => ({
-          id: e.id.toString(),
-          email: e.email,
-          type: e.type,
-          is_primary: !!e.is_primary,
-          created_at: e.created_at,
-        })),
+        emails: emails.map((e) => {
+          const o = optinByEmail.get(e.id.toString());
+          return {
+            id: e.id.toString(),
+            email: e.email,
+            type: e.type,
+            is_primary: !!e.is_primary,
+            created_at: e.created_at,
+            opted_in: !!o,
+            optin_id: o ? o.id.toString() : null,
+          };
+        }),
         custom_fields: customFields,
         support_number_task: supportNumberTask,
         tasks: tasks.map((t) => {
@@ -245,12 +366,51 @@ export class ContactsService {
           tasks: tasksCount,
           bookings: bookingsCount,
           calls: callsCount,
-          ad_clicks: 0, // ad_clicks table not present yet — keep slot for parity
-          opportunities: 0,
+          ad_clicks: adClicksCount,
+          opportunities: opportunitiesCount,
           groups: 0,
         },
+        opportunities: enrichedOpportunities,
+        ad_clicks: (adClicks as any[]).map((r) => ({
+          id: r.id.toString(),
+          ad_id: r.ad_id,
+          title: r.title ?? null,
+          subtitle: r.subtitle ?? null,
+          source: r.source ?? null,
+          type: r.type ?? null,
+          created_at: r.created_at,
+        })),
+        calls: (callsList as any[]).map((c) => ({
+          id: c.id.toString(),
+          from_number: c.from_number,
+          to_number: c.to_number,
+          call_duration: c.call_duration,
+          call_type: c.call_type,
+          status: c.status,
+          created_at: c.created_at,
+          transcription: this.extractTranscription(c),
+        })),
+        company_contacts: (companyContacts as any[]).map((c) => ({
+          id: c.id.toString(),
+          full_name: (c.full_name ?? `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim()) || 'Unnamed',
+        })),
       },
     };
+  }
+
+  /** Pull a transcription string out of a twilio_call_logs row's metadata JSON, if present. */
+  private extractTranscription(c: any): string | null {
+    for (const raw of [c?.metadata, c?.twilio_metadata]) {
+      if (!raw) continue;
+      try {
+        const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const t = obj?.transcription ?? obj?.transcript ?? obj?.transcription_text ?? null;
+        if (t) return typeof t === 'string' ? t : JSON.stringify(t);
+      } catch {
+        /* metadata isn't JSON — ignore */
+      }
+    }
+    return null;
   }
 
   /** Project a contact_mobiles row into the lean shape the modal renders. */
@@ -266,36 +426,142 @@ export class ContactsService {
     };
   }
 
+  /** Strip everything except digits. */
+  private cleanDigits(s: string): string {
+    return (s || '').replace(/[^\d]/g, '');
+  }
+
   /**
-   * Check if contact already exists by email or phone in workspace
+   * Best-effort country lookup by dialing-code prefix on a digits-only string.
+   * Mirrors whatsapp-events.consumer.detectCountryId so manual + inbound contacts
+   * resolve the same country. Returns the matched code, the remaining national
+   * digits, and the country row (null if nothing matched).
+   */
+  private async detectCountryByPrefix(digits: string) {
+    for (const len of [3, 2, 1]) {
+      if (digits.length <= len) continue;
+      const prefix = digits.slice(0, len);
+      const c = await this.prisma.countries.findFirst({
+        where: { phone_code: prefix },
+        select: { id: true, phone_code: true },
+      });
+      if (c) return { code: prefix, national: digits.slice(len), country: c };
+    }
+    return { code: '', national: digits, country: null as any };
+  }
+
+  /**
+   * Normalise a raw phone number into the SAME canonical shape replyagent stores
+   * (parseMobileNumber): full_mobile_number = "+CCNNN", national_mobile_number =
+   * "CCNNN", mobile_number = national digits, plus country_code + country_id.
+   * This is the dedup key — it MUST match what the WhatsApp inbound path writes
+   * (+ followed by full international digits) or manual + inbound contacts diverge.
+   *
+   * - If a country is selected and the input is in local form, the country's
+   *   dialing code is prepended (after stripping a leading 0).
+   * - If the input is already international (+, 00, or bare country code), the
+   *   country is detected from the prefix.
+   */
+  private async normalizeMobile(rawPhone: string, countryId?: bigint | number | string) {
+    const raw = (rawPhone || '').trim();
+    let country: any = null;
+    if (countryId) {
+      country = await this.prisma.countries
+        .findUnique({ where: { id: BigInt(countryId) }, select: { id: true, phone_code: true } })
+        .catch(() => null);
+    }
+
+    let codeDigits = country?.phone_code ? this.cleanDigits(String(country.phone_code)) : '';
+    let nationalDigits: string;
+    const isIntl = raw.startsWith('+') || raw.startsWith('00');
+
+    if (country && !isIntl) {
+      // Local number entered with an explicit country → prepend its dialing code.
+      nationalDigits = this.cleanDigits(raw).replace(/^0+/, '');
+    } else {
+      // International form: strip + / 00, then split off the country code.
+      let intl = raw.startsWith('00') ? raw.slice(2) : raw.replace(/^\+/, '');
+      intl = this.cleanDigits(intl);
+      if (codeDigits && intl.startsWith(codeDigits)) {
+        nationalDigits = intl.slice(codeDigits.length);
+      } else if (codeDigits) {
+        nationalDigits = intl.replace(/^0+/, '');
+      } else {
+        const det = await this.detectCountryByPrefix(intl);
+        codeDigits = det.code;
+        country = det.country ?? country;
+        nationalDigits = det.national;
+      }
+    }
+
+    const fullDigits = `${codeDigits}${nationalDigits}`;
+    return {
+      country_id: country?.id ?? null,
+      country_code: codeDigits || null,
+      mobile_number: nationalDigits,
+      national_mobile_number: fullDigits,
+      full_mobile_number: `+${fullDigits}`,
+    };
+  }
+
+  /**
+   * Find a LIVE (non-deleted) contact in this workspace that owns the given
+   * canonical mobile number. Searches both +CCNNN and CCNNN forms and ignores
+   * stale mobile rows pointing at soft-deleted contacts (same defence as the
+   * WhatsApp inbound resolveContact fix).
+   */
+  async findContactByMobile(workspaceId: bigint, fullMobile: string) {
+    const fullNoPlus = fullMobile.startsWith('+') ? fullMobile.slice(1) : fullMobile;
+    const mobiles = await this.prisma.contact_mobiles.findMany({
+      where: {
+        ownership_type: 'App\\Models\\Workspace',
+        ownership_id: workspaceId,
+        modelable_type: 'App\\Models\\Contact',
+        OR: [{ full_mobile_number: fullMobile }, { full_mobile_number: fullNoPlus }],
+      },
+      select: { modelable_id: true },
+    });
+    if (!mobiles.length) return null;
+    return this.prisma.contacts.findFirst({
+      where: { id: { in: mobiles.map((m) => m.modelable_id) }, deleted_at: null },
+      orderBy: { id: 'asc' },
+    });
+  }
+
+  /** Find a LIVE contact in this workspace that owns the given email address. */
+  async findContactByEmail(workspaceId: bigint, email: string) {
+    const emails = await this.prisma.contact_emails.findMany({
+      where: {
+        ownership_type: 'App\\Models\\Workspace',
+        ownership_id: workspaceId,
+        modelable_type: 'App\\Models\\Contact',
+        email,
+      },
+      select: { modelable_id: true },
+    });
+    if (!emails.length) return null;
+    return this.prisma.contacts.findFirst({
+      where: { id: { in: emails.map((e) => e.modelable_id) }, deleted_at: null },
+      orderBy: { id: 'asc' },
+    });
+  }
+
+  /**
+   * Check if contact already exists by email or phone in workspace. Phone is
+   * normalised first so "+92..", "92.." and local forms all resolve to the same
+   * canonical key. Used by CSV import (reuse-on-match); manual create uses the
+   * dedicated reject path in addContact().
    */
   async findExistingContact(workspaceId: bigint, email?: string, phone?: string) {
     if (email) {
-      const emailRecord = await this.prisma.contact_emails.findFirst({
-        where: { email, modelable_type: 'App\\Models\\Contact' },
-        include: { contacts: true } // Assuming relation exists
-      });
-      // Since relations might be missing, we query contacts table manually
-      if (emailRecord) {
-        const contact = await this.prisma.contacts.findFirst({
-          where: { id: emailRecord.modelable_id, workspace_id: workspaceId, deleted_at: null }
-        });
-        if (contact) return contact;
-      }
+      const c = await this.findContactByEmail(workspaceId, email);
+      if (c) return c;
     }
-
     if (phone) {
-      const mobileRecord = await this.prisma.contact_mobiles.findFirst({
-        where: { full_mobile_number: phone, modelable_type: 'App\\Models\\Contact' }
-      });
-      if (mobileRecord) {
-        const contact = await this.prisma.contacts.findFirst({
-          where: { id: mobileRecord.modelable_id, workspace_id: workspaceId, deleted_at: null }
-        });
-        if (contact) return contact;
-      }
+      const norm = await this.normalizeMobile(phone);
+      const c = await this.findContactByMobile(workspaceId, norm.full_mobile_number);
+      if (c) return c;
     }
-
     return null;
   }
 
@@ -441,10 +707,25 @@ export class ContactsService {
         data: payload,
       });
     } else {
-      // Identity Check — reuse existing contact if email/phone already exists.
-      // The limit only blocks NEW contacts, so this must come BEFORE enforceContactsLimit.
-      const existing = await this.findExistingContact(workspaceId, data.email, data.phone);
-      if (existing) return await this.getContact(workspaceId, existing.id);
+      // replyagent parity (ContactHelper::updateContactFields): a duplicate mobile
+      // or email is REJECTED with an error — it does NOT silently reuse, and it
+      // ignores soft-deleted contacts (so a number whose old contact was deleted
+      // can be re-added). Normalise the phone first so the dedup key matches the
+      // WhatsApp inbound path (+CCNNN).
+      const norm = data.phone ? await this.normalizeMobile(data.phone, data.country_id) : null;
+
+      if (norm?.mobile_number) {
+        const dup = await this.findContactByMobile(workspaceId, norm.full_mobile_number);
+        if (dup) {
+          throw new BadRequestException(`Mobile number ${norm.full_mobile_number} already exists`);
+        }
+      }
+      if (data.email) {
+        const dupEmail = await this.findContactByEmail(workspaceId, data.email);
+        if (dupEmail) {
+          throw new BadRequestException(`Email ${data.email} already exists`);
+        }
+      }
 
       await this.enforceContactsLimit(workspaceId);
 
@@ -453,7 +734,7 @@ export class ContactsService {
           ...payload,
           workspace_id: workspaceId,
           source: 'MANUAL',
-          status: 'PENDING',
+          status: 'ACTIVE', // replyagent default; PENDING was wrong (only used when limit hit)
         },
       });
 
@@ -470,17 +751,22 @@ export class ContactsService {
           }
         });
       }
-      if (data.phone) {
+      if (norm?.mobile_number) {
         await this.prisma.contact_mobiles.create({
           data: {
             ownership_id: workspaceId,
             ownership_type: 'App\\Models\\Workspace',
             modelable_id: contact.id,
             modelable_type: 'App\\Models\\Contact',
-            full_mobile_number: data.phone,
-            country_id: BigInt(data.country_id || 1),
-            is_primary: 1
-          }
+            full_mobile_number: norm.full_mobile_number,
+            national_mobile_number: norm.national_mobile_number,
+            mobile_number: norm.mobile_number,
+            country_code: norm.country_code,
+            country_id: norm.country_id ?? BigInt(data.country_id || 1),
+            type: 'mobile',
+            slug: 'mobile',
+            is_primary: 1,
+          } as any,
         });
       }
     }
@@ -630,6 +916,72 @@ export class ContactsService {
           }
         }
       }
+
+      // Add a phone / email value from the inline "Add phone/email" dialogs
+      // (PATCH { phone|email, type, mark_primary }). updateContactData previously
+      // ignored these keys, so those dialogs silently did nothing. Normalised +
+      // deduped like manual create; stores type + slug + primary.
+      if (data.phone) {
+        const norm = await this.normalizeMobile(data.phone, data.country_id);
+        if (norm?.mobile_number) {
+          const dup = await this.findContactByMobile(workspaceId, norm.full_mobile_number);
+          if (dup && dup.id !== contactId) {
+            throw new BadRequestException(`Mobile number ${norm.full_mobile_number} already exists`);
+          }
+          if (!dup) {
+            const slug = data.slug === 'whatsapp' ? 'whatsapp' : 'mobile';
+            if (data.mark_primary) {
+              await this.prisma.contact_mobiles.updateMany({
+                where: { modelable_type: 'App\\Models\\Contact', modelable_id: contactId },
+                data: { is_primary: 0 },
+              });
+            }
+            await this.prisma.contact_mobiles.create({
+              data: {
+                ownership_id: workspaceId,
+                ownership_type: 'App\\Models\\Workspace',
+                modelable_id: contactId,
+                modelable_type: 'App\\Models\\Contact',
+                full_mobile_number: norm.full_mobile_number,
+                national_mobile_number: norm.national_mobile_number,
+                mobile_number: norm.mobile_number,
+                country_code: norm.country_code,
+                country_id: norm.country_id ?? BigInt(data.country_id || 1),
+                type: data.type || slug,
+                slug,
+                is_primary: data.mark_primary ? 1 : 0,
+              } as any,
+            });
+          }
+        }
+      }
+
+      if (data.email) {
+        const dupEmail = await this.findContactByEmail(workspaceId, data.email);
+        if (dupEmail && dupEmail.id !== contactId) {
+          throw new BadRequestException(`Email ${data.email} already exists`);
+        }
+        if (!dupEmail) {
+          if (data.mark_primary) {
+            await this.prisma.contact_emails.updateMany({
+              where: { modelable_type: 'App\\Models\\Contact', modelable_id: contactId },
+              data: { is_primary: 0 },
+            });
+          }
+          await this.prisma.contact_emails.create({
+            data: {
+              ownership_id: workspaceId,
+              ownership_type: 'App\\Models\\Workspace',
+              modelable_id: contactId,
+              modelable_type: 'App\\Models\\Contact',
+              email: data.email,
+              type: data.type || 'work',
+              slug: 'email',
+              is_primary: data.mark_primary ? 1 : 0,
+            } as any,
+          });
+        }
+      }
     }
 
     return await this.getContact(workspaceId, contactId);
@@ -690,6 +1042,49 @@ export class ContactsService {
    * Delete/Trash a contact
    */
   async deleteContact(workspaceId: bigint, contactId: bigint) {
+    // 1. Find all chat IDs linked to this contact across every channel.
+    const [evChats, fbChats, instaChats, tgChats, wcChats, zapiChats] = await Promise.all([
+      this.prisma.evolution_chats.findMany({ where: { contact_id: contactId }, select: { id: true } }).catch(() => []),
+      this.prisma.fb_chats.findMany({ where: { contact_id: contactId }, select: { id: true } }).catch(() => []),
+      this.prisma.insta_chats.findMany({ where: { contact_id: contactId }, select: { id: true } }).catch(() => []),
+      this.prisma.telegram_chats.findMany({ where: { contact_id: contactId }, select: { id: true } }).catch(() => []),
+      this.prisma.wc_chats.findMany({ where: { contact_id: contactId }, select: { id: true } }).catch(() => []),
+      this.prisma.zapi_chats.findMany({ where: { contact_id: contactId }, select: { id: true } }).catch(() => []),
+    ]);
+
+    // 2. Delete inbox records for each chat type (best-effort, don't fail delete if this errors).
+    const inboxDeletes: Promise<any>[] = [];
+    if ((evChats as any[]).length)
+      inboxDeletes.push(this.prisma.inbox.deleteMany({ where: { modelable_type: { contains: 'WhatsappChat' }, modelable_id: { in: (evChats as any[]).map((c) => c.id) } } }).catch(() => null));
+    if ((fbChats as any[]).length)
+      inboxDeletes.push(this.prisma.inbox.deleteMany({ where: { modelable_type: { contains: 'FacebookChat' }, modelable_id: { in: (fbChats as any[]).map((c) => c.id) } } }).catch(() => null));
+    if ((instaChats as any[]).length)
+      inboxDeletes.push(this.prisma.inbox.deleteMany({ where: { modelable_type: { contains: 'InstaChat' }, modelable_id: { in: (instaChats as any[]).map((c) => c.id) } } }).catch(() => null));
+    if ((tgChats as any[]).length)
+      inboxDeletes.push(this.prisma.inbox.deleteMany({ where: { modelable_type: { contains: 'TelegramChat' }, modelable_id: { in: (tgChats as any[]).map((c) => c.id) } } }).catch(() => null));
+    if ((wcChats as any[]).length)
+      inboxDeletes.push(this.prisma.inbox.deleteMany({ where: { modelable_type: { contains: 'WcChat' }, modelable_id: { in: (wcChats as any[]).map((c) => c.id) } } }).catch(() => null));
+    if ((zapiChats as any[]).length)
+      inboxDeletes.push(this.prisma.inbox.deleteMany({ where: { modelable_type: { contains: 'ZapiChat' }, modelable_id: { in: (zapiChats as any[]).map((c) => c.id) } } }).catch(() => null));
+    await Promise.all(inboxDeletes);
+
+    // 2b. WhatsApp Cloud chats (wa_chats) — these were MISSING from the lookup
+    // above, so deleting a contact never removed its WhatsApp conversation.
+    // Remove the inbox row (by type+id — robust against morph-string quirks),
+    // the messages, and the chat itself so the conversation fully disappears.
+    const waChats = await this.prisma.wa_chats
+      .findMany({ where: { contact_id: contactId }, select: { id: true } })
+      .catch(() => [] as { id: bigint }[]);
+    if (waChats.length) {
+      const ids = waChats.map((c) => c.id);
+      await this.prisma.inbox
+        .deleteMany({ where: { type: 'WHATSAPP', modelable_id: { in: ids } } })
+        .catch(() => null);
+      await this.prisma.wa_messages.deleteMany({ where: { wa_chat_id: { in: ids } } }).catch(() => null);
+      await this.prisma.wa_chats.deleteMany({ where: { id: { in: ids } } }).catch(() => null);
+    }
+
+    // 3. Soft-delete the contact.
     await this.prisma.contacts.update({
       where: { id: contactId },
       data: { deleted_at: new Date() },
@@ -867,12 +1262,11 @@ export class ContactsService {
    * without error rather than crashing.
    */
   async unsubscribe(workspaceId: bigint, contactId: bigint, optinId: bigint) {
-    try {
-      await (this.prisma as any).optins?.update?.({
-        where: { id: optinId },
-        data: { is_subscribed: 0, unsubscribed_at: new Date() },
-      });
-    } catch {}
+    // Opt-out = remove the channel_opts row (replyagent: ChannelOpt presence = opted in).
+    // Scoped to the contact so an agent can't delete another contact's opt-in.
+    await this.prisma.channel_opts
+      .deleteMany({ where: { id: optinId, contact_id: contactId } })
+      .catch(() => undefined);
     return { success: true };
   }
 
@@ -1652,6 +2046,13 @@ export class ContactsService {
         take: 50,
       });
       contactIds = chats.filter((c) => c.contact_id).map((c) => c.contact_id as bigint);
+    } else if (type === 'support_ticket') {
+      const rows = await this.prisma.support_numbers.findMany({
+        where: { sn_number: { contains: t } },
+        select: { contact_id: true },
+        take: 50,
+      });
+      contactIds = rows.map((r) => r.contact_id);
     }
 
     const where: any = {

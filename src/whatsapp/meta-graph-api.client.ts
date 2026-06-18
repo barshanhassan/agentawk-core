@@ -73,8 +73,13 @@ export class MetaGraphApiClient {
   }
 
   /**
-   * OAuth code → user access token exchange. Used during WhatsApp Embedded
-   * Signup completion. Returns the long-lived user token Meta issues.
+   * OAuth code → long-lived user access token exchange. Used during WhatsApp
+   * Embedded Signup completion.
+   *
+   * Two-step: first exchange the short-lived code for a short-lived token,
+   * then immediately upgrade it to a long-lived token (~60 days) so we are
+   * not stuck with a 1-hour window. The long-lived token is what gets stored
+   * in wa_accounts.access_token and forwarded to the microservice.
    */
   async exchangeCode(code: string): Promise<{ access_token: string; token_type: string; expires_in?: number }> {
     const clientId = process.env.META_APP_ID;
@@ -82,13 +87,31 @@ export class MetaGraphApiClient {
     if (!clientId || !clientSecret) {
       throw new BadRequestException('META_APP_ID and META_APP_SECRET must be set');
     }
-    const url = `${this.base}/oauth/access_token?client_id=${clientId}&client_secret=${clientSecret}&code=${encodeURIComponent(code)}`;
-    const res = await fetch(url);
-    const data: any = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new BadRequestException(`Meta OAuth: ${data?.error?.message ?? `HTTP ${res.status}`}`);
+
+    // Step 1 — short-lived token
+    const shortUrl = `${this.base}/oauth/access_token?client_id=${clientId}&client_secret=${clientSecret}&code=${encodeURIComponent(code)}`;
+    const shortRes = await fetch(shortUrl);
+    const shortData: any = await shortRes.json().catch(() => ({}));
+    if (!shortRes.ok) {
+      throw new BadRequestException(`Meta OAuth (code exchange): ${shortData?.error?.message ?? `HTTP ${shortRes.status}`}`);
     }
-    return data;
+    const shortToken: string = shortData.access_token;
+    if (!shortToken) throw new BadRequestException('Meta did not return access_token during code exchange');
+
+    // Step 2 — upgrade to long-lived token (~60 days)
+    try {
+      const longUrl = `${this.base}/oauth/access_token?grant_type=fb_exchange_token&client_id=${clientId}&client_secret=${clientSecret}&fb_exchange_token=${encodeURIComponent(shortToken)}`;
+      const longRes = await fetch(longUrl);
+      const longData: any = await longRes.json().catch(() => ({}));
+      if (longRes.ok && longData.access_token) {
+        return longData;
+      }
+      this.logger.warn(`Long-lived token upgrade failed (${longRes.status}): ${longData?.error?.message ?? 'unknown'}; using short-lived token`);
+    } catch (e: any) {
+      this.logger.warn(`Long-lived token upgrade threw: ${e?.message ?? e}; using short-lived token`);
+    }
+
+    return shortData;
   }
 
   async fetchWabaAccount(wabaId: string, accessToken: string) {

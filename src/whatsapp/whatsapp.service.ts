@@ -210,6 +210,8 @@ export class WhatsappService {
           whatsappAccountId: payload.waba_id,
           accessToken: payload.access_token,
           name: payload.name,
+          uploadDir: `whatsapp/${workspaceId}/`,
+          thumbDir: `whatsapp/${workspaceId}/thumb/`,
           meta: {
             backend_wa_account_id: account.id.toString(),
             phone_number_id: payload.phone_number_id,
@@ -385,6 +387,7 @@ export class WhatsappService {
         status: 'PENDING',
         name_status: 'PENDING',
         auto_reply_interval: '247',
+        platform_type: phoneData.platform_type ?? 'CLOUD_API',
       };
       if (exists) {
         await this.prisma.wa_phone_numbers.update({ where: { id: exists.id }, data: numberData });
@@ -407,13 +410,13 @@ export class WhatsappService {
       await this.rabbit.publish('ra', 'whatsapp', {
         event: 'WA_REGISTER',
         payload: {
-          waba_id: account.waba_id,
-          access_token: accessToken,
-          phone_number_id: phoneData?.id ?? null,
-          display_phone_number: phoneData?.display_phone_number ?? null,
-          verified_name: phoneData?.verified_name ?? null,
+          whatsappAccountId: account.waba_id,
+          accessToken,
+          name: phoneData?.verified_name ?? account.name,
+          uploadDir: `whatsapp/${workspaceId}/`,
+          thumbDir: `whatsapp/${workspaceId}/thumb/`,
+          meta: { backend_wa_account_id: account.id.toString() },
         },
-        meta: { backend_wa_account_id: account.id.toString() },
       });
     } catch (e: any) {
       this.logger.warn(`WA_REGISTER publish failed (onboard): ${e?.message ?? e}`);
@@ -1115,14 +1118,24 @@ export class WhatsappService {
     id: bigint;
     waba_id: string;
     access_token: string;
+    name?: string;
+    workspace_id?: bigint;
   }): Promise<boolean> {
     try {
       await this.meta.subscribeWabaWebhook(account.waba_id, account.access_token);
       try {
         await this.rabbit.publish('ra', 'whatsapp', {
-          event: 'WA_SUBSCRIBE',
-          payload: { waba_id: account.waba_id, access_token: account.access_token },
-          meta: { backend_wa_account_id: account.id.toString() },
+          event: 'WA_REGISTER',
+          payload: {
+            whatsappAccountId: account.waba_id,
+            accessToken: account.access_token,
+            name: account.name ?? '',
+            ...(account.workspace_id ? {
+              uploadDir: `whatsapp/${account.workspace_id}/`,
+              thumbDir: `whatsapp/${account.workspace_id}/thumb/`,
+            } : {}),
+            meta: { backend_wa_account_id: account.id.toString() },
+          },
         });
       } catch {
         /* microservice nudge is best-effort */
@@ -1158,7 +1171,7 @@ export class WhatsappService {
   async resubscribeAllActive(): Promise<{ total: number; ok: number }> {
     const accounts = await this.prisma.wa_accounts.findMany({
       where: { deleted_at: null, status: 'ACTIVE' },
-      select: { id: true, waba_id: true, access_token: true },
+      select: { id: true, waba_id: true, access_token: true, name: true, workspace_id: true },
     });
     let ok = 0;
     for (const acc of accounts) {
