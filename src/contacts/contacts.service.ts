@@ -209,7 +209,7 @@ export class ContactsService {
       this.prisma.channel_opts
         .findMany({
           where: { contact_id: contact.id },
-          select: { id: true, channel: true, contactable_type: true, contactable_id: true },
+          select: { id: true, channel: true, contactable_type: true, contactable_id: true, modelable_id: true, modelable_type: true },
         })
         .catch(() => [] as any[]),
     ]);
@@ -220,15 +220,33 @@ export class ContactsService {
     const EMAIL_CONTACTABLE = 'App\\Models\\Contact\\EmailContact';
     const optinByMobile = new Map<string, any>();
     const optinByEmail = new Map<string, any>();
+    // Per-mobile list of opt-ins (one row per workspace channel number) so the
+    // profile dropdown can check `isOpted(workspace_number)` exactly like
+    // replyagent's `c.optins` (each carries channel + modelable_id = the
+    // wa_phone_numbers id the contact opted in to).
+    const optinsByMobile = new Map<string, any[]>();
     for (const o of channelOpts as any[]) {
       if (!o.contactable_id) continue;
       const key = o.contactable_id.toString();
-      if (o.contactable_type === MOBILE_CONTACTABLE) optinByMobile.set(key, o);
-      else if (o.contactable_type === EMAIL_CONTACTABLE) optinByEmail.set(key, o);
+      if (o.contactable_type === MOBILE_CONTACTABLE) {
+        optinByMobile.set(key, o);
+        const arr = optinsByMobile.get(key) ?? [];
+        arr.push({
+          id: o.id.toString(),
+          channel: o.channel,
+          modelable_id: o.modelable_id != null ? o.modelable_id.toString() : null,
+        });
+        optinsByMobile.set(key, arr);
+      } else if (o.contactable_type === EMAIL_CONTACTABLE) optinByEmail.set(key, o);
     }
     const withMobileOptin = (m: any) => {
       const o = optinByMobile.get(m.id.toString());
-      return { ...this.serializeMobile(m), opted_in: !!o, optin_id: o ? o.id.toString() : null };
+      return {
+        ...this.serializeMobile(m),
+        opted_in: !!o,
+        optin_id: o ? o.id.toString() : null,
+        optins: optinsByMobile.get(m.id.toString()) ?? [],
+      };
     };
     const phones = allMobiles
       .filter((m) => String(m.type ?? 'phone').toLowerCase() !== 'whatsapp')
@@ -982,6 +1000,73 @@ export class ContactsService {
           });
         }
       }
+
+      // Edit an EXISTING phone/whatsapp value inline (replyagent's number
+      // edit-mode → save). Re-normalises + dedups so an edit can't collide with
+      // another contact's number. update_mobile: { id, value, type, country_id }.
+      if (data.update_mobile && data.update_mobile.id) {
+        const rowId = BigInt(data.update_mobile.id);
+        const row = await this.prisma.contact_mobiles.findFirst({
+          where: { id: rowId, modelable_type: 'App\\Models\\Contact', modelable_id: contactId },
+        });
+        if (row) {
+          const newVal = data.update_mobile.value;
+          if (newVal !== undefined && newVal !== null && String(newVal).trim() !== '') {
+            const norm = await this.normalizeMobile(String(newVal), data.update_mobile.country_id);
+            if (norm?.mobile_number) {
+              const dup = await this.findContactByMobile(workspaceId, norm.full_mobile_number);
+              if (dup && dup.id !== contactId) {
+                throw new BadRequestException(`Mobile number ${norm.full_mobile_number} already exists`);
+              }
+              await this.prisma.contact_mobiles.update({
+                where: { id: rowId },
+                data: {
+                  full_mobile_number: norm.full_mobile_number,
+                  national_mobile_number: norm.national_mobile_number,
+                  mobile_number: norm.mobile_number,
+                  country_code: norm.country_code,
+                  ...(norm.country_id ? { country_id: norm.country_id } : {}),
+                  ...(data.update_mobile.type ? { type: data.update_mobile.type } : {}),
+                } as any,
+              });
+            }
+          } else if (data.update_mobile.type) {
+            await this.prisma.contact_mobiles.update({
+              where: { id: rowId },
+              data: { type: data.update_mobile.type } as any,
+            });
+          }
+        }
+      }
+
+      // Edit an existing email value inline. update_email: { id, value, type }.
+      if (data.update_email && data.update_email.id) {
+        const rowId = BigInt(data.update_email.id);
+        const row = await this.prisma.contact_emails.findFirst({
+          where: { id: rowId, modelable_type: 'App\\Models\\Contact', modelable_id: contactId },
+        });
+        if (row) {
+          const newVal = data.update_email.value;
+          if (newVal !== undefined && newVal !== null && String(newVal).trim() !== '') {
+            const dupEmail = await this.findContactByEmail(workspaceId, String(newVal));
+            if (dupEmail && dupEmail.id !== contactId) {
+              throw new BadRequestException(`Email ${newVal} already exists`);
+            }
+            await this.prisma.contact_emails.update({
+              where: { id: rowId },
+              data: {
+                email: String(newVal),
+                ...(data.update_email.type ? { type: data.update_email.type } : {}),
+              } as any,
+            });
+          } else if (data.update_email.type) {
+            await this.prisma.contact_emails.update({
+              where: { id: rowId },
+              data: { type: data.update_email.type } as any,
+            });
+          }
+        }
+      }
     }
 
     return await this.getContact(workspaceId, contactId);
@@ -1270,18 +1355,79 @@ export class ContactsService {
     return { success: true };
   }
 
+  /**
+   * Opt a contact's number in/out of a workspace channel. Mirrors replyagent's
+   * ContactsController::setContactOptin → ContactHelper::optInWhatsapp /
+   * ChannelOpt::optOut. A channel_opts row's PRESENCE = opted in; its absence =
+   * opted out. The row links the contact's mobile (contactable) to the workspace
+   * channel number (modelable = WhatsappNumber / ZapiInstance).
+   *
+   * Body: { action:'optin'|'optout', channel_type:'whatsapp'|'zapi',
+   *         channel:{ id }, phone_number:{ object_id } }
+   */
   async optin(workspaceId: bigint, contactId: bigint, data: any) {
-    try {
-      await (this.prisma as any).optins?.create?.({
-        data: {
-          workspace_id: workspaceId,
+    const action = String(data?.action ?? 'optin');
+    const channelType = String(data?.channel_type ?? 'whatsapp');
+    const channelId =
+      data?.channel?.id != null ? BigInt(data.channel.id) : null;
+    const mobileId =
+      data?.phone_number?.object_id != null
+        ? BigInt(data.phone_number.object_id)
+        : null;
+
+    if (!channelId || !mobileId) {
+      throw new BadRequestException('Missing required data');
+    }
+
+    const modelableType =
+      channelType === 'zapi'
+        ? 'App\\Models\\Zapi\\ZapiInstance'
+        : 'App\\Models\\Whatsapp\\WhatsappNumber';
+    const MOBILE_CONTACTABLE = 'App\\Models\\Contact\\MobileContact';
+
+    if (action === 'optin') {
+      // hasOpted? — match by contact + channel + modelable_id + mobile (skip
+      // modelable_type in the lookup: backslash morph-string equality is flaky
+      // in this MySQL setup, so we rely on the id pair which is unambiguous).
+      const existing = await this.prisma.channel_opts.findFirst({
+        where: {
           contact_id: contactId,
-          channel: data.channel ?? null,
-          is_subscribed: 1,
+          channel: channelType as any,
+          modelable_id: channelId,
+          contactable_id: mobileId,
         },
       });
-    } catch {}
-    return { success: true };
+      if (!existing) {
+        await this.prisma.channel_opts.create({
+          data: {
+            contact_id: contactId,
+            channel: channelType as any,
+            modelable_id: channelId,
+            modelable_type: modelableType,
+            contactable_id: mobileId,
+            contactable_type: MOBILE_CONTACTABLE,
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+        });
+      }
+    } else {
+      // optout = delete the row (replyagent: ChannelOpt::optOut deletes it).
+      await this.prisma.channel_opts
+        .deleteMany({
+          where: {
+            contact_id: contactId,
+            channel: channelType as any,
+            modelable_id: channelId,
+            contactable_id: mobileId,
+          },
+        })
+        .catch(() => undefined);
+    }
+
+    // Return the refreshed contact so the FE re-binds optin state (parity with
+    // replyagent which returns the ContactResource).
+    return await this.getContact(workspaceId, contactId);
   }
 
   /**
