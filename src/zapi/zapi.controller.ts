@@ -44,10 +44,11 @@ export class ZapiController {
   }
 
   @Delete('delete-instance/:id')
-  async deleteInstance(@Request() req: any, @Param('id') id: string) {
+  async deleteInstance(@Request() req: any, @Param('id') id: string, @Body() body: any) {
     return this.service.deleteInstance(
       BigInt(req.user.workspace_id || 1),
       BigInt(id),
+      !!body?.delete_media,
     );
   }
 

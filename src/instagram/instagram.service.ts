@@ -9,6 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { MetaGraphApiClient } from '../whatsapp/meta-graph-api.client';
 import { RabbitMqService } from '../rabbitmq/rabbitmq.service';
+import { S3Service } from '../s3/s3.service';
 
 @Injectable()
 export class InstagramService {
@@ -19,6 +20,7 @@ export class InstagramService {
     private readonly meta: MetaGraphApiClient,
     private readonly rabbit: RabbitMqService,
     private readonly config: ConfigService,
+    private readonly s3: S3Service,
   ) {}
 
   // ── List pages ──────────────────────────────────────────────────────
@@ -37,19 +39,30 @@ export class InstagramService {
     const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
     const igQueue = this.config.get<string>('RABBITMQ_INSTAGRAM_QUEUE') || 'instagram';
 
-    const orClauses = [];
-    if (data.ig_user_id) orClauses.push({ ig_user_id: data.ig_user_id });
-    if (data.page_id)    orClauses.push({ page_id: data.page_id });
-
-    const existing = await this.prisma.insta_pages.findFirst({
-      where: { workspace_id: workspaceId, OR: orClauses },
-    });
+    // Reconnect (replyagent carries page_id): target the exact existing row by
+    // its internal id so a re-auth refreshes that account's token in place,
+    // rather than matching by ig_user_id. Falls back to upsert-by-identity.
+    let existing;
+    if (data._reconnect_page_id) {
+      existing = await this.prisma.insta_pages.findFirst({
+        where: { id: BigInt(data._reconnect_page_id), workspace_id: workspaceId },
+      });
+      if (!existing) throw new NotFoundException('Instagram page not found for reconnect');
+    } else {
+      const orClauses = [];
+      if (data.ig_user_id) orClauses.push({ ig_user_id: data.ig_user_id });
+      if (data.page_id)    orClauses.push({ page_id: data.page_id });
+      existing = await this.prisma.insta_pages.findFirst({
+        where: { workspace_id: workspaceId, OR: orClauses },
+      });
+    }
 
     if (existing) {
       const saved = await this.prisma.insta_pages.update({
         where: { id: existing.id },
         data: {
           access_token: data.access_token,
+          ig_user_id: data.ig_user_id ?? existing.ig_user_id,
           name: data.name ?? existing.name,
           username: data.username ?? existing.username,
           followers_count: data.followers_count ?? existing.followers_count,
@@ -57,6 +70,7 @@ export class InstagramService {
           media_count: data.media_count != null ? BigInt(data.media_count) : existing.media_count,
           token_expirey: data.token_expirey ?? existing.token_expirey,
           status: existing.service_account_id ? 'ACTIVE' : 'PENDING',
+          fail_reason: null,
           updated_at: new Date(),
         },
       });
@@ -154,7 +168,13 @@ export class InstagramService {
   }
 
   // ── Connect Instagram Business via OAuth code exchange ──────────────
-  async connectBusiness(workspaceId: bigint, userId: bigint, code: string, redirectUri: string) {
+  async connectBusiness(
+    workspaceId: bigint,
+    userId: bigint,
+    code: string,
+    redirectUri: string,
+    reconnectPageId?: bigint,
+  ) {
     const appId = process.env.META_IG_APP_ID ?? process.env.META_APP_ID;
     const appSecret = process.env.META_IG_APP_SECRET ?? process.env.META_APP_SECRET;
     if (!appId || !appSecret) throw new BadRequestException('Meta app credentials not configured');
@@ -234,6 +254,7 @@ export class InstagramService {
       account_type: user.account_type ?? 'BUSINESS',
       platform: 'instagram',
       token_expirey: expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000) : null,
+      _reconnect_page_id: reconnectPageId ?? null,
     });
   }
 
@@ -318,6 +339,88 @@ export class InstagramService {
       });
     }
     return { success: true };
+  }
+
+  // ── Full delete / teardown ───────────────────────────────────────────
+  // Mirrors replyagent's DeleteInstagramPage job: always cascades the page's
+  // DB rows (chats/messages/features/page-users/inbox), publishes the
+  // microservice "deleting" event, and — only when `deleteMedia` is set —
+  // purges this page's stored media (avatar + message attachments) from S3.
+  async deletePageFull(workspaceId: bigint, pageId: bigint, deleteMedia = false) {
+    const page = await this.requirePage(workspaceId, pageId);
+    const exchange = this.config.get<string>('RABBITMQ_EXCHANGE') || 'ra';
+    const igQueue = this.config.get<string>('RABBITMQ_INSTAGRAM_QUEUE') || 'instagram';
+
+    // 1. Tell the microservice to stop polling / tear down its account.
+    if (page.service_account_id) {
+      await this.rabbit
+        .publish(exchange, igQueue, {
+          event: 'INSTA_ACCOUNT_DELETING',
+          payload: {
+            account_id: page.service_account_id,
+            businessPageId: page.page_id ?? page.ig_user_id,
+            page_id: page.id.toString(),
+            username: page.username,
+          },
+        })
+        .catch((e) => this.logger.warn(`INSTA_ACCOUNT_DELETING publish failed (non-fatal): ${e?.message}`));
+    }
+
+    // 2. Collect this page's chats up front (needed for messages + inbox).
+    const chats = await this.prisma.insta_chats.findMany({
+      where: { insta_page_id: page.id },
+      select: { id: true },
+    });
+    const chatIds = chats.map((c) => c.id);
+
+    // 3. Optional media purge (replyagent's `delete_folder`). EZCONN stores no
+    //    per-page S3 folder, so we resolve media via gallery_media_id on the
+    //    page avatar + each message, then delete the S3 objects + gallery rows.
+    if (deleteMedia) {
+      const galleryIds: bigint[] = [];
+      if (page.gallery_media_id) galleryIds.push(page.gallery_media_id);
+      const mediaMsgs = await this.prisma.insta_messages.findMany({
+        where: { insta_page_id: page.id, gallery_media_id: { not: null } },
+        select: { gallery_media_id: true },
+      });
+      for (const m of mediaMsgs) if (m.gallery_media_id) galleryIds.push(m.gallery_media_id);
+
+      if (galleryIds.length) {
+        const rows = await this.prisma.media_gallery.findMany({
+          where: { id: { in: galleryIds } },
+          select: { id: true, file_path: true, thumb_200_path: true },
+        });
+        for (const r of rows) {
+          if (r.file_path) await this.s3.delete(r.file_path).catch(() => null);
+          if (r.thumb_200_path) await this.s3.delete(r.thumb_200_path).catch(() => null);
+        }
+        await this.prisma.media_gallery
+          .deleteMany({ where: { id: { in: rows.map((r) => r.id) } } })
+          .catch((e) => this.logger.warn(`media_gallery cleanup failed (non-fatal): ${e?.message}`));
+      }
+    }
+
+    // 4. Always cascade the page's DB rows (fixes orphan rows left by the old
+    //    insta_pages-only delete). Order: leaves → root.
+    await this.prisma.insta_messages.deleteMany({ where: { insta_page_id: page.id } }).catch(() => null);
+    if (chatIds.length) {
+      await this.prisma.inbox
+        .deleteMany({
+          where: {
+            modelable_type: 'App\\Models\\Instagram\\InstaChat',
+            modelable_id: { in: chatIds },
+          },
+        })
+        .catch(() => null);
+    }
+    await this.prisma.insta_chats.deleteMany({ where: { insta_page_id: page.id } }).catch(() => null);
+    await this.prisma.insta_features.deleteMany({ where: { insta_page_id: page.id } }).catch(() => null);
+    await this.prisma.insta_page_users.deleteMany({ where: { insta_page_id: page.id } }).catch(() => null);
+
+    // 5. Finally remove the page itself.
+    await this.prisma.insta_pages.delete({ where: { id: page.id } });
+
+    return { success: true, deleted_media: deleteMedia };
   }
 
   // ── Send message ─────────────────────────────────────────────────────

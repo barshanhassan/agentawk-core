@@ -6,12 +6,16 @@ import {
   Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { InstagramService } from '../instagram/instagram.service';
 
 @Injectable()
 export class IntegrationsService {
   private readonly logger = new Logger(IntegrationsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly instagram: InstagramService,
+  ) {}
 
   // ─── Core Integration Management ───────────────────────────────────
 
@@ -314,7 +318,7 @@ export class IntegrationsService {
     };
   }
 
-  async deleteChannel(workspaceId: bigint, type: string, id: bigint) {
+  async deleteChannel(workspaceId: bigint, type: string, id: bigint, deleteMedia = false) {
     const where = { id, workspace_id: workspaceId };
 
     switch (type.toLowerCase()) {
@@ -322,7 +326,9 @@ export class IntegrationsService {
         // Note: For WhatsApp, usually it's wa_accounts. Soft delete or hard delete depending on policy.
         return this.prisma.wa_accounts.deleteMany({ where });
       case 'instagram':
-        return this.prisma.insta_pages.deleteMany({ where });
+        // Full teardown (cascade child rows + microservice event + optional
+        // media purge) instead of an orphan-leaving insta_pages-only delete.
+        return this.instagram.deletePageFull(workspaceId, id, deleteMedia);
       case 'messenger':
         return this.prisma.fb_pages.deleteMany({ where });
       case 'telegram':

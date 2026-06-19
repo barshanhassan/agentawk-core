@@ -89,12 +89,14 @@ export class IntegrationsController {
   async deleteChannel(
     @Param('id') id: string,
     @Param('type') type: string,
+    @Body() body: any,
     @Request() req: any,
   ) {
     return this.service.deleteChannel(
       BigInt(req.user.workspace_id || 1),
       type,
       BigInt(id),
+      !!body?.delete_media,
     );
   }
 

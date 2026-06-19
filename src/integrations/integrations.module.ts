@@ -3,9 +3,10 @@ import { IntegrationsController } from './integrations.controller';
 import { ApiTriggersPublicController } from './api-triggers-public.controller';
 import { IntegrationsService } from './integrations.service';
 import { PrismaModule } from '../prisma/prisma.module';
+import { InstagramModule } from '../instagram/instagram.module';
 
 @Module({
-  imports: [PrismaModule],
+  imports: [PrismaModule, InstagramModule],
   controllers: [IntegrationsController, ApiTriggersPublicController],
   providers: [IntegrationsService],
   exports: [IntegrationsService],

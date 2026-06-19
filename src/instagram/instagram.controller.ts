@@ -55,6 +55,21 @@ export class InstagramController {
     return this.service.connectBusiness(this.ws(req), this.uid(req), code, redirect_uri);
   }
 
+  // ── OAuth: reconnect / re-authorize an existing IG Business page ──
+  // Mirrors replyagent's "Refresh" — same OAuth as connect, but carries the
+  // page_id so the existing row's token is refreshed in place (not duplicated).
+  @Post('reconnect-business')
+  reconnectBusiness(@Body() body: any, @Request() req: any) {
+    const { code, redirect_uri, page_id } = body;
+    return this.service.connectBusiness(
+      this.ws(req),
+      this.uid(req),
+      code,
+      redirect_uri,
+      page_id ? BigInt(page_id) : undefined,
+    );
+  }
+
   // ── OAuth: Facebook-managed pages — get available accounts ────────
   @Get('available-pages')
   getAvailablePages(@Query('token') token: string, @Request() req: any) {
