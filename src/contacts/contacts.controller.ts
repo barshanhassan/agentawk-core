@@ -105,6 +105,20 @@ export class ContactsController {
   }
 
   /**
+   * Export Facebook/Instagram PSIDs as CSV. Body: { ids?: number[] } — empty
+   * exports all INSTAGRAM/MESSENGER contacts in the workspace.
+   */
+  @Post('export/psid')
+  async exportPsid(@Request() req: any, @Body() body: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    const ids = Array.isArray(body?.ids)
+      ? body.ids.map((i: any) => BigInt(i))
+      : [];
+    const csv = await this.service.exportPsid(workspaceId, ids);
+    return { csv, filename: 'PSID.csv' };
+  }
+
+  /**
    * CSV import. Body: { csv: string } (the raw CSV text). Returns counts.
    */
   @Post('import/csv')

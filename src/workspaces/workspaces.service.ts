@@ -396,6 +396,7 @@ export class WorkspacesService {
         full_name: true,
         email: true,
         status: true,
+        is_owner: true,
         locale: true,
         tfa_required: true,
         mobile_access: true,
@@ -416,6 +417,41 @@ export class WorkspacesService {
     const roles = await this.prisma.acl_roles.findMany({
       where: { id: { in: roleIds } }
     });
+
+    // Resolve each member's permission slugs (mirrors AuthService.loadUserPermissions,
+    // but batched for the whole member list): owner → wildcards; otherwise the
+    // member's role permissions + any direct entity permissions. The frontend uses
+    // this to gate per-agent UI (e.g. only agents with `receive_tasks` appear in the
+    // task-assignee dropdown — replyagent's getUsers()).
+    const rolePerms = roleIds.length
+      ? await this.prisma.acl_role_permissions.findMany({ where: { role_id: { in: roleIds.map(r => Number(r)) } } })
+      : [];
+    const entityPerms = userIds.length
+      ? await this.prisma.acl_entity_permissions.findMany({ where: { entity_id: { in: userIds }, entity_type: 'App\\Models\\User' } })
+      : [];
+    const allPermIds = [...new Set([...rolePerms.map(rp => rp.permission_id), ...entityPerms.map(ep => ep.permission_id)])];
+    const permRows = allPermIds.length
+      ? await this.prisma.acl_permissions.findMany({ where: { id: { in: allPermIds } }, select: { id: true, slug: true } })
+      : [];
+    const slugByPermId = new Map(permRows.map(p => [p.id.toString(), p.slug]));
+    const slugsByRole = new Map<string, string[]>();
+    for (const rp of rolePerms) {
+      const slug = slugByPermId.get(rp.permission_id.toString());
+      if (!slug) continue;
+      const rid = rp.role_id.toString();
+      const arr = slugsByRole.get(rid) ?? [];
+      arr.push(slug);
+      slugsByRole.set(rid, arr);
+    }
+    const entitySlugsByUser = new Map<string, string[]>();
+    for (const ep of entityPerms) {
+      const slug = slugByPermId.get(ep.permission_id.toString());
+      if (!slug) continue;
+      const uid = ep.entity_id.toString();
+      const arr = entitySlugsByUser.get(uid) ?? [];
+      arr.push(slug);
+      entitySlugsByUser.set(uid, arr);
+    }
 
     // Batched phone/whatsapp read-back (with country iso2 for the form's country selector)
     const mobiles = userIds.length
@@ -449,6 +485,13 @@ export class WorkspacesService {
     return users.map(user => {
       const roleRelation = roleables.find(r => r.roleable_id === user.id);
       const role = roleRelation ? roles.find(r => r.id === BigInt(roleRelation.role_id)) : null;
+      // Resolved permission slugs for this member (owner → wildcards).
+      const permissions = (user as any).is_owner
+        ? ['agency.*', 'workspace.*']
+        : [...new Set([
+            ...(roleRelation ? (slugsByRole.get(roleRelation.role_id.toString()) ?? []) : []),
+            ...(entitySlugsByUser.get(user.id.toString()) ?? []),
+          ])];
       const mob = mobiles.find(m => m.modelable_id === user.id && m.slug === 'mobile');
       const wa = mobiles.find(m => m.modelable_id === user.id && m.slug === 'whatsapp');
       const policy = policies.find(p => p.user_id === user.id) || null;
@@ -480,6 +523,7 @@ export class WorkspacesService {
         tags: accessOf(user.id, 'App\\Models\\Tag\\Tag'),
         agents: accessOf(user.id, 'App\\Models\\User'),
         channels,
+        permissions,
       };
     });
   }

@@ -5,6 +5,16 @@ import { PrismaService } from '../prisma/prisma.service';
 export class RolesService {
   constructor(private readonly prisma: PrismaService) {}
 
+  // Group slugs intentionally hidden from the role-create permission tree.
+  // (User-requested removal — these groups should not appear when building a role.)
+  private static readonly HIDDEN_GROUP_SLUGS = new Set<string>([
+    'workspace.pipeline.*',    // Pipelines & Opportunities
+    'workspace.ai_products.*', // AI Products
+    'workspace.bundle.*',      // Bundles
+    'workspace.legal.*',       // Legal (workspace-only removal; agency keeps Legal)
+    'workspace.booking.*',     // Booking (not used in EZCONN)
+  ]);
+
   // Returns all permissions grouped under a parent slug (e.g. 'agency.*')
   async getPermissionsTree(parentSlug: string) {
     const parent = await this.prisma.acl_permissions.findFirst({
@@ -25,6 +35,12 @@ export class RolesService {
     const groups: Record<string, { slug: string; name: string; description: string; icon: string | null; tooltip: string | null; children: any[] }> = {};
 
     for (const perm of allPerms) {
+      // Hide non-public permissions from the role-create tree — mirrors
+      // replyagent's `v-show="permission.public"` (e.g. Canned Responses and the
+      // Pipeline-level permissions are public=false and never shown when building
+      // a role; they live in their own dedicated settings screens instead).
+      if (perm.public === false) continue;
+
       if (perm.parent_id === parent.id) {
         // This is a group-level permission (e.g. agency.users.*)
         if (!groups[perm.slug]) {
@@ -49,7 +65,9 @@ export class RolesService {
       }
     }
 
-    return Object.values(groups).filter(g => g.children.length > 0);
+    return Object.values(groups).filter(
+      g => g.children.length > 0 && !RolesService.HIDDEN_GROUP_SLUGS.has(g.slug),
+    );
   }
 
   async getRoles(ownerId: bigint, ownerType: string = 'App\\Models\\Workspace') {

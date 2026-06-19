@@ -1462,6 +1462,65 @@ export class ContactsService {
       }),
     ]);
 
+    // Custom-field values (label + value) — mirrors replyagent custom_fields_data
+    // so the merge preview/summary can show them. Manual join (no Prisma relation
+    // between custom_field_entities and custom_field_entity_values).
+    let customFieldsData: any[] = [];
+    try {
+      const fields = await this.prisma.custom_fields.findMany({
+        where: { workspace_id: workspaceId, for: 'CONTACT' as any },
+        orderBy: { created_at: 'asc' },
+      });
+      const fieldIds = (fields as any[]).map((f) => f.id);
+      if (fieldIds.length) {
+        const entities = await this.prisma.custom_field_entities.findMany({
+          where: {
+            entity_type: 'CONTACT',
+            entity_id: contact.id,
+            custom_field_id: { in: fieldIds },
+          },
+        });
+        const entityIds = (entities as any[]).map((e) => e.id);
+        const vals = entityIds.length
+          ? await this.prisma.custom_field_entity_values.findMany({
+              where: { cf_entity_id: { in: entityIds } },
+            })
+          : [];
+        const entityToField = new Map(
+          (entities as any[]).map((e) => [
+            e.id.toString(),
+            e.custom_field_id.toString(),
+          ]),
+        );
+        const valueMap = new Map<string, string>();
+        for (const v of vals as any[]) {
+          const fid = entityToField.get(v.cf_entity_id.toString());
+          if (fid && v.value != null) valueMap.set(fid, v.value);
+        }
+        customFieldsData = (fields as any[])
+          .filter((f) => valueMap.has(f.id.toString()))
+          .map((f) => ({
+            id: f.id.toString(),
+            label: f.label,
+            content_type: f.content_type,
+            value: valueMap.get(f.id.toString()),
+          }));
+      }
+    } catch {}
+
+    // Channel chats (presence) for the preview — best-effort per table.
+    const [tgChats, fbChats, igChats] = await Promise.all([
+      this.prisma.telegram_chats
+        .findMany({ where: { contact_id: contact.id }, take: 10 })
+        .catch(() => [] as any[]),
+      this.prisma.fb_chats
+        .findMany({ where: { contact_id: contact.id }, take: 10 })
+        .catch(() => [] as any[]),
+      this.prisma.insta_chats
+        .findMany({ where: { contact_id: contact.id }, take: 10 })
+        .catch(() => [] as any[]),
+    ]);
+
     return {
       ...this.serialize(contact),
       slug: contact.id.toString(),
@@ -1486,8 +1545,14 @@ export class ContactsService {
         name: tl.name,
         tag_id: tl.tag_id?.toString(),
       })),
-      custom_fields_data: [],
-      telegram_chats: [],
+      custom_fields_data: customFieldsData,
+      telegram_chats: (tgChats as any[]).map((c) => ({
+        id: c.id?.toString(),
+        full_name:
+          (c as any).full_name ??
+          `${(c as any).first_name ?? ''} ${(c as any).last_name ?? ''}`.trim(),
+        from_id: (c as any).from_id?.toString?.() ?? null,
+      })),
       whatsapp_chats: mobiles
         .filter((m) => String(m.type ?? '').toLowerCase() === 'whatsapp')
         .map((m) => ({
@@ -1495,8 +1560,17 @@ export class ContactsService {
           wa_id: m.full_mobile_number ?? m.mobile_number ?? '',
           profile_name: contact.full_name ?? '',
         })),
-      facebook_chats: [],
-      instagram_chats: [],
+      facebook_chats: (fbChats as any[]).map((c) => ({
+        id: c.id?.toString(),
+        first_name: (c as any).first_name ?? '',
+        last_name: (c as any).last_name ?? '',
+        sender_id: (c as any).sender_id ?? null,
+      })),
+      instagram_chats: (igChats as any[]).map((c) => ({
+        id: c.id?.toString(),
+        name: (c as any).name ?? (c as any).username ?? '',
+        username: (c as any).username ?? null,
+      })),
     };
   }
 
@@ -1648,6 +1722,43 @@ export class ContactsService {
           data: { linkable_id: dest.id },
         });
       }
+    }
+
+    // 2.5 Move custom-field VALUES. Values hang off `custom_field_entities`
+    //     (entity_type='CONTACT', entity_id=contactId) via
+    //     custom_field_entity_values.cf_entity_id, so reassigning the entity's
+    //     entity_id carries its value across. Dedupe by custom_field_id — the
+    //     destination keeps its own value when both contacts have the field.
+    try {
+      const [currentEntities, destEntities] = await Promise.all([
+        this.prisma.custom_field_entities.findMany({
+          where: { entity_type: 'CONTACT', entity_id: current.id },
+        }),
+        this.prisma.custom_field_entities.findMany({
+          where: { entity_type: 'CONTACT', entity_id: dest.id },
+        }),
+      ]);
+      const destFieldSet = new Set(
+        (destEntities as any[]).map((e) => e.custom_field_id?.toString() ?? ''),
+      );
+      for (const ent of currentEntities as any[]) {
+        if (destFieldSet.has(ent.custom_field_id?.toString() ?? '')) {
+          // Destination already holds this field — drop the source's value + entity.
+          await this.prisma.custom_field_entity_values
+            .deleteMany({ where: { cf_entity_id: ent.id } })
+            .catch(() => null);
+          await this.prisma.custom_field_entities
+            .delete({ where: { id: ent.id } })
+            .catch(() => null);
+        } else {
+          await this.prisma.custom_field_entities.update({
+            where: { id: ent.id },
+            data: { entity_id: dest.id },
+          });
+        }
+      }
+    } catch (e) {
+      this.logger.warn(`merge: custom-field value move failed: ${e}`);
     }
 
     // 3. Move conversations to the destination contact. The `inbox` table
@@ -1973,6 +2084,61 @@ export class ContactsService {
         c.created_at ? c.created_at.toISOString() : '',
       ].join(',');
       lines.push(row);
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * Export Facebook/Instagram PSIDs (page-scoped sender IDs) for the given
+   * contacts. Mirrors replyagent's PSIDExport: only contacts whose source is
+   * INSTAGRAM or MESSENGER are included; the PSID comes from insta_chats /
+   * fb_chats `sender_id`. Synchronous (EZCONN pattern, like exportCsv).
+   * @param ids optional contact id filter; empty = all matching in workspace.
+   */
+  async exportPsid(workspaceId: bigint, ids: bigint[] = []) {
+    const where: any = {
+      workspace_id: workspaceId,
+      deleted_at: null,
+      source: { in: ['INSTAGRAM', 'MESSENGER'] as any },
+    };
+    if (ids && ids.length) where.id = { in: ids };
+
+    const contacts = await this.prisma.contacts.findMany({
+      where,
+      orderBy: { id: 'asc' },
+      take: 10000,
+      select: {
+        id: true,
+        full_name: true,
+        first_name: true,
+        last_name: true,
+        source: true,
+      },
+    });
+
+    const lines: string[] = ['name,source,psid'];
+    for (const c of contacts) {
+      let psid: string | null = null;
+      if (c.source === ('INSTAGRAM' as any)) {
+        const ig = await this.prisma.insta_chats.findFirst({
+          where: { contact_id: c.id },
+          select: { sender_id: true },
+        });
+        psid = ig?.sender_id ?? null;
+      } else if (c.source === ('MESSENGER' as any)) {
+        const fb = await this.prisma.fb_chats.findFirst({
+          where: { contact_id: c.id },
+          select: { sender_id: true },
+        });
+        psid = fb?.sender_id ?? null;
+      }
+      if (!psid) continue;
+      const name =
+        c.full_name ??
+        `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim();
+      lines.push(
+        [this.csvEscape(name), String(c.source), this.csvEscape(psid)].join(','),
+      );
     }
     return lines.join('\n');
   }
