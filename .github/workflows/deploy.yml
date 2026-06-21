@@ -34,4 +34,4 @@ jobs:
             --region ${{ env.REGION }} \
             --allow-unauthenticated \
             --add-cloudsql-instances dynamic-inventory-replenish:us-east1:dynamic-inventory \
-            --set-env-vars="NODE_ENV=production,DATABASE_URL=mysql://root:talhashah@localhost/ezconn_db?socket=/cloudsql/dynamic-inventory-replenish:us-east1:dynamic-inventory,APP_KEY=ezconn_secret_2024,SESSION_LIFETIME=120,JWT_SECRET=ezconn_secret_key_2024_safe_and_long,AWS_REGION=us-east-1,AWS_BUCKET=ezconn-prod-storage,AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }},AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            --set-env-vars="NODE_ENV=production,DATABASE_URL=mysql://talha:shah@localhost/ezconn_db?socket=/cloudsql/dynamic-inventory-replenish:us-east1:dynamic-inventory,APP_KEY=ezconn_secret_2024,SESSION_LIFETIME=120,JWT_SECRET=ezconn_secret_key_2024_safe_and_long,AWS_REGION=us-east-1,AWS_BUCKET=ezconn-prod-storage,AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }},AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}"
