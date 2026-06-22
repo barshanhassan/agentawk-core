@@ -13,6 +13,7 @@ import { RabbitMqService } from '../rabbitmq/rabbitmq.service';
 import { S3Service } from '../s3/s3.service';
 import OpenAI from 'openai';
 import { Readable, PassThrough } from 'stream';
+import { randomUUID } from 'crypto';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const ffmpeg = require('fluent-ffmpeg');
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -99,9 +100,16 @@ export class InboxService {
       is_upcoming,     // true — Upcoming tab (snooze in the future)
       channel_types,   // string[] — channels filter chips
       current_user_id, // bigint — used for the "my chats" tab (NOT a tab now, but kept for future)
+      sort,            // { column: 'last_updated'|'queued_at', order: 'asc'|'desc' } — sort menu
     } = filters;
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const take = parseInt(limit);
+
+    // Sort menu (replyagent): default Latest message ↓. `queued_at` powers the
+    // "Queue order" option on the Queue tab. Applied BOTH at the DB layer and in
+    // the post-dedup in-memory sort below so the chosen order always wins.
+    const sortCol = sort?.column === 'queued_at' ? 'queued_at' : 'updated_at';
+    const sortAsc = sort?.order === 'asc';
 
     const where: any = { workspace_id: workspaceId };
 
@@ -179,64 +187,198 @@ export class InboxService {
       where.user_id = BigInt(assigned_to);
     }
 
+    // Multi-agent assignee filter (header "Agents" dropdown — replyagent UserFilter).
+    // 'NULL' means unassigned/queue. Specific ids take precedence; NULL-only filters
+    // to unassigned rows. (top-level user_id is AND-merged with channel/search OR.)
+    if (Array.isArray(filters.users) && filters.users.length > 0) {
+      const ids = filters.users
+        .filter((u: any) => u != null && u !== 'NULL')
+        .map((u: any) => BigInt(u));
+      if (ids.length) {
+        where.user_id = { in: ids };
+      } else if (filters.users.includes('NULL')) {
+        where.user_id = null;
+      }
+    }
+
     // Text search: find contacts matching the query, then restrict inbox to
     // their chat rows. Runs two rounds of lookups but stays fully accurate
     // for pagination (the WHERE clause is complete before findMany runs).
     if (search?.trim()) {
       const term = search.trim();
-      const matchingContacts = await this.prisma.contacts.findMany({
-        where: {
-          workspace_id: workspaceId,
-          deleted_at: null,
-          OR: [
-            { full_name: { contains: term } },
-            { first_name: { contains: term } },
-            { last_name: { contains: term } },
-          ],
-        },
-        select: { id: true },
-        take: 300,
-      });
-      const contactIds = matchingContacts.map((c) => c.id);
+      // Which field to search (replyagent search-box type selector). Defaults to
+      // a broad name match so the plain search box keeps working.
+      const st = String(filters.search_type ?? 'full_name').toLowerCase();
+      const emptyResult = { inbox: [], total: 0, page: parseInt(page), limit: take, pages: 0 };
 
-      if (contactIds.length === 0) {
-        return { inbox: [], total: 0, page: parseInt(page), limit: take, pages: 0 };
+      let searchOrConditions: any[] = [];
+      let directHandled = false; // true when the type resolved inbox rows itself
+
+      // ── Channel-identifier / support-ticket searches resolve to inbox rows
+      //    directly (no contact-table round-trip). ──
+      if (st === 'whatsapp') {
+        const rows = await this.prisma.wa_chats.findMany({ where: { wa_id: { contains: term } }, select: { id: true }, take: 300 });
+        if (!rows.length) return emptyResult;
+        searchOrConditions.push({ modelable_type: { contains: 'WhatsappChat' }, modelable_id: { in: rows.map((r) => r.id) } });
+        directHandled = true;
+      } else if (st === 'telegram') {
+        const rows = await this.prisma.telegram_chats.findMany({ where: { username: { contains: term } }, select: { id: true }, take: 300 });
+        if (!rows.length) return emptyResult;
+        searchOrConditions.push({ modelable_type: { contains: 'TelegramChat' }, modelable_id: { in: rows.map((r) => r.id) } });
+        directHandled = true;
+      } else if (st === 'messenger') {
+        const rows = await this.prisma.fb_chats.findMany({ where: { sender_id: { contains: term } }, select: { id: true }, take: 300 });
+        if (!rows.length) return emptyResult;
+        searchOrConditions.push({ modelable_type: { contains: 'FacebookChat' }, modelable_id: { in: rows.map((r) => r.id) } });
+        directHandled = true;
+      } else if (st === 'instagram') {
+        const rows = await this.prisma.insta_chats.findMany({ where: { OR: [{ username: { contains: term } }, { sender_id: { contains: term } }] }, select: { id: true }, take: 300 });
+        if (!rows.length) return emptyResult;
+        searchOrConditions.push({ modelable_type: { contains: 'InstaChat' }, modelable_id: { in: rows.map((r) => r.id) } });
+        directHandled = true;
+      } else if (st === 'support-ticket') {
+        const rows = await this.prisma.support_numbers.findMany({ where: { workspace_id: workspaceId, sn_number: { contains: term } }, select: { inbox_id: true }, take: 300 });
+        if (!rows.length) return emptyResult;
+        where.id = { in: rows.map((r) => r.inbox_id) };
+        directHandled = true;
       }
 
-      const [waIds, tgIds, fbIds, igIds, wcIds, zapiIds] = await Promise.all([
-        this.prisma.wa_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
-        this.prisma.telegram_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
-        this.prisma.fb_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
-        this.prisma.insta_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
-        this.prisma.wc_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
-        this.prisma.zapi_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
-      ]);
+      if (!directHandled) {
+        // ── Contact-based searches → contactIds → channel chat ids. ──
+        let contactIds: bigint[] = [];
+        if (st === 'id') {
+          if (/^\d+$/.test(term)) contactIds = [BigInt(term)];
+        } else if (st === 'phone') {
+          // contact_mobiles: ownership = Workspace, modelable = Contact.
+          const mob = await this.prisma.contact_mobiles.findMany({
+            where: {
+              ownership_type: 'App\\Models\\Workspace',
+              ownership_id: workspaceId,
+              OR: [
+                { mobile_number: { contains: term } },
+                { full_mobile_number: { contains: term } },
+                { national_mobile_number: { contains: term } },
+              ],
+            },
+            select: { modelable_id: true },
+            take: 300,
+          });
+          contactIds = mob.map((m) => m.modelable_id);
+        } else if (st === 'email') {
+          const em = await this.prisma.contact_emails.findMany({
+            where: { modelable_type: 'App\\Models\\Contact', email: { contains: term } },
+            select: { modelable_id: true },
+            take: 300,
+          });
+          contactIds = em.map((e) => e.modelable_id);
+        } else {
+          // Name types: first_name / last_name / full_name / (default = any name).
+          const nameWhere =
+            st === 'first_name' ? { first_name: { contains: term } }
+            : st === 'last_name' ? { last_name: { contains: term } }
+            : st === 'full_name' ? { full_name: { contains: term } }
+            : { OR: [
+                { full_name: { contains: term } },
+                { first_name: { contains: term } },
+                { last_name: { contains: term } },
+              ] };
+          const matchingContacts = await this.prisma.contacts.findMany({
+            where: { workspace_id: workspaceId, deleted_at: null, ...nameWhere },
+            select: { id: true },
+            take: 300,
+          });
+          contactIds = matchingContacts.map((c) => c.id);
+        }
 
-      const searchOrConditions: any[] = [];
-      if (waIds.length)   searchOrConditions.push({ modelable_type: { contains: 'WhatsappChat' }, modelable_id: { in: waIds.map((c) => c.id) } });
-      if (tgIds.length)   searchOrConditions.push({ modelable_type: { contains: 'TelegramChat' }, modelable_id: { in: tgIds.map((c) => c.id) } });
-      if (fbIds.length)   searchOrConditions.push({ modelable_type: { contains: 'FacebookChat' }, modelable_id: { in: fbIds.map((c) => c.id) } });
-      if (igIds.length)   searchOrConditions.push({ modelable_type: { contains: 'InstaChat' }, modelable_id: { in: igIds.map((c) => c.id) } });
-      if (wcIds.length)   searchOrConditions.push({ modelable_type: { contains: 'WcChat' }, modelable_id: { in: wcIds.map((c) => c.id) } });
-      if (zapiIds.length) searchOrConditions.push({ modelable_type: { contains: 'ZapiChat' }, modelable_id: { in: zapiIds.map((c) => c.id) } });
+        // email / id lookups aren't workspace-scoped at the source — restrict the
+        // candidate ids to this workspace's live contacts.
+        if (contactIds.length && (st === 'email' || st === 'id')) {
+          const valid = await this.prisma.contacts.findMany({
+            where: { id: { in: contactIds }, workspace_id: workspaceId, deleted_at: null },
+            select: { id: true },
+          });
+          contactIds = valid.map((c) => c.id);
+        }
 
-      if (searchOrConditions.length === 0) {
-        return { inbox: [], total: 0, page: parseInt(page), limit: take, pages: 0 };
+        if (contactIds.length === 0) return emptyResult;
+
+        const [waIds, tgIds, fbIds, igIds, wcIds, zapiIds] = await Promise.all([
+          this.prisma.wa_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+          this.prisma.telegram_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+          this.prisma.fb_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+          this.prisma.insta_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+          this.prisma.wc_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+          this.prisma.zapi_chats.findMany({ where: { contact_id: { in: contactIds } }, select: { id: true } }),
+        ]);
+
+        if (waIds.length)   searchOrConditions.push({ modelable_type: { contains: 'WhatsappChat' }, modelable_id: { in: waIds.map((c) => c.id) } });
+        if (tgIds.length)   searchOrConditions.push({ modelable_type: { contains: 'TelegramChat' }, modelable_id: { in: tgIds.map((c) => c.id) } });
+        if (fbIds.length)   searchOrConditions.push({ modelable_type: { contains: 'FacebookChat' }, modelable_id: { in: fbIds.map((c) => c.id) } });
+        if (igIds.length)   searchOrConditions.push({ modelable_type: { contains: 'InstaChat' }, modelable_id: { in: igIds.map((c) => c.id) } });
+        if (wcIds.length)   searchOrConditions.push({ modelable_type: { contains: 'WcChat' }, modelable_id: { in: wcIds.map((c) => c.id) } });
+        if (zapiIds.length) searchOrConditions.push({ modelable_type: { contains: 'ZapiChat' }, modelable_id: { in: zapiIds.map((c) => c.id) } });
+
+        if (searchOrConditions.length === 0) return emptyResult;
       }
 
-      // Merge with any existing channel OR so both constraints apply together
-      if (where.OR) {
-        where.AND = [{ OR: where.OR }, { OR: searchOrConditions }];
-        delete where.OR;
-      } else {
-        where.OR = searchOrConditions;
+      // Merge the channel/identifier match into `where` (skip when a direct
+      // inbox-id search like support-ticket already constrained `where.id`).
+      if (searchOrConditions.length > 0) {
+        if (where.OR) {
+          where.AND = [{ OR: where.OR }, { OR: searchOrConditions }];
+          delete where.OR;
+        } else {
+          where.OR = searchOrConditions;
+        }
+      }
+    }
+
+    // ── Advanced filters (filter-popover column/operator/value rows, AND-combined).
+    //    Resolved to contact ids → their chat rows → AND-merged into `where`,
+    //    same machinery as text search. ──
+    if (Array.isArray(filters.advanced_filters) && filters.advanced_filters.length > 0) {
+      const afContactIds = await this.resolveAdvancedFilterContactIds(
+        workspaceId,
+        filters.advanced_filters,
+      );
+      if (afContactIds !== null) {
+        const emptyResult = { inbox: [], total: 0, page: parseInt(page), limit: take, pages: 0 };
+        if (afContactIds.length === 0) return emptyResult;
+
+        const [waIds, tgIds, fbIds, igIds, wcIds, zapiIds] = await Promise.all([
+          this.prisma.wa_chats.findMany({ where: { contact_id: { in: afContactIds } }, select: { id: true } }),
+          this.prisma.telegram_chats.findMany({ where: { contact_id: { in: afContactIds } }, select: { id: true } }),
+          this.prisma.fb_chats.findMany({ where: { contact_id: { in: afContactIds } }, select: { id: true } }),
+          this.prisma.insta_chats.findMany({ where: { contact_id: { in: afContactIds } }, select: { id: true } }),
+          this.prisma.wc_chats.findMany({ where: { contact_id: { in: afContactIds } }, select: { id: true } }),
+          this.prisma.zapi_chats.findMany({ where: { contact_id: { in: afContactIds } }, select: { id: true } }),
+        ]);
+
+        const afOr: any[] = [];
+        if (waIds.length)   afOr.push({ modelable_type: { contains: 'WhatsappChat' }, modelable_id: { in: waIds.map((c) => c.id) } });
+        if (tgIds.length)   afOr.push({ modelable_type: { contains: 'TelegramChat' }, modelable_id: { in: tgIds.map((c) => c.id) } });
+        if (fbIds.length)   afOr.push({ modelable_type: { contains: 'FacebookChat' }, modelable_id: { in: fbIds.map((c) => c.id) } });
+        if (igIds.length)   afOr.push({ modelable_type: { contains: 'InstaChat' }, modelable_id: { in: igIds.map((c) => c.id) } });
+        if (wcIds.length)   afOr.push({ modelable_type: { contains: 'WcChat' }, modelable_id: { in: wcIds.map((c) => c.id) } });
+        if (zapiIds.length) afOr.push({ modelable_type: { contains: 'ZapiChat' }, modelable_id: { in: zapiIds.map((c) => c.id) } });
+
+        if (afOr.length === 0) return emptyResult;
+
+        if (where.AND) {
+          where.AND.push({ OR: afOr });
+        } else if (where.OR) {
+          where.AND = [{ OR: where.OR }, { OR: afOr }];
+          delete where.OR;
+        } else {
+          where.OR = afOr;
+        }
       }
     }
 
     const [inboxes, total] = await Promise.all([
       this.prisma.inbox.findMany({
         where,
-        orderBy: { updated_at: 'desc' },
+        orderBy: { [sortCol]: sortAsc ? 'asc' : 'desc' },
         skip,
         take,
       }),
@@ -408,7 +550,11 @@ export class InboxService {
       }
     }
     const finalInboxes = [...nonIgResult, ...igContactSeen.values()].sort(
-      (a: any, b: any) => (b.updated_at?.getTime?.() ?? 0) - (a.updated_at?.getTime?.() ?? 0),
+      (a: any, b: any) => {
+        const av = a[sortCol]?.getTime?.() ?? 0;
+        const bv = b[sortCol]?.getTime?.() ?? 0;
+        return sortAsc ? av - bv : bv - av;
+      },
     );
 
     return {
@@ -423,6 +569,122 @@ export class InboxService {
   /**
    * Get counts for different inbox statuses (Active, Unread, Snoozed, Completed, Unassigned)
    */
+  /**
+   * Resolve the inbox advanced-filter rows (column / operator / value, AND-combined)
+   * to the contact ids they match. Columns map to `contacts` fields or the
+   * polymorphic mobile / email / tag tables. Returns null when no usable filters
+   * are present, otherwise a (possibly empty) contact-id array.
+   *
+   * Negation / empty operators are evaluated against the workspace contact set
+   * (capped at 20k — logs a warning if the cap is hit).
+   */
+  private async resolveAdvancedFilterContactIds(
+    workspaceId: bigint,
+    advancedFilters: any[],
+  ): Promise<bigint[] | null> {
+    const EMPTY_OPS = ['is empty', 'is not empty'];
+    const valid = (advancedFilters ?? []).filter(
+      (f) =>
+        f && f.column && f.operator &&
+        (EMPTY_OPS.includes(f.operator) || String(f.value ?? '').trim() !== ''),
+    );
+    if (!valid.length) return null;
+
+    const CAP = 20000;
+    const allRows = await this.prisma.contacts.findMany({
+      where: { workspace_id: workspaceId, deleted_at: null },
+      select: { id: true },
+      take: CAP,
+    });
+    if (allRows.length === CAP) {
+      this.logger.warn(
+        `advanced filter: contact universe hit cap ${CAP} for ws ${workspaceId}; negation/empty results may be partial`,
+      );
+    }
+    const allIds = new Set(allRows.map((c) => String(c.id)));
+    const inWs = (ids: (bigint | null)[]) =>
+      new Set(
+        ids
+          .filter((x): x is bigint => x !== null)
+          .map(String)
+          .filter((id) => allIds.has(id)),
+      );
+
+    const nameField: Record<string, string> = {
+      name: 'full_name',
+      firstName: 'first_name',
+      lastName: 'last_name',
+    };
+
+    const nameRows = async (frag: any): Promise<Set<string>> => {
+      const rows = await this.prisma.contacts.findMany({
+        where: { workspace_id: workspaceId, deleted_at: null, ...frag },
+        select: { id: true },
+        take: CAP,
+      });
+      return new Set(rows.map((r) => String(r.id)));
+    };
+
+    // contains | equals | hasValue → positive contact-id set for one column.
+    const positiveSet = async (
+      col: string,
+      kind: 'contains' | 'equals' | 'hasValue',
+      v: string,
+    ): Promise<Set<string>> => {
+      const field = nameField[col];
+      if (field) {
+        if (kind === 'contains') return nameRows({ [field]: { contains: v } });
+        if (kind === 'equals') return nameRows({ [field]: v });
+        return nameRows({ NOT: [{ [field]: null }, { [field]: '' }] });
+      }
+      if (col === 'email') {
+        const where: any = { modelable_type: 'App\\Models\\Contact' };
+        if (kind === 'contains') where.email = { contains: v };
+        else if (kind === 'equals') where.email = v;
+        const rows = await this.prisma.contact_emails.findMany({ where, select: { modelable_id: true }, take: CAP });
+        return inWs(rows.map((r) => r.modelable_id));
+      }
+      if (col === 'phoneNumber') {
+        const where: any = { ownership_type: 'App\\Models\\Workspace', ownership_id: workspaceId };
+        if (kind === 'contains') where.OR = [{ full_mobile_number: { contains: v } }, { mobile_number: { contains: v } }];
+        else if (kind === 'equals') where.OR = [{ full_mobile_number: v }, { mobile_number: v }];
+        const rows = await this.prisma.contact_mobiles.findMany({ where, select: { modelable_id: true }, take: CAP });
+        return inWs(rows.map((r) => r.modelable_id));
+      }
+      if (col === 'tags') {
+        const where: any = { linkable_type: 'App\\Models\\Contact' };
+        if (kind === 'contains') where.name = { contains: v };
+        else if (kind === 'equals') where.name = v;
+        const rows = await this.prisma.tag_links.findMany({ where, select: { linkable_id: true }, take: CAP });
+        return inWs(rows.map((r) => r.linkable_id));
+      }
+      return new Set<string>();
+    };
+
+    const diff = (a: Set<string>, b: Set<string>) => new Set([...a].filter((x) => !b.has(x)));
+    const intersect = (a: Set<string>, b: Set<string>) => new Set([...a].filter((x) => b.has(x)));
+
+    let result: Set<string> | null = null;
+    for (const f of valid) {
+      const col = f.column;
+      const v = String(f.value ?? '');
+      let set: Set<string>;
+      switch (f.operator) {
+        case 'contains':         set = await positiveSet(col, 'contains', v); break;
+        case 'is':               set = await positiveSet(col, 'equals', v); break;
+        case 'is not empty':     set = await positiveSet(col, 'hasValue', v); break;
+        case 'does not contain': set = diff(allIds, await positiveSet(col, 'contains', v)); break;
+        case 'is not':           set = diff(allIds, await positiveSet(col, 'equals', v)); break;
+        case 'is empty':         set = diff(allIds, await positiveSet(col, 'hasValue', v)); break;
+        default:                 set = new Set(allIds);
+      }
+      result = result === null ? set : intersect(result, set);
+      if (result.size === 0) break;
+    }
+
+    return Array.from(result ?? []).map((s) => BigInt(s));
+  }
+
   async getInboxCounts(workspaceId: bigint, filters: any) {
     const now = new Date();
     const userIds = filters.users ? filters.users.map(id => id === 'NULL' ? null : BigInt(id)) : [];
@@ -575,30 +837,41 @@ export class InboxService {
     let messages = [];
     const query: any = { orderBy: { created_at: 'desc' }, skip, take };
 
+    // Message-mode filter (replyagent header dropdown). ALL = no filter; INBOX /
+    // AUTOMATION map to the `communication_mode` enum. (NOTE / OLD_DATA aren't
+    // backed by this column and are not offered.)
+    const rawMode = String(filters.communication_mode ?? filters.mode ?? 'ALL').toUpperCase();
+    // INBOX / AUTOMATION exclude system/note rows (replyagent whereNotIn); ALL
+    // shows everything including the note_action system pills.
+    const modeWhere =
+      rawMode === 'INBOX' || rawMode === 'AUTOMATION'
+        ? { communication_mode: rawMode as any, type: { notIn: ['note_action', 'note'] } }
+        : {};
+
     if (type.includes('whatsapp')) {
       messages = await this.prisma.wa_messages.findMany({
         ...query,
-        where: { wa_chat_id: modelableId },
+        where: { wa_chat_id: modelableId, ...modeWhere },
       });
     } else if (type.includes('messenger') || type.includes('fb')) {
       messages = await this.prisma.fb_messages.findMany({
         ...query,
-        where: { fb_chat_id: modelableId },
+        where: { fb_chat_id: modelableId, ...modeWhere },
       });
     } else if (type.includes('instagram') || type.includes('insta')) {
       messages = await this.prisma.insta_messages.findMany({
         ...query,
-        where: { insta_chat_id: modelableId },
+        where: { insta_chat_id: modelableId, ...modeWhere },
       });
     } else if (type.includes('telegram')) {
       messages = await this.prisma.telegram_messages.findMany({
         ...query,
-        where: { telegram_chat_id: modelableId },
+        where: { telegram_chat_id: modelableId, ...modeWhere },
       });
     } else if (type.includes('webchat')) {
       messages = await this.prisma.wc_messages.findMany({
         ...query,
-        where: { wc_chat_id: modelableId },
+        where: { wc_chat_id: modelableId, ...modeWhere },
       });
     }
 
@@ -705,7 +978,132 @@ export class InboxService {
       }
     }
 
-    return { messages: enrichedMessages.reverse(), page: parseInt(page), limit: take };
+    // ── Template previews — resolve type='template' messages to their wa_template
+    //    structure (header/body/footer/buttons) so the thread can render a card. ──
+    const templateMsgs = enrichedMessages.filter((m: any) => m.type === 'template');
+    if (templateMsgs.length) {
+      const names = new Set<string>();
+      for (const m of templateMsgs) {
+        try {
+          const p = JSON.parse((m as any).payload ?? '{}');
+          const n = p?.template?.name;
+          if (n) names.add(n);
+        } catch {}
+      }
+      if (names.size) {
+        const accounts = await this.prisma.wa_accounts.findMany({
+          where: { workspace_id: inbox.workspace_id },
+          select: { waba_id: true },
+        });
+        const wabaIds = accounts.map((a) => a.waba_id);
+        const tpls = wabaIds.length
+          ? await this.prisma.wa_templates.findMany({
+              where: { wa_account_id: { in: wabaIds }, name: { in: Array.from(names) } },
+            })
+          : [];
+        const tplMap = new Map(tpls.map((t) => [t.name, t]));
+        for (const m of templateMsgs) {
+          try {
+            const p = JSON.parse((m as any).payload ?? '{}');
+            const tpl = p?.template?.name ? tplMap.get(p.template.name) : null;
+            if (tpl) {
+              let components: any = [];
+              try { components = JSON.parse(tpl.components ?? '[]'); } catch { components = []; }
+              (m as any).template = {
+                name: tpl.name,
+                components,
+                params: p?.template?.components ?? [],
+              };
+            }
+          } catch {}
+        }
+      }
+    }
+
+    // ── Sender names for outgoing agent (INBOX) messages — drives the per-bubble
+    //    agent avatar (replyagent). AUTOMATION sends render a bot icon instead. ──
+    const senderIds = Array.from(
+      new Set(
+        enrichedMessages
+          .filter((m: any) => m.direction === 'OUTGOING' && m.communication_mode === 'INBOX' && m.sender_id)
+          .map((m: any) => BigInt(m.sender_id)),
+      ),
+    );
+    if (senderIds.length) {
+      const senders = await this.prisma.users.findMany({ where: { id: { in: senderIds } } });
+      const senderMap = new Map(
+        senders.map((u: any) => [
+          String(u.id),
+          (u.full_name || `${u.first_name ?? ''} ${u.last_name ?? ''}`.trim() || u.name || u.email || 'Agent'),
+        ]),
+      );
+      for (const m of enrichedMessages) {
+        if ((m as any).sender_id) (m as any).sender_name = senderMap.get(String((m as any).sender_id)) ?? null;
+      }
+    }
+
+    // Stored `note_action` rows (assignment/folder/etc. events) → system pills.
+    const ordered = enrichedMessages.reverse().map((m: any) => {
+      if (m.type === 'note_action') {
+        let data: any = {};
+        if (typeof m.data === 'string') {
+          try { data = JSON.parse(m.data); } catch { data = {}; }
+        } else if (m.data) {
+          data = m.data;
+        }
+        const r = this.resolveNoteAction(m.text, data);
+        return { id: m.id, kind: 'system', tone: r.tone, text: r.text, created_at: m.created_at };
+      }
+      return m;
+    }); // oldest → newest
+
+    // ── System messages (replyagent note_action pills). Injected only on the
+    //    first (newest) page so they aren't duplicated when older pages load. ──
+    const systemTop: any[] = [];
+    const systemBottom: any[] = [];
+    // Only in the unfiltered (ALL) view, page 1 — matches replyagent, where the
+    // ticket/closed pills are note_action rows hidden in INBOX/AUTOMATION modes.
+    if (parseInt(page) === 1 && rawMode !== 'INBOX' && rawMode !== 'AUTOMATION') {
+      const ticket = await this.prisma.support_numbers.findFirst({
+        where: { inbox_id: inboxId },
+        orderBy: { id: 'asc' },
+      });
+      if (ticket?.sn_number) {
+        systemTop.push({
+          id: `sys-ticket-${inboxId}`,
+          kind: 'system',
+          tone: 'info',
+          text: `Conversation assigned Ticket # ${ticket.sn_number}`,
+          created_at: ticket.created_at ?? ordered[0]?.created_at ?? new Date(),
+          direction: 'SYSTEM',
+        });
+      }
+
+      if (inbox.status === 'COMPLETED') {
+        let agentName = '';
+        if (inbox.closed_by) {
+          const closer: any = await this.prisma.users.findUnique({ where: { id: inbox.closed_by } });
+          agentName = closer
+            ? (closer.full_name || `${closer.first_name ?? ''} ${closer.last_name ?? ''}`.trim() || closer.name || '')
+            : '';
+        }
+        const ticketSuffix = ticket?.sn_number ? ` — Ticket # ${ticket.sn_number}` : '';
+        systemBottom.push({
+          id: `sys-completed-${inboxId}`,
+          kind: 'system',
+          tone: 'red',
+          text: agentName ? `Conversation closed by ${agentName}${ticketSuffix}` : `Conversation closed${ticketSuffix}`,
+          created_at: inbox.closed_at ?? new Date(),
+          direction: 'SYSTEM',
+        });
+      }
+    }
+
+    return {
+      messages: [...systemTop, ...ordered, ...systemBottom],
+      page: parseInt(page),
+      limit: take,
+    };
   }
 
   /**
@@ -843,7 +1241,15 @@ export class InboxService {
 
         const sentAt = new Date();
         const hasFiles = uploadedFileUrls.length > 0;
-        const fileType = hasFiles
+        // Sticker send (replyagent): a webp image flagged is_sticker goes out as
+        // a Meta `sticker` message rather than a plain image.
+        const wantsSticker =
+          (data.is_sticker === true || String(data.is_sticker) === 'true') &&
+          hasFiles &&
+          (uploadedFileUrls[0].mime === 'image/webp' || /\.webp$/i.test(uploadedFileUrls[0].name ?? ''));
+        const fileType = wantsSticker
+          ? 'sticker'
+          : hasFiles
           ? (uploadedFileUrls[0].mime?.startsWith('image/') ? 'image'
             : uploadedFileUrls[0].mime?.startsWith('audio/') ? 'audio'
             : uploadedFileUrls[0].mime?.startsWith('video/') ? 'video'
@@ -870,6 +1276,7 @@ export class InboxService {
         // Internal notes never leave the platform — short-circuit the publish
         // step so they don't reach Meta/customer.
         if (isNote) {
+          await this.notifyMentions(data.mentions, inbox, text, userId);
           return { success: true, message: savedMessage, note: true };
         }
 
@@ -905,6 +1312,7 @@ export class InboxService {
           const mediaUrl = uploadedFileUrls[0].url;
           waContext.type = fileType;
           if (fileType === 'image') waContext.image = { link: mediaUrl };
+          else if (fileType === 'sticker') waContext.sticker = { link: mediaUrl };
           else if (fileType === 'audio') waContext.audio = { link: mediaUrl };
           else if (fileType === 'video') waContext.video = { link: mediaUrl };
           else waContext.document = { link: mediaUrl, filename: uploadedFileUrls[0].name };
@@ -1027,6 +1435,10 @@ export class InboxService {
             updated_at: sentAt,
           },
         });
+
+        if (isNote) {
+          await this.notifyMentions(data.mentions, inbox, text, userId);
+        }
 
         if (!isNote) {
           if (!instaPage?.service_account_id) {
@@ -1173,6 +1585,166 @@ export class InboxService {
 
     enrichedInbox.contacts = contact;
 
+    // Opt-in status (replyagent getHasOptedInAttribute) — drives the composer's
+    // "contact opted out" state. A `channel_opts` row for (contact, channel,
+    // channel-number/page) means opted in. Webchat is always in; Z-API "@lid"
+    // chats too. Unknown channels default to opted-in (don't block).
+    let hasOptedIn = true;
+    try {
+      const t = (mType ?? '').toLowerCase();
+      const optCheck = async (channel: string, modelableId: bigint | null | undefined) => {
+        if (!chat?.contact_id || modelableId == null) return false;
+        const opt = await this.prisma.channel_opts.findFirst({
+          where: { contact_id: chat.contact_id, channel: channel as any, modelable_id: modelableId },
+          select: { id: true },
+        });
+        return !!opt;
+      };
+      if (t.includes('whatsapp')) hasOptedIn = await optCheck('whatsapp', chat?.wa_number_id);
+      else if (t.includes('insta')) hasOptedIn = await optCheck('instagram', chat?.insta_page_id);
+      else if (t.includes('facebook') || t.includes('fb')) hasOptedIn = await optCheck('messenger', chat?.fb_page_id);
+      else if (t.includes('telegram')) hasOptedIn = await optCheck('telegram', chat?.telegram_bot_id);
+      else if (t.includes('zapi')) {
+        hasOptedIn = String(chat?.mobile_number ?? '').includes('@lid')
+          ? true
+          : await optCheck('zapi', chat?.zapi_instance_id);
+      }
+      // webchat / unknown → stays opted-in
+    } catch {
+      hasOptedIn = true;
+    }
+    enrichedInbox.has_opted_in = hasOptedIn;
+
+    // Support number (replyagent inbox.support_number) + chatting channel
+    // name/number for the Details tab.
+    let supportNumber: string | null = null;
+    try {
+      const sn = await this.prisma.support_numbers.findFirst({
+        where: { inbox_id: inboxId },
+        orderBy: { id: 'desc' },
+        select: { sn_number: true },
+      });
+      supportNumber = sn?.sn_number ?? null;
+    } catch {}
+    enrichedInbox.support_number = supportNumber;
+
+    let channel: any = null;
+    try {
+      const t = (mType ?? '').toLowerCase();
+      if (t.includes('whatsapp') && chat?.wa_number_id) {
+        const p = await this.prisma.wa_phone_numbers.findUnique({ where: { id: chat.wa_number_id } });
+        if (p) channel = { type: 'whatsapp', name: p.verified_name, number: p.display_phone_number };
+      } else if (t.includes('insta') && chat?.insta_page_id) {
+        const p = await this.prisma.insta_pages.findUnique({ where: { id: chat.insta_page_id } });
+        if (p) channel = { type: 'instagram', name: p.name || p.username, number: null };
+      } else if ((t.includes('facebook') || t.includes('fb')) && chat?.fb_page_id) {
+        const p = await this.prisma.fb_pages.findUnique({ where: { id: chat.fb_page_id } });
+        if (p) channel = { type: 'messenger', name: p.name || p.username, number: null };
+      } else if (t.includes('telegram') && chat?.telegram_bot_id) {
+        const p = await this.prisma.telegram_bots.findUnique({ where: { id: chat.telegram_bot_id } });
+        if (p) channel = { type: 'telegram', name: p.name, number: null };
+      } else if (t.includes('zapi') && chat?.zapi_instance_id) {
+        const p = await this.prisma.zapi_instances.findUnique({ where: { id: chat.zapi_instance_id } });
+        if (p) channel = { type: 'zapi', name: p.name, number: p.phone_number };
+      } else if (t.includes('wc') || t.includes('webchat')) {
+        channel = { type: 'webchat', name: 'Webchat', number: null };
+      }
+    } catch {}
+
+    // In-Automation lists (replyagent contact_automation + input_automations):
+    // queued smart-flows + pending chat-inputs, each resolved to its automation
+    // name via step → published version → automation.
+    let contactAutomations: any[] = [];
+    let inputAutomations: any[] = [];
+    if (contact?.id) {
+      try {
+        const queue = await this.prisma.automation_queue.findMany({
+          where: { object_id: contact.id, object_type: { contains: 'Contact' } },
+          select: { id: true, step_id: true },
+        });
+        const stepMap = await this.resolveAutomationsBySteps(queue.map((q) => q.step_id));
+        const seen = new Set<string>();
+        for (const q of queue) {
+          const a = stepMap.get(String(q.step_id));
+          if (a && !seen.has(String(a.id))) {
+            seen.add(String(a.id));
+            contactAutomations.push({ id: String(q.id), name: a.name, automation_id: String(a.id) });
+          }
+        }
+      } catch {}
+
+      try {
+        const inputs = await this.prisma.chat_inputs.findMany({
+          where: { workspace_id: (inbox as any).workspace_id, contact_id: contact.id },
+          select: { id: true, activity_slug: true },
+        });
+        if (inputs.length) {
+          const slugs = [...new Set(inputs.map((i) => i.activity_slug).filter(Boolean))] as string[];
+          const acts = await this.prisma.automation_step_activities.findMany({
+            where: { slug: { in: slugs } },
+            select: { slug: true, step_id: true },
+          });
+          const slugToStep = new Map(acts.map((a) => [a.slug, a.step_id]));
+          const stepMap2 = await this.resolveAutomationsBySteps(acts.map((a) => a.step_id));
+          const seen2 = new Set<string>();
+          for (const ci of inputs) {
+            const stepId = slugToStep.get(ci.activity_slug);
+            const a = stepId ? stepMap2.get(String(stepId)) : null;
+            if (a && !seen2.has(String(a.id))) {
+              seen2.add(String(a.id));
+              inputAutomations.push({ id: String(ci.id), name: a.name, automation_id: String(a.id) });
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // Full media history for the Media tab (replyagent profile.media_items) —
+    // every message in this chat that carries a gallery file, newest first.
+    // (The thread only loads the latest page, so the tab would otherwise miss
+    // older media.)
+    let media: any[] = [];
+    try {
+      const t = (mType ?? '').toLowerCase();
+      const sel = { id: true, gallery_media_id: true, type: true, created_at: true, direction: true } as any;
+      let msgs: any[] = [];
+      if (t.includes('whatsapp')) msgs = await this.prisma.wa_messages.findMany({ where: { wa_chat_id: mId, gallery_media_id: { not: null } }, orderBy: { created_at: 'desc' }, take: 100, select: sel });
+      else if (t.includes('insta')) msgs = await this.prisma.insta_messages.findMany({ where: { insta_chat_id: mId, gallery_media_id: { not: null } }, orderBy: { created_at: 'desc' }, take: 100, select: sel });
+      else if (t.includes('facebook') || t.includes('fb')) msgs = await this.prisma.fb_messages.findMany({ where: { fb_chat_id: mId, gallery_media_id: { not: null } }, orderBy: { created_at: 'desc' }, take: 100, select: sel });
+      else if (t.includes('telegram')) msgs = await this.prisma.telegram_messages.findMany({ where: { telegram_chat_id: mId, gallery_media_id: { not: null } }, orderBy: { created_at: 'desc' }, take: 100, select: sel });
+      else if (t.includes('wc') || t.includes('webchat')) msgs = await this.prisma.wc_messages.findMany({ where: { wc_chat_id: mId, gallery_media_id: { not: null } }, orderBy: { created_at: 'desc' }, take: 100, select: sel });
+
+      const gidOf = (raw: any): bigint | null => {
+        try { return typeof raw === 'string' ? BigInt(raw.split(',')[0]) : BigInt(raw); } catch { return null; }
+      };
+      const gids = msgs.map((m) => gidOf(m.gallery_media_id)).filter(Boolean) as bigint[];
+      if (gids.length) {
+        const galleries = await this.prisma.media_gallery.findMany({ where: { id: { in: gids } } });
+        const gMap = new Map(galleries.map((g: any) => [String(g.id), g]));
+        media = (
+          await Promise.all(
+            msgs.map(async (m) => {
+              const gid = gidOf(m.gallery_media_id);
+              const g: any = gid ? gMap.get(String(gid)) : null;
+              if (!g) return null;
+              const url = g.file_path ? (await this.getCachedSignedUrl(g.file_path)) || g.file_url : g.file_url;
+              const thumb = g.thumb_200_path ? (await this.getCachedSignedUrl(g.thumb_200_path)) || g.thumb_200 : g.thumb_200;
+              return {
+                id: String(g.id),
+                message_id: String(m.id),
+                media_type: g.media_type,
+                url,
+                thumb: thumb || url,
+                name: g.object_name,
+                direction: m.direction,
+                created_at: m.created_at,
+              };
+            }),
+          )
+        ).filter(Boolean);
+      }
+    } catch {}
+
     // Fetch contact's applied tags via tag_links
     let contactTags: any[] = [];
     if (contact?.id) {
@@ -1285,7 +1857,39 @@ export class InboxService {
       tags: contactTags,
       custom_fields: customFields,
       opportunities,
+      has_opted_in: hasOptedIn,
+      support_number: supportNumber,
+      channel,
+      contact_automations: contactAutomations,
+      input_automations: inputAutomations,
+      automations_paused_till: contact?.automations_paused_till ?? null,
+      media,
     };
+  }
+
+  /** Resolve step ids → their automation {id, name} via published version (replyagent join). */
+  private async resolveAutomationsBySteps(
+    stepIds: bigint[],
+  ): Promise<Map<string, { id: bigint; name: string }>> {
+    const out = new Map<string, { id: bigint; name: string }>();
+    const ids = [...new Set(stepIds.filter(Boolean).map(String))].map((s) => BigInt(s));
+    if (!ids.length) return out;
+    const steps = await this.prisma.automation_steps.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, automation_version_id: true },
+    });
+    const versionIds = [...new Set(steps.map((s) => s.automation_version_id))];
+    if (!versionIds.length) return out;
+    const autos = await this.prisma.automations.findMany({
+      where: { published_version_id: { in: versionIds } },
+      select: { id: true, name: true, published_version_id: true },
+    });
+    const verToAuto = new Map(autos.map((a) => [String(a.published_version_id), a]));
+    for (const s of steps) {
+      const a = verToAuto.get(String(s.automation_version_id));
+      if (a) out.set(String(s.id), { id: a.id, name: a.name });
+    }
+    return out;
   }
 
   async assignConversation(data: any, workspaceId: bigint, userId: bigint) {
@@ -1343,7 +1947,162 @@ export class InboxService {
       });
     }
 
+    // Inline system event in the thread (replyagent addNoteText note_action):
+    // assigned_to_agent (with the agent name) or conversation_unassigned.
+    if (assignedToId) {
+      const agent: any = await this.prisma.users.findUnique({ where: { id: assignedToId } });
+      const agentName = agent
+        ? (agent.full_name || `${agent.first_name ?? ''} ${agent.last_name ?? ''}`.trim() || agent.name || agent.email || '')
+        : '';
+      await this.createNoteAction(updated, 'assigned_to_agent', userId, { agent_name: agentName });
+    } else {
+      await this.createNoteAction(updated, 'conversation_unassigned', userId, {});
+    }
+
     return updated;
+  }
+
+  /**
+   * Insert a `note_action` system-event row into the conversation's channel
+   * message table (replyagent createNoteMessage). `key` is the event slug
+   * (assigned_to_agent / conversation_unassigned / …), `data` the interpolation
+   * payload. Best-effort — a failure never blocks the triggering action.
+   * Supported channels: WhatsApp / Instagram / Messenger / Webchat.
+   */
+  private async createNoteAction(
+    inbox: { modelable_type: string | null; modelable_id: bigint; id: bigint },
+    key: string,
+    userId: bigint | null,
+    data: any = {},
+  ) {
+    const type = (inbox.modelable_type ?? '').toLowerCase();
+    const chatId = inbox.modelable_id;
+    const dataStr = JSON.stringify(data ?? {});
+    const now = new Date();
+    const base = {
+      sender_id: userId && userId > 0n ? userId : undefined,
+      type: 'note_action',
+      direction: 'OUTGOING' as any,
+      communication_mode: 'INBOX' as any,
+      text: key,
+      data: dataStr,
+      created_at: now,
+      updated_at: now,
+    };
+    try {
+      if (type.includes('whatsapp')) {
+        const chat = await this.prisma.wa_chats.findUnique({ where: { id: chatId } });
+        if (!chat) return null;
+        return await this.prisma.wa_messages.create({
+          data: { wa_number_id: chat.wa_number_id, wa_chat_id: chat.id, mobile_number: chat.wa_id, ...base },
+        });
+      } else if (type.includes('insta')) {
+        const chat = await this.prisma.insta_chats.findUnique({ where: { id: chatId } });
+        if (!chat) return null;
+        return await this.prisma.insta_messages.create({
+          data: { insta_page_id: chat.insta_page_id, insta_chat_id: chat.id, ...base },
+        });
+      } else if (type.includes('facebook') || type.includes('fb')) {
+        const chat = await this.prisma.fb_chats.findUnique({ where: { id: chatId } });
+        if (!chat) return null;
+        return await this.prisma.fb_messages.create({
+          data: { fb_page_id: chat.fb_page_id, fb_chat_id: chat.id, ...base },
+        });
+      } else if (type.includes('wc') || type.includes('webchat')) {
+        return await this.prisma.wc_messages.create({
+          data: { wc_chat_id: chatId, ...base },
+        });
+      }
+    } catch (e: any) {
+      this.logger.warn(`createNoteAction(${key}) failed for inbox ${inbox.id}: ${e.message}`);
+    }
+    return null;
+  }
+
+  /**
+   * Create a notification for each agent @mentioned in an internal note
+   * (replyagent addNote mentions). `mentions` is an array of user ids (or a
+   * comma string). Best-effort — a failure never blocks the note send.
+   */
+  private async notifyMentions(
+    mentions: any,
+    inbox: any,
+    noteText: string,
+    byUserId: bigint,
+  ) {
+    const raw = Array.isArray(mentions)
+      ? mentions
+      : typeof mentions === 'string'
+        ? mentions.split(',')
+        : [];
+    const userIds = raw
+      .map((x: any) => {
+        try { return BigInt(String(x).trim()); } catch { return null; }
+      })
+      .filter((x): x is bigint => x !== null && x > 0n);
+    if (!userIds.length) return;
+
+    const by: any = await this.prisma.users.findUnique({ where: { id: byUserId } });
+    const byName = by
+      ? (by.full_name || `${by.first_name ?? ''} ${by.last_name ?? ''}`.trim() || by.email || 'Someone')
+      : 'Someone';
+
+    for (const uid of userIds) {
+      if (uid === byUserId) continue; // don't notify yourself
+      try {
+        await this.prisma.notifications.create({
+          data: {
+            id: randomUUID(),
+            slug: 'mention',
+            type: 'inbox_note_mention',
+            notifiable_type: 'App\\Models\\User',
+            notifiable_id: uid,
+            data: JSON.stringify({
+              message: `${byName} mentioned you in a note`,
+              note: noteText,
+              inbox_id: String(inbox.id),
+              by: String(byUserId),
+            }),
+            read: 0,
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+        });
+      } catch (e: any) {
+        this.logger.warn(`mention notify failed for user ${uid}: ${e.message}`);
+      }
+    }
+  }
+
+  /** Resolve a stored `note_action` row's localization key + data to display text + tone. */
+  private resolveNoteAction(key: string, data: any): { text: string; tone: string } {
+    const agent = data?.agent_name ?? data?.agent ?? '';
+    const ticket = data?.ticket_number ?? '';
+    const folder = data?.folder_name ?? data?.folder ?? '';
+    switch (key) {
+      case 'assigned_to_agent':
+        return { text: agent ? `Assigned to ${agent}` : 'Conversation assigned', tone: 'info' };
+      case 'conversation_assigned_auto':
+        return { text: 'Conversation auto-assigned', tone: 'info' };
+      case 'conversation_unassigned':
+      case 'conversation_unassigned_auto':
+      case 'agent_removed':
+        return { text: 'Conversation unassigned', tone: 'orange' };
+      case 'conversation_active':
+        return { text: 'Conversation reopened', tone: 'success' };
+      case 'conversation_completed':
+      case 'conversation_completed_sf':
+        return {
+          text: `${agent ? `Conversation closed by ${agent}` : 'Conversation closed'}${ticket ? ` — Ticket # ${ticket}` : ''}`,
+          tone: 'red',
+        };
+      case 'ticket_assigned':
+        return { text: `Conversation assigned Ticket # ${ticket}`, tone: 'info' };
+      case 'moved_to_folder':
+        return { text: folder ? `Moved to folder ${folder}` : 'Moved to folder', tone: 'info' };
+      default:
+        return { text: key.replace(/_/g, ' '), tone: 'info' };
+    }
   }
 
   /**
@@ -1407,11 +2166,39 @@ export class InboxService {
     inboxIds: bigint[],
     assignedTo: bigint | null,
     workspaceId: bigint,
+    actorId?: bigint,
   ) {
-    return this.prisma.inbox.updateMany({
+    const res = await this.prisma.inbox.updateMany({
       where: { id: { in: inboxIds }, workspace_id: workspaceId },
-      data: { user_id: assignedTo },
+      data: {
+        user_id: assignedTo,
+        is_assigned: assignedTo ? 1 : 0,
+        status: assignedTo ? 'ACTIVE' : 'UNASSIGNED',
+        assigned_on: new Date(),
+        updated_at: new Date(),
+      },
     });
+
+    // Inline system events (replyagent note_action), one per conversation.
+    let agentName = '';
+    if (assignedTo) {
+      const a: any = await this.prisma.users.findUnique({ where: { id: assignedTo } });
+      agentName = a
+        ? (a.full_name || `${a.first_name ?? ''} ${a.last_name ?? ''}`.trim() || a.name || a.email || '')
+        : '';
+    }
+    const rows = await this.prisma.inbox.findMany({
+      where: { id: { in: inboxIds }, workspace_id: workspaceId },
+    });
+    for (const row of rows) {
+      if (assignedTo) {
+        await this.createNoteAction(row, 'assigned_to_agent', actorId ?? null, { agent_name: agentName });
+      } else {
+        await this.createNoteAction(row, 'conversation_unassigned', actorId ?? null, {});
+      }
+    }
+
+    return res;
   }
 
   async snoozeConversation(
@@ -1474,6 +2261,76 @@ export class InboxService {
     }
 
     return updated;
+  }
+
+  /**
+   * Bulk status / read-state change driven by the conversation list's
+   * select-all + actions menu (replyagent `updateMessageStatus`).
+   *   READ / UNREAD → toggles `is_read` (status untouched)
+   *   COMPLETED     → status COMPLETED (+ closed_at/closed_by, fires done events)
+   *   ACTIVE        → status ACTIVE (clears snooze sentinel)
+   */
+  async bulkUpdateStatus(
+    inboxIds: bigint[],
+    action: string,
+    workspaceId: bigint,
+    userId?: bigint,
+  ) {
+    if (!inboxIds.length) return { success: true, count: 0 };
+    const now = new Date();
+    const act = String(action || '').toUpperCase();
+    let data: any;
+    if (act === 'READ') {
+      data = { is_read: 1 };
+    } else if (act === 'UNREAD') {
+      data = { is_read: 0 };
+    } else if (act === 'COMPLETED') {
+      data = { status: 'COMPLETED', closed_at: now, updated_at: now };
+      if (userId) data.closed_by = userId;
+    } else if (act === 'ACTIVE') {
+      data = { status: 'ACTIVE', snooze: new Date(0), updated_at: now };
+    } else {
+      throw new BadRequestException('Invalid bulk action');
+    }
+
+    const res = await this.prisma.inbox.updateMany({
+      where: { id: { in: inboxIds }, workspace_id: workspaceId },
+      data,
+    });
+
+    // Mirror replyagent: fire the marked-as-done trigger per conversation so
+    // any `conversation_marked_as_done` automation activities can dispatch.
+    if (act === 'COMPLETED') {
+      const rows = await this.prisma.inbox.findMany({
+        where: { id: { in: inboxIds }, workspace_id: workspaceId },
+      });
+      for (const row of rows) {
+        const contactId = await this.resolveInboxContact(row);
+        if (contactId) {
+          this.eventEmitter.emit('conversation.marked_as_done', {
+            contactId,
+            workspaceId,
+            inboxId: row.id,
+          });
+        }
+      }
+    }
+
+    return { success: true, count: res.count };
+  }
+
+  /** Bulk snooze for the actions menu (replyagent `snoozeMessage` with inbox_ids[]). */
+  async bulkSnooze(
+    inboxIds: bigint[],
+    until: Date | null,
+    workspaceId: bigint,
+  ) {
+    if (!inboxIds.length) return { success: true, count: 0 };
+    const res = await this.prisma.inbox.updateMany({
+      where: { id: { in: inboxIds }, workspace_id: workspaceId },
+      data: { snooze: until ?? new Date(0), status: 'ACTIVE' },
+    });
+    return { success: true, count: res.count };
   }
 
   /** List conversation folders for a workspace (does NOT create — mirrors replyagent's getSettings folders). */
@@ -2247,6 +3104,7 @@ export class InboxService {
   async transformAi(workspaceId: bigint, body: any) {
     const text = String(body?.text ?? '').trim();
     const mode = String(body?.mode ?? 'correct').toLowerCase();
+    const language = String(body?.language ?? '').trim();
     if (!text) throw new BadRequestException('text required');
 
     const apiKey = this.config.get<string>('OPENAI_API_KEY');
@@ -2259,7 +3117,10 @@ export class InboxService {
       correct: `Fix any grammar or spelling mistakes in the following message. Return only the corrected text, nothing else:\n\n${text}`,
       expand: `Expand the following message to make it more detailed and informative. Return only the expanded text:\n\n${text}`,
       shorten: `Make the following message shorter and more concise. Return only the shortened text:\n\n${text}`,
-      translate: `Translate the following message to English. If it is already in English, translate it to Spanish. Return only the translated text:\n\n${text}`,
+      // Honour the target language from the picker; fall back to the EN/ES toggle.
+      translate: language
+        ? `Translate the following message to ${language}. Return only the translated text, nothing else:\n\n${text}`
+        : `Translate the following message to English. If it is already in English, translate it to Spanish. Return only the translated text:\n\n${text}`,
     };
 
     const prompt = prompts[mode] ?? prompts.correct;
@@ -2430,6 +3291,18 @@ export class InboxService {
           where: { id: contactId },
           data: { automations_paused_till: null },
         });
+        return { success: true };
+      }
+      // Remove the contact from a queued smart-flow (replyagent automation_queue).
+      case 'automation_queue': {
+        const id = body.action_table_id ? BigInt(body.action_table_id) : null;
+        if (id) await this.prisma.automation_queue.delete({ where: { id } }).catch(() => {});
+        return { success: true };
+      }
+      // Drop a pending chat-input/question (replyagent chat_inputs).
+      case 'chat_inputs': {
+        const id = body.action_table_id ? BigInt(body.action_table_id) : null;
+        if (id) await this.prisma.chat_inputs.delete({ where: { id } }).catch(() => {});
         return { success: true };
       }
       default:

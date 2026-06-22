@@ -142,6 +142,8 @@ export class PipelinesService {
       company_id,
       value,
       closing_date,
+      currency,
+      probability,
     } = data;
 
     if (!title || !pl_id || !pl_step_id) {
@@ -160,7 +162,8 @@ export class PipelinesService {
         value: parseFloat(value || 0),
         closing_date: closing_date ? new Date(closing_date) : null,
         status: 'ACTIVE',
-        currency: 'USD',
+        currency: currency || 'USD',
+        ...(probability != null && probability !== '' ? { probability: Number(probability) } : {}),
         country_id: 1,
       },
     });

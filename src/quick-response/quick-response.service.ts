@@ -335,11 +335,31 @@ export class QuickResponseService {
         : await this.prisma.quick_response_media.findMany({
             where: { quick_response_id: { in: messageIds } },
           });
+    // Resolve each canned-media row's gallery file so the composer can attach
+    // the image/file when the canned reply is picked (replyagent media canned).
+    const galleryIds = [...new Set(media.map((m: any) => m.gallery_media_id).filter(Boolean))];
+    const galleries = galleryIds.length
+      ? await this.prisma.media_gallery.findMany({ where: { id: { in: galleryIds as bigint[] } } })
+      : [];
+    const galleryMap = new Map(galleries.map((g: any) => [String(g.id), g]));
     const mediaByQr = new Map<string, any[]>();
     for (const m of media) {
-      const key = String(m.quick_response_id);
+      const key = String((m as any).quick_response_id);
       if (!mediaByQr.has(key)) mediaByQr.set(key, []);
-      mediaByQr.get(key)!.push(m);
+      const g: any = galleryMap.get(String((m as any).gallery_media_id));
+      mediaByQr.get(key)!.push({
+        gallery_media_id: (m as any).gallery_media_id,
+        media: g
+          ? {
+              file_url: g.file_url,
+              object_name: g.object_name,
+              media_type: g.media_type,
+              mime_type: g.mime_type,
+              extension: g.extension,
+              file_size: g.file_size,
+            }
+          : null,
+      });
     }
 
     const decorated = visibleResponses.map((r: any) => ({

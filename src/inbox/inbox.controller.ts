@@ -165,12 +165,33 @@ export class InboxController {
   @Post('assign-conversation-bulk')
   async assignConversationBulk(@Body() body: any, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
+    const actorId = BigInt(req.user.id || req.user.sub || 0);
     const ids = (body.inbox_ids ?? []).map((id: string) => BigInt(id));
     return this.service.assignConversationBulk(
       ids,
       body.assigned_to ? BigInt(body.assigned_to) : null,
       workspaceId,
+      actorId,
     );
+  }
+
+  // Bulk status change for the conversation list's select-all + actions menu
+  // (replyagent `updateMessageStatus`). action ∈ COMPLETED | ACTIVE | READ | UNREAD.
+  @Post('update-status-bulk')
+  async updateStatusBulk(@Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    const userId = BigInt(req.user.id || req.user.sub || 1);
+    const ids = (body.inbox_ids ?? []).map((id: string) => BigInt(id));
+    return this.service.bulkUpdateStatus(ids, body.action, workspaceId, userId);
+  }
+
+  // Bulk snooze for the actions menu (replyagent `snoozeMessage` with inbox_ids[]).
+  @Post('snooze-bulk')
+  async snoozeBulk(@Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    const ids = (body.inbox_ids ?? []).map((id: string) => BigInt(id));
+    const until = body.until ? new Date(body.until) : null;
+    return this.service.bulkSnooze(ids, until, workspaceId);
   }
 
   // ─── Folders ───────────────────────────────────────────────────────
