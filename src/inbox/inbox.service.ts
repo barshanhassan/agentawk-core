@@ -837,16 +837,31 @@ export class InboxService {
     let messages = [];
     const query: any = { orderBy: { created_at: 'desc' }, skip, take };
 
-    // Message-mode filter (replyagent header dropdown). ALL = no filter; INBOX /
-    // AUTOMATION map to the `communication_mode` enum. (NOTE / OLD_DATA aren't
-    // backed by this column and are not offered.)
+    // Message-mode filter (replyagent header dropdown — 5 modes). INBOX /
+    // AUTOMATION map to the `communication_mode` enum; NOTE selects the stored
+    // note_action/note rows; ALL shows everything (incl. note_action pills).
+    // replyagent splits "Last 3 months" (live table) vs "Older than 3 months"
+    // (archived backup table) via the `old_data` flag. EZCONN keeps everything
+    // in one table (no extra archive tables), so we mirror the same UX with a
+    // created_at cutoff: recent modes show >= 3 months, OLD_DATA shows < 3 months.
     const rawMode = String(filters.communication_mode ?? filters.mode ?? 'ALL').toUpperCase();
-    // INBOX / AUTOMATION exclude system/note rows (replyagent whereNotIn); ALL
-    // shows everything including the note_action system pills.
-    const modeWhere =
-      rawMode === 'INBOX' || rawMode === 'AUTOMATION'
-        ? { communication_mode: rawMode as any, type: { notIn: ['note_action', 'note'] } }
-        : {};
+    const wantsOldData = rawMode === 'OLD_DATA' || filters.old_data === true || filters.old_data === 'true';
+    const threeMonthsAgo = new Date();
+    threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+    const dateWhere = wantsOldData
+      ? { created_at: { lt: threeMonthsAgo } }
+      : { created_at: { gte: threeMonthsAgo } };
+    // INBOX / AUTOMATION exclude system/note rows (replyagent whereNotIn); NOTE
+    // shows only note_action/note rows; ALL & OLD_DATA apply no mode filter.
+    let modeWhere: any;
+    if (rawMode === 'INBOX' || rawMode === 'AUTOMATION') {
+      modeWhere = { communication_mode: rawMode as any, type: { notIn: ['note_action', 'note'] }, ...dateWhere };
+    } else if (rawMode === 'NOTE') {
+      modeWhere = { type: { in: ['note_action', 'note'] }, ...dateWhere };
+    } else {
+      // ALL ("Last 3 months") or OLD_DATA ("Older than 3 months")
+      modeWhere = { ...dateWhere };
+    }
 
     if (type.includes('whatsapp')) {
       messages = await this.prisma.wa_messages.findMany({
@@ -1063,7 +1078,7 @@ export class InboxService {
     const systemBottom: any[] = [];
     // Only in the unfiltered (ALL) view, page 1 — matches replyagent, where the
     // ticket/closed pills are note_action rows hidden in INBOX/AUTOMATION modes.
-    if (parseInt(page) === 1 && rawMode !== 'INBOX' && rawMode !== 'AUTOMATION') {
+    if (parseInt(page) === 1 && rawMode !== 'INBOX' && rawMode !== 'AUTOMATION' && rawMode !== 'OLD_DATA') {
       const ticket = await this.prisma.support_numbers.findFirst({
         where: { inbox_id: inboxId },
         orderBy: { id: 'asc' },
