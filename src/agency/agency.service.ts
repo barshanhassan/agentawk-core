@@ -983,19 +983,101 @@ export class AgencyService {
    * created each resource. The recent-activity feed shows the real actor name.
    */
   async getDashboardStats(agencyId: bigint, _user?: any) {
-    const [totalWorkspaces, totalAgents, recentLogs] = await Promise.all([
+    // Window for "30 day" metrics — used by messages-sent, new-workspaces, response-time.
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    // Workspace IDs for this agency drive every per-workspace metric below
+    // (conversations, messages, workspace users). Single query, reused.
+    const agencyWorkspaces = await this.prisma.workspaces.findMany({
+      where: { agency_id: agencyId, deleted_at: null },
+      select: { id: true },
+    });
+    const wsIds = agencyWorkspaces.map((w) => w.id);
+
+    // Pre-fetch closed conversation samples for the response-time metric.
+    // Done separately (not in Promise.all) so we can type the result without
+    // colliding with the [] fallback branch on a never[] inference.
+    const closedConversations: { created_at: Date | null; closed_at: Date | null }[] =
+      wsIds.length
+        ? await this.prisma.inbox.findMany({
+            where: {
+              workspace_id: { in: wsIds },
+              status: 'COMPLETED',
+              closed_at: { not: null, gte: thirtyDaysAgo },
+              created_at: { not: null },
+            },
+            select: { created_at: true, closed_at: true },
+            take: 500,
+          })
+        : [];
+
+    const [
+      totalWorkspaces,
+      activeWorkspaces,
+      newWorkspaces30d,
+      totalAgents,
+      workspaceUsersCount,
+      totalConversations,
+      openConversations,
+      // "Messages Sent (30d)" proxied by count of inbox conversations whose
+      // last_updated falls within the window — last_updated is bumped on every
+      // incoming/outgoing message across all channels, so it's the cleanest
+      // workspace-scoped activity metric without joining 4 channel-specific
+      // message tables through 3-4 FK levels each.
+      activeConversations30d,
+      recentLogs,
+    ] = await Promise.all([
       this.prisma.workspaces.count({
         where: { agency_id: agencyId, deleted_at: null },
+      }),
+      this.prisma.workspaces.count({
+        where: { agency_id: agencyId, deleted_at: null, status: 'ACTIVE' },
+      }),
+      this.prisma.workspaces.count({
+        where: { agency_id: agencyId, deleted_at: null, created_at: { gte: thirtyDaysAgo } },
       }),
       this.prisma.users.count({
         where: { modelable_id: agencyId, modelable_type: 'App\\Models\\Agency' },
       }),
+      wsIds.length
+        ? this.prisma.users.count({
+            where: { modelable_id: { in: wsIds }, modelable_type: 'App\\Models\\Workspace' },
+          })
+        : 0,
+      wsIds.length
+        ? this.prisma.inbox.count({ where: { workspace_id: { in: wsIds } } })
+        : 0,
+      wsIds.length
+        ? this.prisma.inbox.count({
+            where: { workspace_id: { in: wsIds }, status: { in: ['ACTIVE', 'UNASSIGNED'] } },
+          })
+        : 0,
+      wsIds.length
+        ? this.prisma.inbox.count({
+            where: { workspace_id: { in: wsIds }, last_updated: { gte: thirtyDaysAgo } },
+          })
+        : 0,
       this.prisma.agency_logs.findMany({
         where: { agency_id: agencyId },
         take: 5,
         orderBy: { created_at: 'desc' },
       }),
     ]);
+
+    const messagesSent30d = activeConversations30d;
+    const totalUsers = totalAgents + workspaceUsersCount;
+
+    // Average response time in minutes — avg(closed_at - created_at) across recently
+    // resolved conversations. 0 when there's no sample (avoids NaN in UI).
+    let avgResponseTimeMinutes = 0;
+    if (closedConversations.length > 0) {
+      const totalMs = closedConversations.reduce((sum: number, c) => {
+        const start = c.created_at ? new Date(c.created_at).getTime() : 0;
+        const end = c.closed_at ? new Date(c.closed_at).getTime() : 0;
+        return sum + Math.max(0, end - start);
+      }, 0);
+      avgResponseTimeMinutes = Math.round(totalMs / closedConversations.length / 60000);
+    }
 
     // agency_logs has no Prisma relation to users, so batch-fetch the actors to
     // show real names in the recent-activity feed instead of a generic "System".
@@ -1014,7 +1096,14 @@ export class AgencyService {
       success: true,
       stats: {
         total_workspaces: totalWorkspaces,
+        active_workspaces: activeWorkspaces,
+        new_workspaces_30d: newWorkspaces30d,
         total_agents: totalAgents,
+        total_users: totalUsers,
+        total_conversations: totalConversations,
+        open_conversations: openConversations,
+        messages_sent_30d: messagesSent30d,
+        avg_response_time_minutes: avgResponseTimeMinutes,
         premium_support_seats: "0 of 5", // Still hardcoded as per business logic usually
       },
       recent_activity: (recentLogs as any[]).map(log => {
