@@ -117,6 +117,11 @@ export class BroadcastsService {
         : JSON.stringify(data.filters)
       : JSON.stringify({ condition: 'any', items: [] });
 
+    // The `broadcasts` table inherits the Laravel-era schema where
+    // `created_at` / `updated_at` are nullable and have no `@default(now())`
+    // in Prisma. Explicitly stamp them here so list views can sort/show
+    // creation time without falling back to row-id heuristics.
+    const now = new Date();
     const broadcast = await this.prisma.broadcasts.create({
       data: {
         workspace_id: workspaceId,
@@ -133,6 +138,8 @@ export class BroadcastsService {
         status: this.normaliseStatus(data.status) ?? ('draft' as any),
         scheduled_at: data.scheduled_at ? new Date(data.scheduled_at) : null,
         do_not_send_if_marketing: !!data.do_not_send_if_marketing,
+        created_at: now,
+        updated_at: now,
       },
     });
 
@@ -182,6 +189,7 @@ export class BroadcastsService {
       where: { id: broadcastId },
       data: {
         updater_id: updaterId,
+        updated_at: new Date(),
         name: data.name ?? undefined,
         channel_type: nextChannelType,
         channelable_type: data.channelable_type ?? undefined,

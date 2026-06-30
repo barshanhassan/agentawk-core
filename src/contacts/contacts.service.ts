@@ -722,7 +722,7 @@ export class ContactsService {
     if (existingId) {
       contact = await this.prisma.contacts.update({
         where: { id: existingId },
-        data: payload,
+        data: { ...payload, updated_at: new Date() },
       });
     } else {
       // replyagent parity (ContactHelper::updateContactFields): a duplicate mobile
@@ -747,12 +747,19 @@ export class ContactsService {
 
       await this.enforceContactsLimit(workspaceId);
 
+      // The `contacts` table inherits the Laravel-era schema where
+      // `created_at` / `updated_at` are nullable with no @default(now()).
+      // Stamp them here so list/sort/filter views always have real dates
+      // instead of a NULL fallback rendered as "-" in the UI.
+      const now = new Date();
       contact = await this.prisma.contacts.create({
         data: {
           ...payload,
           workspace_id: workspaceId,
           source: 'MANUAL',
           status: 'ACTIVE', // replyagent default; PENDING was wrong (only used when limit hit)
+          created_at: now,
+          updated_at: now,
         },
       });
 
@@ -892,7 +899,7 @@ export class ContactsService {
       if (Object.keys(payload).length > 0) {
         await this.prisma.contacts.update({
           where: { id: contactId },
-          data: payload
+          data: { ...payload, updated_at: new Date() },
         });
         // Fire one emission per touched system column so individual
         // triggers (system_field_changed with `field` filter) can react.
