@@ -143,7 +143,36 @@ export class AutomationsService {
       }
     }
 
-    return { success: true, automation: { ...automation, version }, mode: resolvedMode };
+    // Load flow connections + translate step ids back to FE node ids so the
+    // frontend's edge hydrator can wire them straight to the rendered
+    // nodes. Without this the sync-graph writes lands `connector_id` /
+    // `next_step_id` as numeric step ids that don't match the FE's
+    // `node_XXX` node ids, and every reload silently drops all edges.
+    let flows: any[] = [];
+    if (versionId && version) {
+      const rawFlows = await this.prisma.automation_flow.findMany({
+        where: { automation_version_id: versionId, deleted_at: null },
+      });
+      const stepIdToNodeId = new Map<string, string>();
+      for (const s of (version.automation_steps ?? []) as any[]) {
+        stepIdToNodeId.set(String(s.id), String(s.comment ?? `step_${s.id}`));
+      }
+      flows = rawFlows.map((f: any) => ({
+        id: String(f.id),
+        source_node_id: stepIdToNodeId.get(String(f.connector_id)) ?? null,
+        target_node_id: stepIdToNodeId.get(String(f.next_step_id)) ?? null,
+        connector_id: f.connector_id?.toString?.() ?? f.connector_id,
+        next_step_id: f.next_step_id?.toString?.() ?? f.next_step_id,
+      }));
+    }
+
+    return {
+      success: true,
+      automation: { ...automation, version },
+      steps: (version?.automation_steps ?? []),
+      flows,
+      mode: resolvedMode,
+    };
   }
 
   /**
