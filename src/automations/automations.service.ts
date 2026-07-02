@@ -157,13 +157,27 @@ export class AutomationsService {
       for (const s of (version.automation_steps ?? []) as any[]) {
         stepIdToNodeId.set(String(s.id), String(s.comment ?? `step_${s.id}`));
       }
-      flows = rawFlows.map((f: any) => ({
-        id: String(f.id),
-        source_node_id: stepIdToNodeId.get(String(f.connector_id)) ?? null,
-        target_node_id: stepIdToNodeId.get(String(f.next_step_id)) ?? null,
-        connector_id: f.connector_id?.toString?.() ?? f.connector_id,
-        next_step_id: f.next_step_id?.toString?.() ?? f.next_step_id,
-      }));
+      flows = rawFlows.map((f: any) => {
+        // Slug may be `sh:<handle>:<random>` when the edge was
+        // created from a specific source handle (e.g. Randomizer A/B).
+        // See the write-side comment in syncGraph.
+        let sourceHandle: string | null = null;
+        if (typeof f.slug === 'string' && f.slug.startsWith('sh:')) {
+          const rest = f.slug.substring(3);
+          const idx = rest.indexOf(':');
+          if (idx > 0) {
+            sourceHandle = rest.substring(0, idx);
+          }
+        }
+        return {
+          id: String(f.id),
+          source_node_id: stepIdToNodeId.get(String(f.connector_id)) ?? null,
+          target_node_id: stepIdToNodeId.get(String(f.next_step_id)) ?? null,
+          source_handle: sourceHandle,
+          connector_id: f.connector_id?.toString?.() ?? f.connector_id,
+          next_step_id: f.next_step_id?.toString?.() ?? f.next_step_id,
+        };
+      });
     }
 
     return {
@@ -2624,10 +2638,27 @@ export class AutomationsService {
         const targetStep = stepByNodeId.get(targetNode);
         if (!sourceStep || !targetStep) continue;
 
+        // Encode React Flow's sourceHandle (branch id on multi-output
+        // nodes like Randomizer / Splitter / Condition) into the slug
+        // field. The automation_flow table has no dedicated column
+        // for it and Cloud Run doesn't auto-run migrations, so we
+        // prefix the slug as `sh:<handle>:<random>` when a handle is
+        // present. getAutomation parses it back out. Without this,
+        // Randomizer A/B branches lose their handle on reopen and
+        // React Flow refuses to render the edge ("Couldn't create
+        // edge for source handle id: undefined").
+        const rawHandle = edge.sourceHandle;
+        const handleStr =
+          rawHandle == null || rawHandle === ''
+            ? null
+            : String(rawHandle).replace(/:/g, '_');
+        const baseSlug = this.generateSlug();
+        const slug = handleStr ? `sh:${handleStr}:${baseSlug}` : baseSlug;
+
         await this.prisma.automation_flow.create({
           data: {
             automation_version_id: versionId,
-            slug: this.generateSlug(),
+            slug,
             next_step_id: targetStep.id,
             connector_id: sourceStep.id,
             connector_type: 'App\\Models\\Automations\\AutomationStep',
