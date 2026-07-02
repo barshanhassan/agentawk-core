@@ -2587,33 +2587,62 @@ export class AutomationsService {
     }
 
     // 4. Reset flow connections for this version.
-    await this.prisma.automation_flow.deleteMany({
-      where: { automation_version_id: versionId },
-    });
-    for (const edge of edges) {
-      const sourceNode = String(edge.source ?? '');
-      const targetNode = String(edge.target ?? '');
-      const sourceStep = stepByNodeId.get(sourceNode);
-      const targetStep = stepByNodeId.get(targetNode);
-      if (!sourceStep || !targetStep) continue;
-
-      await this.prisma.automation_flow.create({
-        data: {
-          automation_version_id: versionId,
-          slug: this.generateSlug(),
-          next_step_id: targetStep.id,
-          connector_id: sourceStep.id,
-          connector_type: 'App\\Models\\Automations\\AutomationStep',
-          deleteable: true,
-        } as any,
+    //
+    // Defensive guard against the "hydrate race + wipe" bug: if the
+    // client sent an empty edges array but there are >= 2 nodes and
+    // the version already has persisted flows, this is almost
+    // certainly a stale-state save (initial state.edges=[] leaking
+    // into an auto-save before the user actually deleted anything).
+    // Preserve the existing flows in that case — the manual Save
+    // button still allows an explicit clear via a subsequent call
+    // that sends non-empty edges. This is what stops the recurring
+    // "flow saved once but strings gone on reopen" bug: the auto-
+    // save fired after a node-drag before the flow rows were even
+    // hydrated into state.edges.
+    let edgesSyncedCount = edges.length;
+    let flowsPreserved = false;
+    if (edges.length === 0 && nodes.length >= 2) {
+      const existingFlowCount = await this.prisma.automation_flow.count({
+        where: { automation_version_id: versionId, deleted_at: null },
       });
+      if (existingFlowCount > 0) {
+        flowsPreserved = true;
+        edgesSyncedCount = existingFlowCount;
+        this.logger.warn(
+          `syncGraph: preserved ${existingFlowCount} existing flow(s) for automation ${automationId} — payload had empty edges with ${nodes.length} nodes (suspicious wipe)`,
+        );
+      }
+    }
+    if (!flowsPreserved) {
+      await this.prisma.automation_flow.deleteMany({
+        where: { automation_version_id: versionId },
+      });
+      for (const edge of edges) {
+        const sourceNode = String(edge.source ?? '');
+        const targetNode = String(edge.target ?? '');
+        const sourceStep = stepByNodeId.get(sourceNode);
+        const targetStep = stepByNodeId.get(targetNode);
+        if (!sourceStep || !targetStep) continue;
+
+        await this.prisma.automation_flow.create({
+          data: {
+            automation_version_id: versionId,
+            slug: this.generateSlug(),
+            next_step_id: targetStep.id,
+            connector_id: sourceStep.id,
+            connector_type: 'App\\Models\\Automations\\AutomationStep',
+            deleteable: true,
+          } as any,
+        });
+      }
     }
 
     return {
       success: true,
       nodes_synced: nodes.length,
-      edges_synced: edges.length,
+      edges_synced: edgesSyncedCount,
       orphans_removed: orphanIds.length,
+      flows_preserved: flowsPreserved,
     };
   }
 
