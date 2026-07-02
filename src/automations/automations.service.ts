@@ -2648,8 +2648,16 @@ export class AutomationsService {
         // React Flow refuses to render the edge ("Couldn't create
         // edge for source handle id: undefined").
         const rawHandle = edge.sourceHandle;
+        // Treat literal 'undefined' / 'null' string values as absent —
+        // React Flow's older versions coerced Handle id={undefined} to
+        // the string "undefined", which could round-trip through
+        // sync-graph payloads before the FE-side fix landed. Persisting
+        // that string would break the edge on the next reopen.
         const handleStr =
-          rawHandle == null || rawHandle === ''
+          rawHandle == null ||
+          rawHandle === '' ||
+          rawHandle === 'undefined' ||
+          rawHandle === 'null'
             ? null
             : String(rawHandle).replace(/:/g, '_');
         const baseSlug = this.generateSlug();
