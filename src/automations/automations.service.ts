@@ -143,7 +143,50 @@ export class AutomationsService {
       }
     }
 
-    return { success: true, automation: { ...automation, version }, mode: resolvedMode };
+    // Load flow connections + translate step ids back to FE node ids so the
+    // frontend's edge hydrator can wire them straight to the rendered
+    // nodes. Without this the sync-graph writes lands `connector_id` /
+    // `next_step_id` as numeric step ids that don't match the FE's
+    // `node_XXX` node ids, and every reload silently drops all edges.
+    let flows: any[] = [];
+    if (versionId && version) {
+      const rawFlows = await this.prisma.automation_flow.findMany({
+        where: { automation_version_id: versionId, deleted_at: null },
+      });
+      const stepIdToNodeId = new Map<string, string>();
+      for (const s of (version.automation_steps ?? []) as any[]) {
+        stepIdToNodeId.set(String(s.id), String(s.comment ?? `step_${s.id}`));
+      }
+      flows = rawFlows.map((f: any) => {
+        // Slug may be `sh:<handle>:<random>` when the edge was
+        // created from a specific source handle (e.g. Randomizer A/B).
+        // See the write-side comment in syncGraph.
+        let sourceHandle: string | null = null;
+        if (typeof f.slug === 'string' && f.slug.startsWith('sh:')) {
+          const rest = f.slug.substring(3);
+          const idx = rest.indexOf(':');
+          if (idx > 0) {
+            sourceHandle = rest.substring(0, idx);
+          }
+        }
+        return {
+          id: String(f.id),
+          source_node_id: stepIdToNodeId.get(String(f.connector_id)) ?? null,
+          target_node_id: stepIdToNodeId.get(String(f.next_step_id)) ?? null,
+          source_handle: sourceHandle,
+          connector_id: f.connector_id?.toString?.() ?? f.connector_id,
+          next_step_id: f.next_step_id?.toString?.() ?? f.next_step_id,
+        };
+      });
+    }
+
+    return {
+      success: true,
+      automation: { ...automation, version },
+      steps: (version?.automation_steps ?? []),
+      flows,
+      mode: resolvedMode,
+    };
   }
 
   /**
@@ -2558,33 +2601,87 @@ export class AutomationsService {
     }
 
     // 4. Reset flow connections for this version.
-    await this.prisma.automation_flow.deleteMany({
-      where: { automation_version_id: versionId },
-    });
-    for (const edge of edges) {
-      const sourceNode = String(edge.source ?? '');
-      const targetNode = String(edge.target ?? '');
-      const sourceStep = stepByNodeId.get(sourceNode);
-      const targetStep = stepByNodeId.get(targetNode);
-      if (!sourceStep || !targetStep) continue;
-
-      await this.prisma.automation_flow.create({
-        data: {
-          automation_version_id: versionId,
-          slug: this.generateSlug(),
-          next_step_id: targetStep.id,
-          connector_id: sourceStep.id,
-          connector_type: 'App\\Models\\Automations\\AutomationStep',
-          deleteable: true,
-        } as any,
+    //
+    // Defensive guard against the "hydrate race + wipe" bug: if the
+    // client sent an empty edges array but there are >= 2 nodes and
+    // the version already has persisted flows, this is almost
+    // certainly a stale-state save (initial state.edges=[] leaking
+    // into an auto-save before the user actually deleted anything).
+    // Preserve the existing flows in that case — the manual Save
+    // button still allows an explicit clear via a subsequent call
+    // that sends non-empty edges. This is what stops the recurring
+    // "flow saved once but strings gone on reopen" bug: the auto-
+    // save fired after a node-drag before the flow rows were even
+    // hydrated into state.edges.
+    let edgesSyncedCount = edges.length;
+    let flowsPreserved = false;
+    if (edges.length === 0 && nodes.length >= 2) {
+      const existingFlowCount = await this.prisma.automation_flow.count({
+        where: { automation_version_id: versionId, deleted_at: null },
       });
+      if (existingFlowCount > 0) {
+        flowsPreserved = true;
+        edgesSyncedCount = existingFlowCount;
+        this.logger.warn(
+          `syncGraph: preserved ${existingFlowCount} existing flow(s) for automation ${automationId} — payload had empty edges with ${nodes.length} nodes (suspicious wipe)`,
+        );
+      }
+    }
+    if (!flowsPreserved) {
+      await this.prisma.automation_flow.deleteMany({
+        where: { automation_version_id: versionId },
+      });
+      for (const edge of edges) {
+        const sourceNode = String(edge.source ?? '');
+        const targetNode = String(edge.target ?? '');
+        const sourceStep = stepByNodeId.get(sourceNode);
+        const targetStep = stepByNodeId.get(targetNode);
+        if (!sourceStep || !targetStep) continue;
+
+        // Encode React Flow's sourceHandle (branch id on multi-output
+        // nodes like Randomizer / Splitter / Condition) into the slug
+        // field. The automation_flow table has no dedicated column
+        // for it and Cloud Run doesn't auto-run migrations, so we
+        // prefix the slug as `sh:<handle>:<random>` when a handle is
+        // present. getAutomation parses it back out. Without this,
+        // Randomizer A/B branches lose their handle on reopen and
+        // React Flow refuses to render the edge ("Couldn't create
+        // edge for source handle id: undefined").
+        const rawHandle = edge.sourceHandle;
+        // Treat literal 'undefined' / 'null' string values as absent —
+        // React Flow's older versions coerced Handle id={undefined} to
+        // the string "undefined", which could round-trip through
+        // sync-graph payloads before the FE-side fix landed. Persisting
+        // that string would break the edge on the next reopen.
+        const handleStr =
+          rawHandle == null ||
+          rawHandle === '' ||
+          rawHandle === 'undefined' ||
+          rawHandle === 'null'
+            ? null
+            : String(rawHandle).replace(/:/g, '_');
+        const baseSlug = this.generateSlug();
+        const slug = handleStr ? `sh:${handleStr}:${baseSlug}` : baseSlug;
+
+        await this.prisma.automation_flow.create({
+          data: {
+            automation_version_id: versionId,
+            slug,
+            next_step_id: targetStep.id,
+            connector_id: sourceStep.id,
+            connector_type: 'App\\Models\\Automations\\AutomationStep',
+            deleteable: true,
+          } as any,
+        });
+      }
     }
 
     return {
       success: true,
       nodes_synced: nodes.length,
-      edges_synced: edges.length,
+      edges_synced: edgesSyncedCount,
       orphans_removed: orphanIds.length,
+      flows_preserved: flowsPreserved,
     };
   }
 
