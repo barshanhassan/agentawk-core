@@ -73,6 +73,20 @@ export class MetaGraphApiClient {
   }
 
   /**
+   * Create a message template on Meta. `payload` follows Meta's documented
+   * schema: { name, language, category, components: [...] }. Meta returns
+   * { id, status, category } — the template starts in PENDING review.
+   */
+  async createTemplate(wabaId: string, accessToken: string, payload: any) {
+    return this.request<{ id: string; status?: string; category?: string }>(
+      'POST',
+      `/${wabaId}/message_templates`,
+      accessToken,
+      payload,
+    );
+  }
+
+  /**
    * OAuth code → long-lived user access token exchange. Used during WhatsApp
    * Embedded Signup completion.
    *
@@ -283,9 +297,23 @@ export class MetaGraphApiClient {
     }
 
     if (!res.ok) {
-      const msg = parsed?.error?.message ?? parsed?.message ?? `HTTP ${res.status}`;
-      this.logger.warn(`Meta Graph ${method} ${path} → ${res.status}: ${msg}`);
-      throw new BadRequestException(`Meta Graph API: ${msg}`);
+      const err = parsed?.error ?? {};
+      // Meta buries the useful reason in error_user_msg / error_data.details;
+      // the top-level `message` is often just "Invalid parameter".
+      const detail =
+        err.error_user_msg ||
+        err.error_data?.details ||
+        err.message ||
+        parsed?.message ||
+        `HTTP ${res.status}`;
+      const msg =
+        err.error_user_title && err.error_user_title !== detail
+          ? `${err.error_user_title}: ${detail}`
+          : detail;
+      this.logger.warn(
+        `Meta Graph ${method} ${path} → ${res.status}: ${JSON.stringify(err).slice(0, 400)}`,
+      );
+      throw new BadRequestException(`Meta: ${msg}`);
     }
     return parsed as T;
   }

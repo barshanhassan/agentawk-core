@@ -24,6 +24,17 @@ export class WabaController {
     return this.service.getTemplates(workspaceId);
   }
 
+  /**
+   * Create a WhatsApp message template on Meta + persist it locally.
+   * Body: { wa_account_id?, name, category, language, header?, body, footer?,
+   *         buttons?, examples? }.
+   */
+  @Post('templates')
+  async createTemplate(@Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.createTemplate(workspaceId, body);
+  }
+
   @Get('templates/stats')
   async getStats(@Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
