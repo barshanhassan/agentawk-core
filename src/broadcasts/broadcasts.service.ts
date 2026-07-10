@@ -331,10 +331,14 @@ export class BroadcastsService {
 
     if (accounts.length === 0) return { templates: [] };
 
-    const wabaIds = accounts.map((a) => a.waba_id);
-    const where: any = { wa_account_id: { in: wabaIds } };
+    // wa_templates.wa_account_id stores the internal wa_accounts.id (not waba_id),
+    // matching how waba.service persists/reads them.
+    const accountIds = accounts.map((a) => a.id.toString());
+    const where: any = { wa_account_id: { in: accountIds } };
     if (query.status) where.status = String(query.status).toUpperCase();
-    else where.status = 'APPROVED';
+    // Default: show approved (sendable) + pending (awaiting Meta review) so newly
+    // created templates are visible; hide rejected/disabled.
+    else where.status = { in: ['APPROVED', 'PENDING'] };
     if (query.search) where.name = { contains: String(query.search) };
 
     const templates = await this.prisma.wa_templates.findMany({
