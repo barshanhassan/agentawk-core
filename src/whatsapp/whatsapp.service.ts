@@ -20,6 +20,17 @@ export class WhatsappService {
   ) {}
 
   /**
+   * Public callback URL that Meta should POST inbound WhatsApp events to. Passed
+   * per-WABA as `override_callback_uri` at subscribe time so each client is wired
+   * up automatically during onboarding (no manual app-level webhook needed).
+   * Core routes by `phone_number_id`, so one URL serves every connected number.
+   */
+  private whatsappWebhookUrl(): string {
+    const base = (process.env.APP_URL ?? 'https://api.agentawk.com').replace(/\/+$/, '');
+    return `${base}/webhooks-inbound/whatsapp`;
+  }
+
+  /**
    * Broadcast a workspace-scoped event so the UI's WhatsApp settings page
    * refreshes its list when an account/number status changes.
    *
@@ -348,7 +359,12 @@ export class WhatsappService {
     // completes if Meta is temporarily unavailable; the periodic reconnect
     // sync can re-attempt the subscription later.
     try {
-      await this.meta.subscribeWabaWebhook(payload.waba_id, accessToken);
+      await this.meta.subscribeWabaWebhook(
+        payload.waba_id,
+        accessToken,
+        this.whatsappWebhookUrl(),
+        process.env.META_VERIFY_TOKEN,
+      );
     } catch (err: any) {
       console.warn(
         `[whatsapp.onboard] subscribeWabaWebhook failed for waba ${payload.waba_id}: ${err?.message ?? err}`,
@@ -398,7 +414,12 @@ export class WhatsappService {
 
     // 5. Subscribe app to webhooks (best-effort — log warning on failure)
     try {
-      await this.meta.subscribeWabaWebhook(account.waba_id, accessToken);
+      await this.meta.subscribeWabaWebhook(
+        account.waba_id,
+        accessToken,
+        this.whatsappWebhookUrl(),
+        process.env.META_VERIFY_TOKEN,
+      );
     } catch (e: any) {
       // Non-fatal — admin can manually subscribe from Meta dashboard
     }
@@ -1122,7 +1143,12 @@ export class WhatsappService {
     workspace_id?: bigint;
   }): Promise<boolean> {
     try {
-      await this.meta.subscribeWabaWebhook(account.waba_id, account.access_token);
+      await this.meta.subscribeWabaWebhook(
+        account.waba_id,
+        account.access_token,
+        this.whatsappWebhookUrl(),
+        process.env.META_VERIFY_TOKEN,
+      );
       try {
         await this.rabbit.publish('ra', 'whatsapp', {
           event: 'WA_REGISTER',

@@ -185,9 +185,24 @@ export class MetaGraphApiClient {
     );
   }
 
-  /** Subscribe our app to a WABA's webhook events. Required for inbound. */
-  async subscribeWabaWebhook(wabaId: string, accessToken: string) {
-    return this.request('POST', `/${wabaId}/subscribed_apps`, accessToken);
+  /**
+   * Subscribe our app to a WABA's webhook events (required for inbound).
+   * When `overrideCallbackUri` + `verifyToken` are given, Meta delivers THIS
+   * WABA's events to that URL (per-WABA `override_callback_uri`) — so onboarding
+   * is self-contained and no app-level dashboard webhook is needed. Without them
+   * it falls back to a bare subscribe against the app-level webhook.
+   */
+  async subscribeWabaWebhook(
+    wabaId: string,
+    accessToken: string,
+    overrideCallbackUri?: string,
+    verifyToken?: string,
+  ) {
+    const body =
+      overrideCallbackUri && verifyToken
+        ? { override_callback_uri: overrideCallbackUri, verify_token: verifyToken }
+        : undefined;
+    return this.request('POST', `/${wabaId}/subscribed_apps`, accessToken, body);
   }
 
   /**
