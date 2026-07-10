@@ -2411,6 +2411,37 @@ export class InboxService {
   /**
    * Handle incoming messages from external providers (Webhooks)
    */
+  /**
+   * Resolve the required inbox.type enum from the channel (or the Laravel-style
+   * modelable_type as a fallback). inbox.type is NOT NULL, so every inbox.create
+   * must set it.
+   */
+  private inboxTypeFor(channel?: string, modelableType?: string): any {
+    const c = (channel ?? '').toLowerCase();
+    const map: Record<string, string> = {
+      whatsapp: 'WHATSAPP',
+      telegram: 'TELEGRAM',
+      messenger: 'MESSENGER',
+      facebook: 'MESSENGER',
+      instagram: 'INSTAGRAM',
+      sms: 'SMS',
+      email: 'EMAIL',
+      evolution: 'EVOLUTION',
+      zapi: 'ZAPI',
+      webchat: 'WEBCHAT',
+    };
+    if (map[c]) return map[c];
+    const mt = (modelableType ?? '').toLowerCase();
+    if (mt.includes('whatsapp')) return 'WHATSAPP';
+    if (mt.includes('telegram')) return 'TELEGRAM';
+    if (mt.includes('messenger')) return 'MESSENGER';
+    if (mt.includes('instagram')) return 'INSTAGRAM';
+    if (mt.includes('evolution')) return 'EVOLUTION';
+    if (mt.includes('zapi')) return 'ZAPI';
+    if (mt.includes('webchat')) return 'WEBCHAT';
+    return 'WHATSAPP';
+  }
+
   async handleInboundMessage(provider: string, data: any) {
     this.logger.log(`Handling inbound message from ${provider}`);
     
@@ -2435,6 +2466,7 @@ export class InboxService {
           workspace_id: workspaceId,
           modelable_id: mId,
           modelable_type: mType,
+          type: this.inboxTypeFor(provider, mType),
           status: 'UNASSIGNED',
           last_updated: new Date(),
         }
@@ -2525,6 +2557,7 @@ export class InboxService {
           workspace_id: params.workspaceId,
           modelable_id: params.modelableId,
           modelable_type: params.modelableType,
+          type: this.inboxTypeFor(params.channel, params.modelableType),
           status: 'UNASSIGNED',
           last_updated: new Date(),
         },
