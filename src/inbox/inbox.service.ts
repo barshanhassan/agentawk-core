@@ -2464,11 +2464,19 @@ export class InboxService {
       inbox = await this.prisma.inbox.create({
         data: {
           workspace_id: workspaceId,
+          user_id: null,
+          assigned_by: null,
           modelable_id: mId,
           modelable_type: mType,
           type: this.inboxTypeFor(provider, mType),
           status: 'UNASSIGNED',
+          is_read: 0,
+          is_assigned: 0,
+          snooze: new Date(0),
+          queued_at: new Date(),
           last_updated: new Date(),
+          created_at: new Date(),
+          updated_at: new Date(),
         }
       });
     } else {
@@ -2555,11 +2563,19 @@ export class InboxService {
       inbox = await this.prisma.inbox.create({
         data: {
           workspace_id: params.workspaceId,
+          user_id: null,
+          assigned_by: null,
           modelable_id: params.modelableId,
           modelable_type: params.modelableType,
           type: this.inboxTypeFor(params.channel, params.modelableType),
           status: 'UNASSIGNED',
+          is_read: 0,
+          is_assigned: 0,
+          snooze: new Date(0),
+          queued_at: new Date(),
           last_updated: new Date(),
+          created_at: new Date(),
+          updated_at: new Date(),
         },
       });
     } else {
