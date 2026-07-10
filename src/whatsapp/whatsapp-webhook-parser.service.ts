@@ -144,6 +144,11 @@ export class WhatsappWebhookParserService {
       });
     }
 
+    // A customer who messages us has effectively opted in (Meta's 24h service
+    // window allows free-form replies), so record the opt-in — otherwise the
+    // inbox composer shows "contact has opted out" and blocks outbound.
+    await this.ensureWhatsappOptIn(contact.id, phoneNumber.id);
+
     // Idempotency: skip if we already persisted this wamid
     const existing = await this.prisma.wa_messages.findFirst({ where: { wamid } });
     if (existing) {
@@ -202,6 +207,39 @@ export class WhatsappWebhookParserService {
     });
 
     return { wamid, status: newStatus, wa_message_id: message.id };
+  }
+
+  /**
+   * Record a WhatsApp opt-in for (contact, wa_number) so the inbox composer
+   * treats the contact as reachable. Idempotent. Mirrors the legacy consumer's
+   * `channel_opts` shape so manual/automatic opt-in stay consistent.
+   */
+  private async ensureWhatsappOptIn(contactId: bigint, waNumberId: bigint): Promise<void> {
+    try {
+      const existing = await this.prisma.channel_opts.findFirst({
+        where: { contact_id: contactId, channel: 'whatsapp' as any, modelable_id: waNumberId },
+        select: { id: true },
+      });
+      if (existing) return;
+      const mobile = await this.prisma.contact_mobiles.findFirst({
+        where: { modelable_type: 'App\\Models\\Contact', modelable_id: contactId },
+        select: { id: true },
+      });
+      await this.prisma.channel_opts.create({
+        data: {
+          contact_id: contactId,
+          channel: 'whatsapp' as any,
+          modelable_id: waNumberId,
+          modelable_type: 'App\\Models\\Whatsapp\\WhatsappNumber',
+          contactable_id: mobile?.id ?? null,
+          contactable_type: mobile ? 'App\\Models\\Contact\\MobileContact' : null,
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      });
+    } catch (e: any) {
+      this.logger.warn(`WhatsApp opt-in upsert failed for contact ${contactId}: ${e?.message ?? e}`);
+    }
   }
 
   /**
