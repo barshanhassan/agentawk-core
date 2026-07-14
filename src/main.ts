@@ -17,6 +17,7 @@ async function bootstrap() {
       const allowed =
         origin === 'https://ezconn-fe.vercel.app' ||
         /^https:\/\/ezconn-fe-[a-z0-9-]+-ab607748-8384s-projects\.vercel\.app$/.test(origin) ||
+        /^https:\/\/([\w-]+\.)?agentawk\.com$/.test(origin) ||
         /^https?:\/\/([\w-]+\.)?(localhost|laglobal\.local)(:\d+)?$/.test(origin);
       callback(allowed ? null : new Error('CORS blocked'), allowed);
     },
