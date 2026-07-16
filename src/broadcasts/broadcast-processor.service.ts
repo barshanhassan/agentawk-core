@@ -200,11 +200,31 @@ export class BroadcastProcessorService {
     );
     if (contactIds.length === 0) return { audience: 0, sent: 0 };
 
-    // 4. Template message body (name + language)
-    const templatePayload = {
+    // 4. Template message body (name + language). If the broadcast supplied
+    //    values for the template's body placeholders ({{1}}, {{2}}…) — stored as
+    //    metadata.templateParams by the composer — attach them as a BODY
+    //    component so Meta accepts variable templates. Same values for everyone.
+    let templateParams: string[] = [];
+    try {
+      const md = broadcast.metadata ? JSON.parse(broadcast.metadata) : {};
+      if (Array.isArray(md?.templateParams)) {
+        templateParams = md.templateParams.map((v: any) => String(v ?? ''));
+      }
+    } catch {
+      /* metadata isn't valid JSON — treat as no params */
+    }
+    const templatePayload: any = {
       name: template.name,
       language: { code: template.language || 'en' },
     };
+    if (templateParams.length > 0) {
+      templatePayload.components = [
+        {
+          type: 'body',
+          parameters: templateParams.map((text) => ({ type: 'text', text })),
+        },
+      ];
+    }
 
     const exchange = process.env.RABBITMQ_EXCHANGE || 'ra';
     const whatsappQueue = process.env.RABBITMQ_WHATSAPP_QUEUE || 'whatsapp';
