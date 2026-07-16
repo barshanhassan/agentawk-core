@@ -7,6 +7,7 @@ import { AudienceFilterService } from './audience-filter.service';
 import { BroadcastProcessorService } from './broadcast-processor.service';
 import { BroadcastWorker, BroadcastQueueProducer } from './broadcast.worker';
 import { AutomationsModule } from '../automations/automations.module';
+import { RabbitMqModule } from '../rabbitmq/rabbitmq.module';
 import { QUEUE_BROADCAST } from '../queue/queues.constants';
 import { isQueueEnabled } from '../queue/queue.module';
 
@@ -20,7 +21,7 @@ const queueProviders = isQueueEnabled() ? [BroadcastWorker, BroadcastQueueProduc
 const queueExports = isQueueEnabled() ? [BroadcastQueueProducer] : [];
 
 @Module({
-  imports: [PrismaModule, AutomationsModule, ...queueImports],
+  imports: [PrismaModule, AutomationsModule, RabbitMqModule, ...queueImports],
   controllers: [BroadcastsController],
   providers: [
     BroadcastsService,
