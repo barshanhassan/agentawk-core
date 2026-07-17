@@ -66,19 +66,30 @@ export class AudienceFilterService {
       case 'custom_field':
         contactIds = await this.filterCustomFieldModule(workspaceId, key, filterType, value);
         break;
-      // Add more modules as needed
+      default:
+        // Not implemented yet (mobile_number, whatsapp, email, opportunity…).
+        // Matching nobody is the safe default — see filterContactModule.
+        this.logger.warn(`executeSingleFilter: unsupported module "${module}" — matching no contacts`);
     }
 
     return new Set(contactIds);
   }
 
   private async filterContactModule(workspaceId: bigint, key: string, filterType: string, value: any): Promise<bigint[]> {
-    const where: any = { workspace_id: workspaceId, deleted_at: null };
-    
-    if (key === 'full_name' || key === 'first_name' || key === 'last_name') {
-      if (filterType === 'contain') where[key] = { contains: value };
-      else if (filterType === 'is') where[key] = value;
+    // Only these keys/operators are implemented. Anything else must match
+    // NOBODY: falling through with an unfiltered `where` would silently return
+    // every contact in the workspace and blast the broadcast to all of them.
+    if (key !== 'full_name' && key !== 'first_name' && key !== 'last_name') {
+      this.logger.warn(`filterContactModule: unsupported key "${key}" — matching no contacts`);
+      return [];
     }
+    if (filterType !== 'is' && filterType !== 'contain') {
+      this.logger.warn(`filterContactModule: unsupported operator "${filterType}" — matching no contacts`);
+      return [];
+    }
+
+    const where: any = { workspace_id: workspaceId, deleted_at: null };
+    where[key] = filterType === 'contain' ? { contains: value } : value;
 
     const contacts = await this.prisma.contacts.findMany({ where, select: { id: true } });
     return contacts.map(c => c.id);
