@@ -5,6 +5,12 @@ import { AudienceFilterService } from './audience-filter.service';
 import { AutomationProcessorService } from '../automations/automation-processor.service';
 import { RabbitMqService } from '../rabbitmq/rabbitmq.service';
 
+/**
+ * Marks a template variable value as personalised, e.g. "[CONTACT_FIRST_NAME]".
+ * Kept in sync with the token picker in the frontend broadcast composer.
+ */
+const TOKEN_PATTERN = /\[[A-Z_]+\]/;
+
 @Injectable()
 export class BroadcastProcessorService {
   private readonly logger = new Logger(BroadcastProcessorService.name);
@@ -161,9 +167,10 @@ export class BroadcastProcessorService {
    * WA_OUTBOUND_MESSAGE per recipient on `ra/whatsapp`; the meta microservice
    * forwards each to Meta's `/{phone_number_id}/messages`.
    *
-   * Note: body-variable personalisation is not wired yet (the composer doesn't
-   * capture per-variable values), so zero-variable templates send cleanly and
-   * variable templates are rejected per-message by Meta until values are added.
+   * Body variables ({{1}}, {{2}}…) come from metadata.templateParams. A value
+   * may be plain text (same for everyone) or contain [CONTACT_*] tokens, which
+   * are resolved per recipient — mirroring replyagent, which bakes the tokens
+   * into the template payload and swaps them for each contact at send time.
    */
   private async sendTemplateBroadcast(
     broadcast: any,
@@ -200,10 +207,10 @@ export class BroadcastProcessorService {
     );
     if (contactIds.length === 0) return { audience: 0, sent: 0 };
 
-    // 4. Template message body (name + language). If the broadcast supplied
-    //    values for the template's body placeholders ({{1}}, {{2}}…) — stored as
-    //    metadata.templateParams by the composer — attach them as a BODY
-    //    component so Meta accepts variable templates. Same values for everyone.
+    // 4. Template message body (name + language). Values for the body
+    //    placeholders ({{1}}, {{2}}…) are stored as metadata.templateParams by
+    //    the composer and attached as a BODY component so Meta accepts variable
+    //    templates.
     let templateParams: string[] = [];
     try {
       const md = broadcast.metadata ? JSON.parse(broadcast.metadata) : {};
@@ -213,17 +220,39 @@ export class BroadcastProcessorService {
     } catch {
       /* metadata isn't valid JSON — treat as no params */
     }
-    const templatePayload: any = {
-      name: template.name,
-      language: { code: template.language || 'en' },
+
+    const buildTemplate = (params: string[]) => {
+      const payload: any = {
+        name: template.name,
+        language: { code: template.language || 'en' },
+      };
+      if (params.length > 0) {
+        payload.components = [
+          { type: 'body', parameters: params.map((text) => ({ type: 'text', text })) },
+        ];
+      }
+      return payload;
     };
-    if (templateParams.length > 0) {
-      templatePayload.components = [
-        {
-          type: 'body',
-          parameters: templateParams.map((text) => ({ type: 'text', text })),
+
+    // Personalised only when a value actually carries a [CONTACT_*] token —
+    // otherwise the payload is identical for everyone and is built once.
+    const isPersonalised = templateParams.some((p) => TOKEN_PATTERN.test(p));
+    const staticTemplate = isPersonalised ? null : buildTemplate(templateParams);
+
+    const contactsById = new Map<string, any>();
+    if (isPersonalised) {
+      const rows = await this.prisma.contacts.findMany({
+        where: { id: { in: contactIds } },
+        select: {
+          id: true,
+          first_name: true,
+          last_name: true,
+          full_name: true,
+          title: true,
+          created_at: true,
         },
-      ];
+      });
+      for (const c of rows) contactsById.set(c.id.toString(), c);
     }
 
     const exchange = process.env.RABBITMQ_EXCHANGE || 'ra';
@@ -239,6 +268,14 @@ export class BroadcastProcessorService {
       const to = (mobile?.full_mobile_number ?? '').replace(/[^\d]/g, '');
       if (!to) continue;
 
+      const contactTemplate = isPersonalised
+        ? buildTemplate(
+            templateParams.map((p) =>
+              this.resolveTokens(p, contactsById.get(contactId.toString())),
+            ),
+          )
+        : staticTemplate;
+
       try {
         await this.rabbit.publish(exchange, whatsappQueue, {
           event: 'WA_OUTBOUND_MESSAGE',
@@ -249,7 +286,7 @@ export class BroadcastProcessorService {
               messaging_product: 'whatsapp',
               to,
               type: 'template',
-              template: templatePayload,
+              template: contactTemplate,
             },
             meta: {
               workspace_id: account.workspace_id.toString(),
@@ -266,5 +303,34 @@ export class BroadcastProcessorService {
     }
 
     return { audience: contactIds.length, sent };
+  }
+
+  /**
+   * Swap [CONTACT_*] tokens in a template variable value for this recipient's
+   * own data. Mirrors replyagent's ContactHelper::replaceKeys — a plain
+   * substring replace, so a token can sit inside a sentence ("Hi
+   * [CONTACT_FIRST_NAME]"). Meta rejects empty parameters, so a value that
+   * resolves to nothing (e.g. contact has no first name) falls back to "-".
+   */
+  private resolveTokens(text: string, contact: any): string {
+    const stamp = (value: any) => {
+      const date = value ? new Date(value) : null;
+      if (!date || Number.isNaN(date.getTime())) return '';
+      return date.toISOString().slice(0, 16).replace('T', ' ');
+    };
+    const values: Record<string, string> = {
+      '[CONTACT_FIRST_NAME]': contact?.first_name ?? '',
+      '[CONTACT_LAST_NAME]': contact?.last_name ?? '',
+      '[CONTACT_FULL_NAME]': contact?.full_name ?? '',
+      '[CONTACT_TITLE]': contact?.title ?? '',
+      '[CREATED_AT]': stamp(contact?.created_at),
+      '[CURRENT_DATETIME]': stamp(new Date()),
+    };
+    let out = text;
+    for (const [token, value] of Object.entries(values)) {
+      out = out.split(token).join(value);
+    }
+    out = out.trim();
+    return out === '' ? '-' : out;
   }
 }
