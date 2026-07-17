@@ -284,6 +284,29 @@ export class BroadcastsService {
     return { broadcast: await this.serializeBroadcast(updated) };
   }
 
+  /**
+   * Count the contacts a filter set would reach, without saving anything.
+   * Powers the composer's "Total audience" figure — it runs the very same
+   * AudienceFilterService the sender uses, so what the user sees is what will
+   * actually be messaged. An empty/absent filter set means "everyone", exactly
+   * as it does at send time.
+   */
+  async previewAudience(workspaceId: bigint, filters: any) {
+    const filterJson =
+      filters == null
+        ? '{}'
+        : typeof filters === 'string'
+          ? filters
+          : JSON.stringify(filters);
+    try {
+      const ids = await this.audienceFilter.getAudienceContactIds(workspaceId, filterJson);
+      return { count: ids.length };
+    } catch (e: any) {
+      this.logger.warn(`previewAudience failed: ${e?.message ?? e}`);
+      throw new BadRequestException('Could not evaluate this audience');
+    }
+  }
+
   // ─── Channels (for the create-form picker) ─────────────────────────
 
   /**

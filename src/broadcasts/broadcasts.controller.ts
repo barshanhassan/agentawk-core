@@ -44,6 +44,20 @@ export class BroadcastsController {
     );
   }
 
+  /**
+   * How many contacts a filter set would actually reach, for the composer's
+   * "Total audience" figure. Runs the same AudienceFilterService the sender
+   * uses, so the preview can't drift from what really gets sent.
+   * Body: `{ filters: { condition, items: [...] } }`.
+   */
+  @Post('audience/preview')
+  async previewAudience(@Request() req: any, @Body() body: any) {
+    return this.service.previewAudience(
+      BigInt(req.user.workspace_id || 1),
+      body?.filters,
+    );
+  }
+
   @Post()
   async createBroadcast(@Request() req: any, @Body() body: any) {
     return this.service.createBroadcast(
