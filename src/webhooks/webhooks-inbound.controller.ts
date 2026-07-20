@@ -94,7 +94,11 @@ export class WebhooksInboundController {
         if (item.type !== 'message' || !item.workspace_id || !item.wa_chat_id) continue;
         const r = await this.inboxService.notifyInboundMessage({
           workspaceId: item.workspace_id,
-          modelableType: 'App\\Models\\WhatsappChat',
+          // MUST match WHATSAPP_CHAT_MODELABLE in rabbitmq/whatsapp-events.consumer.ts.
+          // The short form ('App\\Models\\WhatsappChat') created a SECOND inbox row
+          // for a chat the consumer had already opened — same contact, duplicate
+          // conversation, and the original thread went silent.
+          modelableType: 'App\\Models\\Whatsapp\\WhatsappChat',
           modelableId: item.wa_chat_id,
           contactId: item.contact_id,
           channel: 'whatsapp',

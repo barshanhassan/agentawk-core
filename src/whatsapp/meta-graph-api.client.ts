@@ -186,23 +186,21 @@ export class MetaGraphApiClient {
   }
 
   /**
-   * Subscribe our app to a WABA's webhook events (required for inbound).
-   * When `overrideCallbackUri` + `verifyToken` are given, Meta delivers THIS
-   * WABA's events to that URL (per-WABA `override_callback_uri`) — so onboarding
-   * is self-contained and no app-level dashboard webhook is needed. Without them
-   * it falls back to a bare subscribe against the app-level webhook.
+   * Subscribe our app to a WABA's webhook events. Required for inbound.
+   *
+   * DELIBERATELY a bare subscribe (no `override_callback_uri`). Meta must
+   * deliver to the APP-LEVEL webhook, which is the `agentawk-meta` microservice
+   * (`/api/whatsapp-hook`) → RabbitMQ `ra/gateway` → `whatsapp-events.consumer`.
+   * That consumer is the only path that downloads media/voice to S3, handles
+   * emoji reactions and stickers, and emits the realtime socket events.
+   *
+   * A per-WABA `override_callback_uri` was added in b37b110 and reverted here:
+   * it re-routed inbound to `/webhooks-inbound/whatsapp`, whose parser has none
+   * of the above, so media, voice notes, stickers, reactions and realtime all
+   * went dead. Do NOT re-add it until that parser is at full parity.
    */
-  async subscribeWabaWebhook(
-    wabaId: string,
-    accessToken: string,
-    overrideCallbackUri?: string,
-    verifyToken?: string,
-  ) {
-    const body =
-      overrideCallbackUri && verifyToken
-        ? { override_callback_uri: overrideCallbackUri, verify_token: verifyToken }
-        : undefined;
-    return this.request('POST', `/${wabaId}/subscribed_apps`, accessToken, body);
+  async subscribeWabaWebhook(wabaId: string, accessToken: string) {
+    return this.request('POST', `/${wabaId}/subscribed_apps`, accessToken);
   }
 
   /**

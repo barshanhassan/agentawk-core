@@ -848,9 +848,14 @@ export class InboxService {
     const wantsOldData = rawMode === 'OLD_DATA' || filters.old_data === true || filters.old_data === 'true';
     const threeMonthsAgo = new Date();
     threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
-    const dateWhere = wantsOldData
+    // Defence in depth: `created_at` is nullable with no DB default, so a writer
+    // that forgets to stamp it would make the row invisible in EVERY mode (in SQL,
+    // both `>= x` and `< x` are false for NULL). Recent modes therefore also accept
+    // NULL rows rather than silently swallowing them. OLD_DATA stays strict — an
+    // unstamped row is not evidence of being older than 3 months.
+    const dateWhere: any = wantsOldData
       ? { created_at: { lt: threeMonthsAgo } }
-      : { created_at: { gte: threeMonthsAgo } };
+      : { OR: [{ created_at: { gte: threeMonthsAgo } }, { created_at: null }] };
     // INBOX / AUTOMATION exclude system/note rows (replyagent whereNotIn); NOTE
     // shows only note_action/note rows; ALL & OLD_DATA apply no mode filter.
     let modeWhere: any;
@@ -2559,6 +2564,32 @@ export class InboxService {
         modelable_type: params.modelableType,
       },
     });
+
+    // Legacy-morph fallback. The same chat can already own an inbox row written
+    // under a differently-namespaced morph (e.g. the short 'App\Models\WhatsappChat'
+    // this controller used to send vs the consumer's 'App\Models\Whatsapp\WhatsappChat').
+    // An exact-equality lookup missed it and opened a DUPLICATE conversation for the
+    // same contact. Match on the class name so both spellings resolve to one row.
+    if (!inbox) {
+      const morphLeaf = params.modelableType.split('\\').pop();
+      if (morphLeaf) {
+        inbox = await this.prisma.inbox.findFirst({
+          where: {
+            workspace_id: params.workspaceId,
+            modelable_id: params.modelableId,
+            modelable_type: { contains: morphLeaf },
+          },
+        });
+        // Normalise the stray row so it stops diverging from the consumer's writes.
+        if (inbox && inbox.modelable_type !== params.modelableType) {
+          await this.prisma.inbox.update({
+            where: { id: inbox.id },
+            data: { modelable_type: params.modelableType },
+          });
+        }
+      }
+    }
+
     if (!inbox) {
       inbox = await this.prisma.inbox.create({
         data: {

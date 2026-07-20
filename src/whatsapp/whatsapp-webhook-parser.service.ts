@@ -131,6 +131,10 @@ export class WhatsappWebhookParserService {
           last_interacted_at: new Date(),
           last_client_interaction: new Date(),
           input_attempts: BigInt(0),
+          // Same reason as wa_messages: no DB default, and downstream queries
+          // order/filter on these columns.
+          created_at: new Date(),
+          updated_at: new Date(),
         },
       });
     } else {
@@ -175,6 +179,12 @@ export class WhatsappWebhookParserService {
         status: 'received',
         wamid,
         timestamp: msg.timestamp ?? null,
+        // wa_messages.created_at has NO database default. Omitting it stores NULL,
+        // and the inbox reader filters/sorts on created_at — a NULL row is invisible
+        // in EVERY chat mode (SQL comparisons against NULL are never true), so the
+        // message lands in the DB but the agent sees an empty conversation.
+        created_at: new Date(),
+        updated_at: new Date(),
       },
     });
 
