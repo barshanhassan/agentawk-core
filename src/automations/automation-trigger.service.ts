@@ -135,6 +135,8 @@ export class AutomationTriggerService {
     contactId?: bigint;
     channel?: string;
     text?: string;
+    waNumberId?: bigint;
+    waChatId?: bigint;
   }) {
     if (!payload.contactId) return;
 
@@ -164,7 +166,17 @@ export class AutomationTriggerService {
     // 2. Channel-specific auto-reply triggers (wa_auto_reply / tg_auto_reply / ...).
     const autoReplyEvent = this.channelAutoReplyEvent(payload.channel);
     if (autoReplyEvent) {
-      await this.matchAndDispatch(autoReplyEvent, payload.contactId, payload.workspaceId, payload);
+      if (payload.channel === 'whatsapp' && payload.waNumberId && payload.waChatId) {
+        // WhatsApp default reply — replyagent semantics: fire ONLY the activity
+        // scoped to this number (no cross-number spam), honour the interval gate
+        // (24h vs once), and skip if a keyword automation already matched.
+        const keywordMatched = payload.text ? await this.anyKeywordMatch(payload) : false;
+        if (!keywordMatched) {
+          await this.handleWhatsAppAutoReply(payload);
+        }
+      } else {
+        await this.matchAndDispatch(autoReplyEvent, payload.contactId, payload.workspaceId, payload);
+      }
     }
 
     // 3. Keyword triggers (wa_keyword / tg_keyword / zapi_keyword / evolution_keyword).
@@ -514,6 +526,91 @@ export class AutomationTriggerService {
       }
     }
     return raw;
+  }
+
+  /**
+   * True if ANY active keyword automation in the workspace matches this inbound
+   * text. Used to suppress the default auto-reply when a keyword already fired
+   * (replyagent's `!keyword_triggered` guard). Does not dispatch — step 3 still
+   * dispatches keyword triggers normally.
+   */
+  private async anyKeywordMatch(payload: {
+    workspaceId: bigint;
+    channel?: string;
+    text?: string;
+  }): Promise<boolean> {
+    const keywordEvent = this.channelKeywordEvent(payload.channel);
+    if (!keywordEvent || !payload.text) return false;
+    const acts = await this.prisma.automation_step_activities.findMany({
+      where: { event: keywordEvent, deleted_at: null },
+    });
+    for (const a of acts) {
+      const automation = await this.lookupAutomationForActivity(a);
+      if (!automation || automation.workspace_id !== payload.workspaceId || automation.status !== 'active') continue;
+      const props = this.parseProps(a.properties);
+      if (this.matchesKeyword(props, payload.text)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * WhatsApp default reply firing. Mirrors replyagent OnWhatsappMessageCreated:
+   * find the wa_auto_reply trigger activity whose `properties.wa_number_id`
+   * equals THIS chat's number (isolation — never another number's auto-reply),
+   * apply the interval gate against `wa_chats.last_auto_reply` (24 = at most
+   * once per 24h, 247 = once ever), dispatch, and stamp last_auto_reply.
+   */
+  private async handleWhatsAppAutoReply(payload: {
+    contactId?: bigint;
+    workspaceId: bigint;
+    waNumberId?: bigint;
+    waChatId?: bigint;
+  }): Promise<void> {
+    if (!payload.contactId || !payload.waNumberId || !payload.waChatId) return;
+    const contactId = payload.contactId;
+
+    const chat = await this.prisma.wa_chats.findUnique({
+      where: { id: payload.waChatId },
+      select: { id: true, last_auto_reply: true },
+    });
+    if (!chat) return;
+
+    const numberIdStr = String(payload.waNumberId);
+    const activities = await this.prisma.automation_step_activities.findMany({
+      where: { event: TRIGGER_EVENTS.WA_AUTO_REPLY, deleted_at: null },
+    });
+
+    for (const act of activities) {
+      const props = this.parseProps(act.properties);
+      // ── Number scoping — the core isolation guard. ──
+      if (String(props?.wa_number_id) !== numberIdStr) continue;
+
+      const automation = await this.lookupAutomationForActivity(act);
+      if (!automation || automation.workspace_id !== payload.workspaceId || automation.status !== 'active') continue;
+
+      // ── Interval gate. ──
+      const waitInterval = parseInt(String(props?.wait_interval ?? '247'), 10);
+      const last = chat.last_auto_reply ? new Date(chat.last_auto_reply) : null;
+      let shouldTrigger = false;
+      if (waitInterval === 24) {
+        const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        if (!last || last < cutoff) shouldTrigger = true;
+      } else if (!last || waitInterval === 247) {
+        shouldTrigger = true;
+      }
+      if (!shouldTrigger) continue;
+
+      this.logger.log(
+        `WA auto-reply: automation=${automation.id} number=${numberIdStr} contact=${contactId} interval=${waitInterval}`,
+      );
+      await this.processor.triggerAutomation(act.id, contactId);
+      await this.prisma.wa_chats.update({
+        where: { id: chat.id },
+        data: { last_auto_reply: new Date() },
+      });
+      // Only one default reply per inbound.
+      return;
+    }
   }
 
   private channelAutoReplyEvent(channel?: string): string | null {

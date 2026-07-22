@@ -38,6 +38,17 @@ export class WhatsappController {
   }
 
   /**
+   * GET /whatsapp/total-channels — live count of ALL connected channels in the
+   * workspace (replyagent Workspace::totalChannels). The `channel.*` socket
+   * broadcast carries the same value for realtime updates.
+   */
+  @Get('total-channels')
+  async getTotalChannels(@Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return { total_channels: await this.whatsappService.computeTotalChannels(workspaceId) };
+  }
+
+  /**
    * GET /whatsapp/limits — workspace's WhatsApp channel allowance + current
    * usage. The settings page's "Add new" button consults this before opening
    * the Embed Signup popup to surface a limit-reached prompt instead of
@@ -186,6 +197,17 @@ export class WhatsappController {
   async getCapi(@Param('account_id') accountId: string, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
     return this.whatsappService.getCapiForAccount(workspaceId, BigInt(accountId));
+  }
+
+  /**
+   * Auto-provision the dataset from Meta (replyagent's single-GET flow). No body
+   * — dataset_id + token are minted/derived server-side from the WABA.
+   */
+  @Post('capi/:account_id/provision')
+  async provisionCapi(@Param('account_id') accountId: string, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    const userId = BigInt(req.user.sub || req.user.id || 0);
+    return this.whatsappService.provisionCapiForAccount(workspaceId, userId, BigInt(accountId));
   }
 
   @Post('capi/:account_id')

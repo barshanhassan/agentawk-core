@@ -47,6 +47,30 @@ export class WabaController {
     return this.service.getTemplate(BigInt(id), workspaceId);
   }
 
+  /**
+   * Edit + resubmit a rejected/paused template for re-approval.
+   * Body mirrors createTemplate (body, header?, footer?, buttons?, examples?);
+   * name + language are immutable and taken from the stored template.
+   */
+  @Patch('templates/:id')
+  async updateTemplate(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.updateTemplate(workspaceId, BigInt(id), body);
+  }
+
+  /**
+   * Persist an edited authoring structure (variable → value mapping, media
+   * record) and rebuild the send payload from it. Mirrors replyagent
+   * `POST /wa/template/structure/{template_id}`. Does NOT resubmit to Meta —
+   * this is how an imported/approved template gets made sendable.
+   * Body: `{ structure: { ...components, header_component, body_component, … } }`
+   */
+  @Post('templates/:id/structure')
+  async saveStructure(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    const workspaceId = BigInt(req.user.workspace_id || 1);
+    return this.service.saveStructure(workspaceId, BigInt(id), body?.structure ?? body);
+  }
+
   @Delete('templates/:id')
   async deleteTemplate(@Param('id') id: string, @Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);

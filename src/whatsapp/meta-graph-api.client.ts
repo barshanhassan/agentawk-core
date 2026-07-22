@@ -5,12 +5,14 @@ import { Injectable, Logger, BadRequestException } from '@nestjs/common';
  * Instagram, and Messenger. Each method accepts the per-account `accessToken`
  * so multi-tenant calls don't share a global secret.
  *
- * Base version pinned to v20.0 — override with META_GRAPH_API_VERSION env var.
+ * Base version pinned to v21.0 — override with META_GRAPH_API_VERSION env var.
  */
 @Injectable()
 export class MetaGraphApiClient {
   private readonly logger = new Logger(MetaGraphApiClient.name);
-  private readonly base = `https://graph.facebook.com/${process.env.META_GRAPH_API_VERSION ?? 'v20.0'}`;
+  // Default aligned to v21.0 to match the microservice's Graph version (BE-direct
+  // calls were defaulting to v20.0). Override with META_GRAPH_API_VERSION.
+  private readonly base = `https://graph.facebook.com/${process.env.META_GRAPH_API_VERSION ?? 'v21.0'}`;
 
   // ─── WhatsApp Cloud ─────────────────────────────────────────────────
 
@@ -45,6 +47,22 @@ export class MetaGraphApiClient {
     );
   }
 
+  /**
+   * Trigger a WhatsApp Business App (Coexistence) state sync. Meta then delivers
+   * the connected business phone's existing contacts asynchronously via an
+   * `smb_app_state_sync` webhook. This is the Coex equivalent of number
+   * registration — Coex numbers are NOT `/register`'d. Mirrors replyagent
+   * WhatsappTrait::synchronizeNumber (POST `{id}/smb_app_data`).
+   */
+  async smbAppData(phoneNumberId: string, accessToken: string, syncType = 'smb_app_state_sync') {
+    return this.request(
+      'POST',
+      `/${phoneNumberId}/smb_app_data`,
+      accessToken,
+      { messaging_product: 'whatsapp', sync_type: syncType },
+    );
+  }
+
   /** Fetch all message templates for a WABA. Paginates if needed. */
   async fetchTemplates(wabaId: string, accessToken: string) {
     const all: any[] = [];
@@ -64,12 +82,21 @@ export class MetaGraphApiClient {
     return all;
   }
 
-  async deleteTemplate(wabaId: string, accessToken: string, templateName: string) {
-    return this.request(
-      'DELETE',
-      `/${wabaId}/message_templates?name=${encodeURIComponent(templateName)}`,
-      accessToken,
-    );
+  /**
+   * Delete a message template. Passing `hsm_id` (the Meta template id) narrows
+   * the delete to that ONE language variant — name-only deletes every language
+   * registered under that name, which is rarely what the user clicked. Mirrors
+   * replyagent's `?hsm_id=…&name=…`.
+   */
+  async deleteTemplate(
+    wabaId: string,
+    accessToken: string,
+    templateName: string,
+    hsmId?: string | null,
+  ) {
+    const qs = new URLSearchParams({ name: templateName });
+    if (hsmId) qs.set('hsm_id', String(hsmId));
+    return this.request('DELETE', `/${wabaId}/message_templates?${qs.toString()}`, accessToken);
   }
 
   /**
@@ -81,6 +108,21 @@ export class MetaGraphApiClient {
     return this.request<{ id: string; status?: string; category?: string }>(
       'POST',
       `/${wabaId}/message_templates`,
+      accessToken,
+      payload,
+    );
+  }
+
+  /**
+   * Edit an existing template (resubmit for approval). Meta's edit endpoint is
+   * POST directly on the template id; only `components` (and `category`) can
+   * change — name and language are immutable. Mirrors replyagent
+   * WhatsappTrait::updateWhatsappTemplate.
+   */
+  async updateTemplate(templateMetaId: string, accessToken: string, payload: any) {
+    return this.request(
+      'POST',
+      `/${templateMetaId}`,
       accessToken,
       payload,
     );
@@ -137,9 +179,12 @@ export class MetaGraphApiClient {
   }
 
   async fetchPhoneNumberDetails(phoneNumberId: string, accessToken: string) {
+    // name_status + new_name_status are required by reconnectNumber's display-name
+    // override (replyagent parity); without them in the fields list Meta omits
+    // them and the override never fires. new_name_status is transient (not stored).
     return this.request<any>(
       'GET',
-      `/${phoneNumberId}?fields=id,verified_name,display_phone_number,code_verification_status,quality_rating,platform_type,throughput,messaging_limit_tier,last_onboarded_time`,
+      `/${phoneNumberId}?fields=id,verified_name,display_phone_number,code_verification_status,quality_rating,name_status,new_name_status,platform_type,throughput,messaging_limit_tier,last_onboarded_time`,
       accessToken,
     );
   }
@@ -177,6 +222,91 @@ export class MetaGraphApiClient {
     );
   }
 
+  /**
+   * Upload a media file to Meta and return the opaque **header handle** that a
+   * template's `HEADER` component needs in `example.header_handle[0]`.
+   *
+   * Mirrors replyagent `WhatsappTrait::uploadMedia()` (gateway line 362). Two steps:
+   *   1. `POST /{app_id}/uploads?...` opens a resumable session and returns `{id}`.
+   *      For a MEDIA_TEMPLATE the file descriptors also ride in the query string;
+   *      for a CAROUSEL_CARD only the access token does. That asymmetry is
+   *      replyagent's, and Meta accepts both, so it is preserved.
+   *   2. `POST /{session_id}` with the raw bytes, `Authorization: OAuth <token>`
+   *      and `file_offset: 0`, returns `{h: "<handle>"}`.
+   *
+   * The token is the APP system-user token (`WA_SYSTEM_USER`), not the WABA's
+   * access token — uploads belong to the app, not the business account.
+   *
+   * Returns the handle string, or null when any step fails (callers surface that
+   * to the UI as a retryable "TRY_AGAIN").
+   */
+  async uploadTemplateMedia(
+    file: { file_length: number; mime_type: string; file_name: string; file_url: string },
+    systemUserToken: string,
+    templateType: 'MEDIA_TEMPLATE' | 'CAROUSEL_CARD' = 'MEDIA_TEMPLATE',
+  ): Promise<string | null> {
+    const appId = process.env.META_APP_ID ?? process.env.FB_APP_ID;
+    if (!appId) {
+      this.logger?.warn?.('uploadTemplateMedia: META_APP_ID / FB_APP_ID is not configured');
+      return null;
+    }
+    try {
+      // ── Step 1: open the upload session ──
+      const qs = new URLSearchParams({ access_token: systemUserToken });
+      if (templateType === 'MEDIA_TEMPLATE') {
+        qs.set('file_length', String(file.file_length));
+        qs.set('file_type', file.mime_type);
+        qs.set('file_name', file.file_name);
+      }
+      const sessionRes = await fetch(`${this.base}/${appId}/uploads?${qs.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          file_length: file.file_length,
+          file_type: file.mime_type,
+          file_name: file.file_name,
+        }),
+      });
+      const session: any = await sessionRes.json().catch(() => null);
+      if (!session?.id) {
+        this.logger?.warn?.(
+          `uploadTemplateMedia: session create failed — ${JSON.stringify(session ?? {})}`,
+        );
+        return null;
+      }
+
+      // ── Step 2: stream the bytes ──
+      // The media lives on our own S3/CDN, so this is an unauthenticated GET.
+      const binRes = await fetch(file.file_url);
+      if (!binRes.ok) {
+        this.logger?.warn?.(`uploadTemplateMedia: could not read ${file.file_url} (${binRes.status})`);
+        return null;
+      }
+      const bytes = Buffer.from(await binRes.arrayBuffer());
+
+      const uploadRes = await fetch(`${this.base}/${session.id}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `OAuth ${systemUserToken}`,
+          file_offset: '0',
+          'Content-Type': 'application/octet-stream',
+        },
+        body: bytes as any,
+      });
+      const uploaded: any = await uploadRes.json().catch(() => null);
+      if (!uploaded?.h) {
+        this.logger?.warn?.(
+          `uploadTemplateMedia: upload failed — ${JSON.stringify(uploaded ?? {})}`,
+        );
+        return null;
+      }
+      return String(uploaded.h);
+    } catch (e: any) {
+      this.logger?.warn?.(`uploadTemplateMedia threw: ${e?.message ?? e}`);
+      return null;
+    }
+  }
+
   async fetchPhoneNumbersForWaba(wabaId: string, accessToken: string) {
     return this.request<{ data: any[] }>(
       'GET',
@@ -201,6 +331,36 @@ export class MetaGraphApiClient {
    */
   async subscribeWabaWebhook(wabaId: string, accessToken: string) {
     return this.request('POST', `/${wabaId}/subscribed_apps`, accessToken);
+  }
+
+  /**
+   * Unsubscribe our app from a WABA's webhooks. Mirrors replyagent
+   * WhatsappTrait::unSubscribe() — `DELETE {waba_id}/subscribed_apps`. Fired on
+   * account delete so Meta stops delivering that WABA's events to our app.
+   */
+  async unsubscribeWabaWebhook(wabaId: string, accessToken: string) {
+    return this.request('DELETE', `/${wabaId}/subscribed_apps`, accessToken);
+  }
+
+  /**
+   * Deregister a phone number from the Cloud API. Mirrors replyagent
+   * WhatsappTrait::deRegisterNumber() — `POST {phone_number_id}/deregister`.
+   * Fired on both single-number delete and account delete so the number is
+   * released on Meta's side and can be re-onboarded later.
+   */
+  async deregisterPhoneNumber(phoneNumberId: string, accessToken: string) {
+    return this.request('POST', `/${phoneNumberId}/deregister`, accessToken);
+  }
+
+  /**
+   * Mint (or fetch) the Conversions-API dataset bound to a WABA. Mirrors
+   * replyagent CapiController::getWhatsappDataset() — `POST {waba_id}/dataset`
+   * with an EMPTY body, authorized with the account's own access token. Meta
+   * returns `{ id }` where `id` is the dataset_id we persist. Idempotent on
+   * Meta's side — calling again returns the same dataset id.
+   */
+  async createDataset(wabaId: string, accessToken: string): Promise<{ id?: string }> {
+    return this.request('POST', `/${wabaId}/dataset`, accessToken);
   }
 
   /**

@@ -330,11 +330,21 @@ export class GalleryService {
       orderBy: { created_at: 'desc' },
     });
 
+    // `?media_type=IMAGE|VIDEO|FILE|AUDIO` narrows the listing to one kind.
+    // replyagent's gallery modal passes this whenever it is opened as a picker
+    // — a WhatsApp template with an IMAGE header must not be able to select a
+    // PDF. Omitted (or ALL) keeps the normal browse-everything behaviour.
+    const requestedType = String(query?.media_type ?? '').trim().toUpperCase();
+    const typeFilter =
+      requestedType && requestedType !== 'ALL' && requestedType !== 'FOLDER'
+        ? requestedType
+        : null;
+
     const filesWhere: any = {
       workspace_id: workspaceId,
       user_id: { in: memberIds },
       object_status: 'AVAILABLE',
-      media_type: { not: 'FOLDER' },
+      media_type: typeFilter ? typeFilter : { not: 'FOLDER' },
       parent_id: parentId, // null at root, set when inside a folder
     };
 

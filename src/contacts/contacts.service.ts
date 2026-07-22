@@ -1356,10 +1356,50 @@ export class ContactsService {
   async unsubscribe(workspaceId: bigint, contactId: bigint, optinId: bigint) {
     // Opt-out = remove the channel_opts row (replyagent: ChannelOpt presence = opted in).
     // Scoped to the contact so an agent can't delete another contact's opt-in.
-    await this.prisma.channel_opts
-      .deleteMany({ where: { id: optinId, contact_id: contactId } })
-      .catch(() => undefined);
+    // Mirror replyagent ChannelOpt::optOut: write the "Opted out" Note (only when
+    // the row exists) BEFORE deleting it, then delete.
+    const opt = await this.prisma.channel_opts
+      .findFirst({ where: { id: optinId, contact_id: contactId } })
+      .catch(() => null);
+    if (opt) {
+      await this.writeChannelOptNote(contactId, opt.id, String(opt.channel ?? 'whatsapp'), 'out');
+      await this.prisma.channel_opts.deleteMany({ where: { id: optinId, contact_id: contactId } }).catch(() => undefined);
+    }
     return { success: true };
+  }
+
+  /**
+   * Write a system timeline Note for a channel opt-in / opt-out. Mirrors
+   * replyagent ChannelOpt::optIn/optOut → Note::createNote — verbatim text
+   * "Opted in/out to channel {channel}", morph → the ChannelOpt row, user_id
+   * NULL (system note), type NOTE, note icon. EZCONN lists the timeline by
+   * contact_id so the ChannelOpt morph still surfaces it.
+   */
+  private async writeChannelOptNote(
+    contactId: bigint,
+    channelOptId: bigint,
+    channel: string,
+    direction: 'in' | 'out',
+  ) {
+    const text = direction === 'in'
+      ? `Opted in to channel ${channel}`
+      : `Opted out to channel ${channel}`;
+    await this.prisma.notes
+      .create({
+        data: {
+          user_id: null,
+          company_id: null,
+          contact_id: contactId,
+          type: 'NOTE',
+          modelable_type: 'App\\Models\\ChannelOpt',
+          modelable_id: channelOptId,
+          text,
+          icon: '<i class="fa-light fa-note"></i>',
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      })
+      .catch(() => undefined);
   }
 
   /**
@@ -1405,7 +1445,7 @@ export class ContactsService {
         },
       });
       if (!existing) {
-        await this.prisma.channel_opts.create({
+        const opt = await this.prisma.channel_opts.create({
           data: {
             contact_id: contactId,
             channel: channelType as any,
@@ -1417,19 +1457,33 @@ export class ContactsService {
             updated_at: new Date(),
           },
         });
+        // "Opted in" timeline Note (only on first opt-in — mirrors replyagent).
+        await this.writeChannelOptNote(contactId, opt.id, channelType, 'in');
       }
     } else {
       // optout = delete the row (replyagent: ChannelOpt::optOut deletes it).
-      await this.prisma.channel_opts
-        .deleteMany({
-          where: {
-            contact_id: contactId,
-            channel: channelType as any,
-            modelable_id: channelId,
-            contactable_id: mobileId,
-          },
-        })
-        .catch(() => undefined);
+      // Write the "Opted out" Note first, only when a row actually exists.
+      const opt = await this.prisma.channel_opts.findFirst({
+        where: {
+          contact_id: contactId,
+          channel: channelType as any,
+          modelable_id: channelId,
+          contactable_id: mobileId,
+        },
+      });
+      if (opt) {
+        await this.writeChannelOptNote(contactId, opt.id, channelType, 'out');
+        await this.prisma.channel_opts
+          .deleteMany({
+            where: {
+              contact_id: contactId,
+              channel: channelType as any,
+              modelable_id: channelId,
+              contactable_id: mobileId,
+            },
+          })
+          .catch(() => undefined);
+      }
     }
 
     // Return the refreshed contact so the FE re-binds optin state (parity with

@@ -235,7 +235,7 @@ export class WhatsappWebhookParserService {
         where: { modelable_type: 'App\\Models\\Contact', modelable_id: contactId },
         select: { id: true },
       });
-      await this.prisma.channel_opts.create({
+      const opt = await this.prisma.channel_opts.create({
         data: {
           contact_id: contactId,
           channel: 'whatsapp' as any,
@@ -247,6 +247,23 @@ export class WhatsappWebhookParserService {
           updated_at: new Date(),
         },
       });
+      // Timeline Note (replyagent ChannelOpt::optIn → "Opted in to channel whatsapp").
+      await this.prisma.notes
+        .create({
+          data: {
+            user_id: null,
+            company_id: null,
+            contact_id: contactId,
+            type: 'NOTE',
+            modelable_type: 'App\\Models\\ChannelOpt',
+            modelable_id: opt.id,
+            text: 'Opted in to channel whatsapp',
+            icon: '<i class="fa-light fa-note"></i>',
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+        })
+        .catch((e: any) => this.logger.warn(`WhatsApp opt-in note failed for contact ${contactId}: ${e?.message ?? e}`));
     } catch (e: any) {
       this.logger.warn(`WhatsApp opt-in upsert failed for contact ${contactId}: ${e?.message ?? e}`);
     }

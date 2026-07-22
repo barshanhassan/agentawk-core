@@ -5,6 +5,7 @@ import { WhatsappService } from '../whatsapp/whatsapp.service';
 import { MetaGraphApiClient } from '../whatsapp/meta-graph-api.client';
 import { ACTION_SLUGS, ActionSlug } from './automations.constants';
 import { InterpolationService } from './interpolation.service';
+import { RagService } from '../ai/rag.service';
 
 /**
  * Dispatcher for `step.type === 'action'` activities. Each automation action
@@ -38,6 +39,7 @@ export class ActionHandlerService {
     private readonly whatsapp: WhatsappService,
     private readonly meta: MetaGraphApiClient,
     private readonly interpolation: InterpolationService,
+    private readonly rag: RagService,
   ) {}
 
   /**
@@ -464,6 +466,23 @@ export class ActionHandlerService {
 
     const question = value?.question ?? value?.prompt ?? '';
     const base = (acct.api_url ?? 'https://api.openai.com').replace(/\/$/, '');
+
+    // Knowledge grounding — pull the agent's most relevant KB chunks (from its
+    // ai_files embeddings, incl. AI-feeder `feed`) and prepend them as context.
+    // Empty when the agent has no KB — the call still works as a plain completion.
+    let systemPrompt = agent.instructions ?? '';
+    try {
+      const kb = await this.rag.searchSimilar(BigInt(agent.id), question, 5);
+      if (Array.isArray(kb) && kb.length) {
+        const context = kb.map((c: any) => c?.text ?? '').filter(Boolean).join('\n---\n');
+        if (context) {
+          systemPrompt = `${systemPrompt}\n\nUse the following knowledge to answer. If it doesn't cover the question, answer normally.\n"""\n${context}\n"""`;
+        }
+      }
+    } catch (e: any) {
+      this.logger.debug(`${slug}: RAG retrieval skipped: ${e?.message ?? e}`);
+    }
+
     try {
       const res = await fetch(`${base}/v1/chat/completions`, {
         method: 'POST',
@@ -474,7 +493,7 @@ export class ActionHandlerService {
         body: JSON.stringify({
           model: agent.model ?? 'gpt-4o-mini',
           messages: [
-            { role: 'system', content: agent.instructions ?? '' },
+            { role: 'system', content: systemPrompt },
             { role: 'user', content: question },
           ],
           temperature: agent.creativity ?? 0.7,
@@ -489,10 +508,43 @@ export class ActionHandlerService {
       if (value?.save_to?.field_id) {
         await this.setCustomField(contactId, { field_id: value.save_to.field_id, value: answer }, workspaceId);
       }
-      this.logger.log(`${slug}: OpenAI completion stored for contact ${contactId}`);
+      // AI-feeder conversational reply — when the step opts in, send the answer
+      // straight back to the contact on WhatsApp (default AI actions only store
+      // to a custom field). Gated so existing steps are unchanged.
+      if (value?.reply_to_channel || value?.reply_via_whatsapp) {
+        await this.replyToWhatsApp(contactId, workspaceId, answer).catch((e) =>
+          this.logger.warn(`${slug}: WhatsApp reply failed: ${e?.message ?? e}`),
+        );
+      }
+      this.logger.log(`${slug}: OpenAI completion handled for contact ${contactId}`);
     } catch (e: any) {
       this.logger.warn(`${slug}: OpenAI call failed: ${e?.message ?? e}`);
     }
+  }
+
+  /**
+   * Send free text back to a contact on WhatsApp, isolation-safe: resolves the
+   * contact's most recent wa_chat and replies on THAT number (phone_number_id).
+   * Used by AI-feeder conversational steps.
+   */
+  private async replyToWhatsApp(contactId: bigint, workspaceId: bigint, text: string): Promise<void> {
+    if (!text?.trim()) return;
+    const chat = await this.prisma.wa_chats.findFirst({
+      where: { contact_id: contactId },
+      orderBy: { last_interacted_at: 'desc' },
+    });
+    if (!chat) {
+      this.logger.warn(`AI reply: no wa_chat for contact ${contactId} — cannot reply`);
+      return;
+    }
+    const number = await this.prisma.wa_phone_numbers.findUnique({ where: { id: chat.wa_number_id } });
+    await this.whatsapp.sendMessage(workspaceId, 0n, {
+      to: chat.wa_id,
+      phone_number_id: number?.wa_number_id,
+      type: 'text',
+      text: { body: text },
+      contact_id: contactId.toString(),
+    });
   }
 
   /**

@@ -9,8 +9,15 @@ import { InterpolationService } from './interpolation.service';
  * branches by `step.type` and lands here for any channel-step.
  *
  * Routing summary:
- *   - WhatsApp → WhatsappService.sendMessage (publishes WA_OUTBOUND_MESSAGE
- *     on ra/whatsapp; real Meta API call lives in the microservice)
+ *   - WhatsApp → WhatsappService.sendMessage which calls the Meta Graph API
+ *     DIRECTLY + synchronously (NOT via the ra/whatsapp microservice queue that
+ *     the inbox composer uses). The wamid is returned inline, so the wa_message
+ *     row is persisted at status='sent' (a confirmed send, not optimistic);
+ *     delivered/read then arrive later via the app-level status webhook
+ *     (WA_MESSAGE_STATUS → consumer, correlated by wamid). A Meta rejection
+ *     THROWS, which stalls the automation flow (see sendWhatsApp / M9).
+ *     NOTE: automation WhatsApp sends are currently TEXT-ONLY — image/audio/
+ *     button/list/template step content is not yet resolved here.
  *   - Telegram → Telegram Bot API (bot token stored in telegram_bots.token)
  *   - Messenger → Meta Graph API `/me/messages` (page token in fb_pages.access_token)
  *   - Instagram → Meta Graph API `/me/messages` (page token in insta_pages.access_token)
@@ -54,18 +61,28 @@ export class MessagingService {
   // ─── WhatsApp ──────────────────────────────────────────────────────
 
   async sendWhatsApp(contactId: bigint, properties: any, workspaceId: bigint) {
+    // Send-gated resume (M9 / replyagent): an automation WhatsApp send is
+    // SYNCHRONOUS here (whatsapp.sendMessage → Meta Graph directly, not the
+    // microservice queue), so there is no async 'sent' webhook to resume on.
+    // Instead we THROW on any failure so the automation processor's try/catch
+    // does NOT reach finished() — the flow stalls at this step (replyagent:
+    // a failed send never resumes the queue). A successful send returns normally
+    // and the processor advances (equivalent to replyagent's 'sent' → RESUME_QUEUE).
     const text = await this.resolveText(properties, contactId, workspaceId);
-    if (!text) return this.logger.warn(`whatsapp: no text body for contact ${contactId}`);
+    if (!text) {
+      throw new Error(`whatsapp automation: no text body for contact ${contactId} — flow stalled`);
+    }
 
     const chat = await this.prisma.wa_chats.findFirst({
       where: { contact_id: contactId },
       orderBy: { last_interacted_at: 'desc' },
     });
     if (!chat) {
-      this.logger.warn(`whatsapp: no wa_chat for contact ${contactId} — cannot send`);
-      return;
+      throw new Error(`whatsapp automation: no wa_chat for contact ${contactId} — cannot send, flow stalled`);
     }
 
+    // whatsapp.sendMessage throws (BadRequestException) on a Meta rejection —
+    // that propagates up and stalls the flow too.
     await this.whatsapp.sendMessage(workspaceId, 0n /* automation system user */, {
       to: chat.wa_id,
       type: 'text',

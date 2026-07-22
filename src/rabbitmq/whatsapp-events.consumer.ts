@@ -10,6 +10,7 @@ import { S3Service } from '../s3/s3.service';
 const WHATSAPP_CHAT_MODELABLE = 'App\\Models\\Whatsapp\\WhatsappChat';
 const WHATSAPP_MESSAGE_MODELABLE = 'App\\Models\\Whatsapp\\WhatsappMessage';
 const WHATSAPP_NUMBER_MODELABLE = 'App\\Models\\Whatsapp\\WhatsappNumber';
+const WHATSAPP_ACCOUNT_MODELABLE = 'App\\Models\\Whatsapp\\WhatsappAccount';
 const CONTACT_MODELABLE = 'App\\Models\\Contact';
 const MOBILE_CONTACT_MODELABLE = 'App\\Models\\Contact\\MobileContact';
 const WORKSPACE_MODELABLE = 'App\\Models\\Workspace';
@@ -54,8 +55,29 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       case 'WA_INBOUND_MESSAGE':
         await this.onInboundMessage(envelope.payload);
         return;
+      case 'WA_SMB_MESSAGE_ECHOES':
+        await this.onSmbEcho(envelope.payload);
+        return;
       case 'WA_VERIFICATION_RESULT':
         await this.onVerificationResult(envelope.payload);
+        return;
+      // ── Async account/number lifecycle webhooks (Meta → microservice →
+      //    "WA_" + changes.field.toUpperCase()). Mirrors replyagent
+      //    HandleBrokerEvents WA_ACCOUNT_UPDATE / *_QUALITY_UPDATE / *_NAME_UPDATE. ──
+      case 'WA_ACCOUNT_UPDATE':
+        await this.onAccountUpdate(envelope.payload);
+        return;
+      case 'WA_PHONE_NUMBER_QUALITY_UPDATE':
+        await this.onPhoneNumberQualityUpdate(envelope.payload);
+        return;
+      case 'WA_PHONE_NUMBER_NAME_UPDATE':
+        await this.onPhoneNumberNameUpdate(envelope.payload);
+        return;
+      case 'WA_SMB_APP_STATE_SYNC':
+        await this.onSmbAppStateSync(envelope.payload);
+        return;
+      case 'WA_MESSAGE_TEMPLATE_STATUS_UPDATE':
+        await this.onTemplateStatusUpdate(envelope.payload);
         return;
       case 'WA_OUTBOUND_MESSAGE_STATUS':
         await this.onOutboundMessageStatus(envelope.payload);
@@ -258,6 +280,9 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       return;
     }
 
+    // Audit the verification result (replyagent WhatsappLog::createLog parity).
+    await this.createWaLog('WA_VERIFICATION_RESULT', WHATSAPP_ACCOUNT_MODELABLE, account.id, payload);
+
     // Capture the microservice's Mongo _id so the outbound flow can address the
     // account when publishing WA_OUTBOUND_MESSAGE. The microservice (post-patch)
     // returns the existing doc on ACCOUNT_EXIST too, so this value is reliable
@@ -288,6 +313,9 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       this.logger.log(
         `wa_account ${account.id} (waba=${account.waba_id}) verified — status=ACTIVE, meta_account_id=${metaAccountId ?? '(none)'}`,
       );
+      // Auto-import the account's message templates (replyagent ProcessTemplates
+      // on activation). WabaService listens on this event.
+      this.events.emit('whatsapp.account.activated', { workspaceId: account.workspace_id });
     } else {
       const errorCode = typeof payload.status === 'string' ? payload.status : 'REGISTRATION_FAILED';
       updatedAccount = await this.prisma.wa_accounts.update({
@@ -329,6 +357,630 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       }
     } catch (e: any) {
       this.logger.debug(`onVerificationResult emit failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /**
+   * Append an audit row to `wa_logs` for a lifecycle webhook. Mirrors
+   * replyagent WhatsappLog::createLog (best-effort — a failed log must never
+   * break the webhook handler).
+   */
+  private async createWaLog(
+    type: string,
+    modelableType: string,
+    modelableId: bigint,
+    payload: any,
+  ): Promise<void> {
+    try {
+      const now = new Date();
+      await this.prisma.wa_logs.create({
+        data: {
+          type,
+          modelable_type: modelableType,
+          modelable_id: modelableId,
+          payload: JSON.stringify(payload ?? {}),
+          created_at: now,
+          updated_at: now,
+        },
+      });
+    } catch (e: any) {
+      this.logger.warn(`wa_logs createLog failed (${type}): ${e?.message ?? e}`);
+    }
+  }
+
+  /** Digits-only normalisation matching how onboarding stores `phone_number`. */
+  private normalizeStoredPhone(raw: any): string {
+    return String(raw ?? '').replace(/[^0-9]/g, '');
+  }
+
+  /**
+   * Broadcast a `whatsapp.account_updated` / `whatsapp.number_updated` signal so
+   * the settings page refetches its channel list in real time. The FE listener
+   * only triggers a refetch, so a minimal serialized payload is sufficient.
+   */
+  private emitWaAccountRefresh(workspaceId: bigint, account?: any, number?: any): void {
+    try {
+      const serialize = (row: any) => ({
+        ...row,
+        id: row?.id?.toString?.(),
+        workspace_id: row?.workspace_id?.toString?.(),
+        user_id: row?.user_id?.toString?.(),
+        wa_account_id: row?.wa_account_id?.toString?.(),
+        auto_reply_automation_id: row?.auto_reply_automation_id?.toString?.() ?? null,
+      });
+      if (account) {
+        this.chatGateway.emitToWorkspace(workspaceId, 'whatsapp.account_updated', serialize(account));
+      }
+      if (number) {
+        this.chatGateway.emitToWorkspace(workspaceId, 'whatsapp.number_updated', serialize(number));
+      }
+      if (!account && !number) {
+        this.chatGateway.emitToWorkspace(workspaceId, 'whatsapp.account_updated', {
+          workspace_id: workspaceId?.toString?.(),
+        });
+      }
+    } catch (e: any) {
+      this.logger.debug(`emitWaAccountRefresh failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /**
+   * Local cascade for a Meta-initiated phone-number removal: drop its chats →
+   * messages → linked inbox rows → the number row, then write a channel_deleted
+   * audit log. Inline mirror of WhatsappService.cascadeDeleteNumberLocal so the
+   * consumer stays self-contained (no cross-module DI). Keep the two in sync.
+   */
+  private async cascadeRemoveNumberLocal(
+    number: { id: bigint; verified_name: string; display_phone_number: string },
+    account: { id: bigint; workspace_id: bigint },
+  ): Promise<void> {
+    const chats = await this.prisma.wa_chats.findMany({
+      where: { wa_number_id: number.id },
+      select: { id: true },
+    });
+    const chatIds = chats.map((c) => c.id);
+    if (chatIds.length > 0) {
+      await this.prisma.wa_messages
+        .deleteMany({ where: { wa_chat_id: { in: chatIds } } })
+        .catch((e) => this.logger.warn(`Cascade wa_messages delete failed: ${e?.message ?? e}`));
+      await this.prisma.inbox
+        .deleteMany({
+          where: { modelable_type: WHATSAPP_CHAT_MODELABLE, modelable_id: { in: chatIds } },
+        })
+        .catch((e) => this.logger.warn(`Cascade inbox delete failed: ${e?.message ?? e}`));
+      await this.prisma.wa_chats
+        .deleteMany({ where: { id: { in: chatIds } } })
+        .catch((e) => this.logger.warn(`Cascade wa_chats delete failed: ${e?.message ?? e}`));
+    }
+    await this.prisma.wa_phone_numbers.delete({ where: { id: number.id } }).catch((e) =>
+      this.logger.warn(`Cascade wa_phone_numbers delete failed: ${e?.message ?? e}`),
+    );
+    try {
+      const now = new Date();
+      await this.prisma.audit_logs.create({
+        data: {
+          workspace_id: account.workspace_id,
+          user_id: null,
+          event: 'channel_deleted',
+          modelable_type: WHATSAPP_ACCOUNT_MODELABLE,
+          modelable_id: account.id,
+          data: JSON.stringify({
+            channel_type: 'whatsapp',
+            channel_name: number.verified_name,
+            phone_number: number.display_phone_number,
+          }),
+          created_at: now,
+          updated_at: now,
+        },
+      });
+    } catch (e: any) {
+      this.logger.debug(`audit_log insert failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /**
+   * WA_MESSAGE_TEMPLATE_STATUS_UPDATE — Meta approved/rejected/paused a template.
+   * Update the wa_templates row's status/category/reason and notify the UI.
+   * Mirrors replyagent HandleBrokerEvents "WA_MESSAGE_TEMPLATE_STATUS_UPDATE".
+   */
+  private async onTemplateStatusUpdate(data: any): Promise<void> {
+    if (!data) return;
+
+    if (data.wa_bussiness_id) {
+      const acc = await this.prisma.wa_accounts.findFirst({
+        where: { waba_id: String(data.wa_bussiness_id) },
+      });
+      if (acc) {
+        await this.createWaLog('WA_MESSAGE_TEMPLATE_STATUS_UPDATE', WHATSAPP_ACCOUNT_MODELABLE, acc.id, data);
+      }
+    }
+
+    const templateMetaId = data.message_template_id;
+    if (templateMetaId == null) return;
+    const template = await this.prisma.wa_templates.findFirst({
+      where: { template_id: String(templateMetaId) },
+    });
+    if (!template) return;
+
+    const upd: any = { updated_at: new Date() };
+    if (data.event) {
+      upd.status = String(data.event);
+      if (data.message_template_category) upd.category = String(data.message_template_category);
+    }
+    if (data.reason != null) upd.reason = String(data.reason);
+    await this.prisma.wa_templates.update({ where: { id: template.id }, data: upd });
+
+    // Notify the Templates page so the approval badge updates in real time.
+    try {
+      const acc = await this.prisma.wa_accounts.findFirst({
+        where: { id: BigInt(template.wa_account_id) },
+        select: { workspace_id: true },
+      });
+      if (acc) {
+        this.chatGateway.emitToWorkspace(acc.workspace_id, 'whatsapp.template_updated', {
+          template_id: String(templateMetaId),
+          status: upd.status ?? template.status,
+          category: upd.category ?? template.category,
+        });
+      }
+    } catch (e: any) {
+      this.logger.debug(`template_updated emit failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /**
+   * WA_SMB_MESSAGE_ECHOES — messages the merchant sent from their OWN WhatsApp
+   * Business phone app (Coexistence). We echo them into the same conversation as
+   * OUTGOING with a null sender (no agent), so the agent inbox shows what was
+   * typed on the phone. Mirrors replyagent WhatsappHelper::wamaOutbound.
+   * Resolved by phone_number_id (isolation-safe) exactly like inbound; the
+   * customer is `payload.to`.
+   */
+  private async onSmbEcho(payload: any): Promise<void> {
+    const metaPhoneNumberId = payload?.phone_number_id ? String(payload.phone_number_id) : null;
+    const msg = payload?.message;
+    const toWaId = payload?.to ? String(payload.to) : null;
+    if (!metaPhoneNumberId || !msg || !toWaId) {
+      this.logger.warn(`WA_SMB_MESSAGE_ECHOES missing required fields — dropping. Keys: ${Object.keys(payload ?? {}).join(',')}`);
+      return;
+    }
+
+    // Idempotency — the same echo can be redelivered.
+    const wamid = msg?.id ? String(msg.id) : null;
+    if (wamid) {
+      const already = await this.prisma.wa_messages.findFirst({ where: { wamid }, select: { id: true } });
+      if (already) return;
+    }
+
+    // Isolation-safe resolution: number by phone_number_id, account from number.
+    const phoneNumber = await this.prisma.wa_phone_numbers.findFirst({
+      where: { wa_number_id: metaPhoneNumberId },
+    });
+    if (!phoneNumber) {
+      this.logger.warn(`SMB echo: no wa_phone_numbers for wa_number_id=${metaPhoneNumberId} — dropped.`);
+      return;
+    }
+    const account = await this.prisma.wa_accounts.findFirst({
+      where: { id: phoneNumber.wa_account_id, deleted_at: null },
+    });
+    if (!account) return;
+
+    const fullMobile = toWaId.startsWith('+') ? toWaId : `+${toWaId}`;
+    const contact = await this.resolveContact({
+      workspaceId: account.workspace_id,
+      fullMobile,
+      waId: toWaId.startsWith('+') ? toWaId.slice(1) : toWaId,
+      profileName: null,
+    });
+
+    const now = new Date();
+    const chat = await this.prisma.wa_chats.upsert({
+      where: {
+        wa_account_id_wa_number_id_wa_id: {
+          wa_account_id: account.id,
+          wa_number_id: phoneNumber.id,
+          wa_id: fullMobile,
+        },
+      },
+      update: { last_business_interaction: now, last_interacted_at: now, updated_at: now },
+      create: {
+        wa_account_id: account.id,
+        wa_number_id: phoneNumber.id,
+        user_id: account.user_id,
+        contact_id: contact.id,
+        profile_name: null,
+        wa_id: fullMobile,
+        is_primary: true,
+        input_attempts: 0n,
+        last_business_interaction: now,
+        last_interacted_at: now,
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    const messageType = String(msg.type ?? 'text').toLowerCase();
+    let text: string | null = null;
+    if (messageType === 'text') text = msg.text?.body ?? null;
+    else if (messageType === 'button') text = msg.button?.text ?? null;
+    else if (messageType === 'interactive') text = JSON.stringify(msg.interactive ?? {});
+    else if (['image', 'audio', 'video', 'document'].includes(messageType)) text = msg[messageType]?.caption ?? null;
+
+    // Reply-to context (the merchant may have quoted a message).
+    let replyTo: bigint | null = null;
+    if (msg?.context?.id) {
+      const repliedTo = await this.prisma.wa_messages.findFirst({
+        where: { wamid: String(msg.context.id) },
+        select: { id: true },
+      });
+      if (repliedTo) replyTo = repliedTo.id;
+    }
+
+    const insertedMessage = await this.prisma.wa_messages.create({
+      data: {
+        wa_number_id: phoneNumber.id,
+        wa_chat_id: chat.id,
+        sender_id: null, // merchant's phone, not an agent
+        mobile_number: fullMobile,
+        type: messageType,
+        direction: 'OUTGOING',
+        text,
+        status: 'sent',
+        wamid,
+        timestamp: msg.timestamp ? String(msg.timestamp) : null,
+        payload: JSON.stringify(msg),
+        communication_mode: 'INBOX',
+        ...(replyTo ? { reply_to: replyTo } : {}),
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    // Inbox row — surface the conversation (outbound doesn't mark it unread).
+    const existingInbox = await this.prisma.inbox.findFirst({
+      where: { modelable_type: WHATSAPP_CHAT_MODELABLE, modelable_id: chat.id },
+    });
+    let inboxRow: any;
+    if (!existingInbox) {
+      inboxRow = await this.prisma.inbox.create({
+        data: {
+          workspace_id: account.workspace_id,
+          user_id: null,
+          assigned_by: null,
+          type: 'WHATSAPP',
+          status: 'UNASSIGNED',
+          is_read: 1,
+          is_assigned: 0,
+          snooze: new Date(0),
+          modelable_type: WHATSAPP_CHAT_MODELABLE,
+          modelable_id: chat.id,
+          queued_at: now,
+          last_updated: now,
+          created_at: now,
+          updated_at: now,
+        },
+      });
+    } else {
+      inboxRow = await this.prisma.inbox.update({
+        where: { id: existingInbox.id },
+        data: { last_updated: now, updated_at: now },
+      });
+    }
+
+    // Media echoes — consume the microservice media (S3 + thumb) into a gallery
+    // row (replyagent parity); fall back to a Graph download when absent.
+    let mediaEntry: any = null;
+    const MEDIA_TYPES = ['image', 'video', 'audio', 'voice', 'document', 'sticker'];
+    if (MEDIA_TYPES.includes(messageType)) {
+      if (payload.media && (payload.media.fileUrl || payload.media.filePath)) {
+        mediaEntry = await this.persistWaInboundMedia(insertedMessage.id, payload.media, account).catch((e) => {
+          this.logger.warn(`[WA SMB ECHO MEDIA] gallery persist failed for ${insertedMessage.id}: ${e?.message ?? e}`);
+          return null;
+        });
+      } else {
+        this.downloadWaMediaToS3(insertedMessage.id, msg, account.access_token, account.workspace_id, inboxRow.id)
+          .catch((e) => this.logger.warn(`[WA SMB ECHO MEDIA] download failed for ${insertedMessage.id}: ${e?.message ?? e}`));
+      }
+    }
+
+    this.chatGateway.emitToWorkspace(account.workspace_id, 'new_message', {
+      inbox_id: inboxRow.id.toString(),
+      message: {
+        id: insertedMessage.id.toString(),
+        direction: 'OUTGOING',
+        text,
+        type: messageType,
+        status: 'sent',
+        reactions: [],
+        parsed_files: mediaEntry ? [mediaEntry] : (messageType === 'text' ? [] : null),
+        created_at: insertedMessage.created_at?.toISOString?.() ?? now.toISOString(),
+        updated_at: insertedMessage.updated_at?.toISOString?.() ?? now.toISOString(),
+      },
+    });
+    this.logger.log(`SMB echo persisted (OUTGOING) for chat ${chat.id} on number ${phoneNumber.id}`);
+  }
+
+  /**
+   * WA_SMB_APP_STATE_SYNC — the Coexistence business phone's contact book,
+   * delivered by Meta after an smb_app_data sync. Imports each new contact
+   * (company + contact + WhatsApp mobile). Mirrors replyagent
+   * ImportBusinessContacts. Dedupes on the workspace's existing mobiles.
+   */
+  private async onSmbAppStateSync(data: any): Promise<void> {
+    if (!data) return;
+    const phoneNumberId = data?.metadata?.phone_number_id;
+    if (!phoneNumberId) return;
+
+    const number = await this.prisma.wa_phone_numbers.findFirst({
+      where: { wa_number_id: String(phoneNumberId) },
+    });
+    if (!number) return;
+    const account = await this.prisma.wa_accounts.findFirst({
+      where: { id: number.wa_account_id },
+    });
+    if (!account) return;
+
+    const workspaceId = account.workspace_id;
+    const stateSync = Array.isArray(data.state_sync) ? data.state_sync : [];
+    let imported = 0;
+
+    for (const cp of stateSync) {
+      try {
+        if (cp?.type !== 'contact' || cp?.action !== 'add') continue;
+        let phone = cp?.contact?.phone_number;
+        if (!phone) continue;
+        phone = String(phone);
+        if (!phone.startsWith('+')) phone = '+' + phone;
+        const phoneNoPlus = phone.slice(1);
+
+        // Dedupe — skip if the workspace already has a contact with this mobile.
+        const existingMobile = await this.prisma.contact_mobiles.findFirst({
+          where: {
+            ownership_type: WORKSPACE_MODELABLE,
+            ownership_id: workspaceId,
+            modelable_type: CONTACT_MODELABLE,
+            OR: [{ full_mobile_number: phone }, { full_mobile_number: phoneNoPlus }],
+          },
+        });
+        if (existingMobile) continue;
+
+        const fullName = String(cp?.contact?.full_name ?? phone);
+        const now = new Date();
+
+        // Company per imported contact (replyagent CompanyHelper::create).
+        const company = await this.prisma.companies.create({
+          data: {
+            user_id: account.user_id,
+            workspace_id: workspaceId,
+            name: fullName.slice(0, 200),
+            created_at: now,
+            updated_at: now,
+          },
+        });
+
+        const first = fullName.split(' ')[0] ?? null;
+        const last = fullName.includes(' ') ? fullName.split(' ').slice(1).join(' ') : null;
+        const contact = await this.prisma.contacts.create({
+          data: {
+            workspace_id: workspaceId,
+            company_id: company.id,
+            first_name: first,
+            last_name: last,
+            full_name: fullName,
+            // The enum has no WHATSAPP_APP value; use WHATSAPP + source_name to
+            // preserve replyagent's `whatsapp_app` provenance.
+            source: 'WHATSAPP',
+            source_name: 'whatsapp_app',
+            status: 'ACTIVE',
+            created_at: now,
+            updated_at: now,
+          },
+        });
+
+        await this.prisma.contact_mobiles.create({
+          data: {
+            ownership_type: WORKSPACE_MODELABLE,
+            ownership_id: workspaceId,
+            modelable_type: CONTACT_MODELABLE,
+            modelable_id: contact.id,
+            country_id: await this.detectCountryId(phoneNoPlus),
+            country_code: this.guessCountryCode(phoneNoPlus),
+            mobile_number: phoneNoPlus,
+            national_mobile_number: phoneNoPlus,
+            full_mobile_number: phone,
+            type: 'whatsapp',
+            slug: 'whatsapp',
+            is_primary: 1,
+            created_at: now,
+            updated_at: now,
+          },
+        });
+        imported++;
+      } catch (e: any) {
+        this.logger.warn(`ImportBusinessContacts: contact import failed: ${e?.message ?? e}`);
+      }
+    }
+
+    if (imported) {
+      this.logger.log(`WA_SMB_APP_STATE_SYNC: imported ${imported} business contact(s) for number ${number.id}`);
+    }
+  }
+
+  /**
+   * WA_ACCOUNT_UPDATE — Meta account-level lifecycle. Mirrors replyagent
+   * HandleBrokerEvents "WA_ACCOUNT_UPDATE" (gateway).
+   *   - PARTNER_ADDED     → store owner business id on the account
+   *   - PHONE_NUMBER_REMOVED → cascade-delete the number locally
+   *   - VERIFIED_ACCOUNT  → business_verification_status = 'verified'
+   *   - DISABLED_UPDATE   → business_verification_status = ban state; status = BANNED
+   */
+  private async onAccountUpdate(data: any): Promise<void> {
+    if (!data) return;
+
+    // Parent-level audit log against the account (best-effort).
+    if (data.wa_bussiness_id) {
+      const acc = await this.prisma.wa_accounts.findFirst({
+        where: { waba_id: String(data.wa_bussiness_id) },
+      });
+      if (acc) await this.createWaLog('WA_ACCOUNT_UPDATE', WHATSAPP_ACCOUNT_MODELABLE, acc.id, data);
+    }
+
+    const event = data.event;
+    if (!event) return;
+
+    if (event === 'PARTNER_ADDED') {
+      const wabaInfo = data.waba_info;
+      if (!wabaInfo?.waba_id) return;
+      const acc = await this.prisma.wa_accounts.findFirst({
+        where: { waba_id: String(wabaInfo.waba_id) },
+      });
+      if (!acc) return;
+      await this.createWaLog('PARTNER_ADDED', WHATSAPP_ACCOUNT_MODELABLE, acc.id, data);
+      if (wabaInfo.owner_business_id) {
+        await this.prisma.wa_accounts.update({
+          where: { id: acc.id },
+          data: { wa_business_id: String(wabaInfo.owner_business_id), updated_at: new Date() },
+        });
+        this.emitWaAccountRefresh(acc.workspace_id);
+      }
+      return;
+    }
+
+    if (
+      event === 'PHONE_NUMBER_REMOVED' ||
+      event === 'VERIFIED_ACCOUNT' ||
+      event === 'DISABLED_UPDATE'
+    ) {
+      const displayPhone = this.normalizeStoredPhone(data.phone_number);
+      if (!displayPhone) return;
+      const number = await this.prisma.wa_phone_numbers.findFirst({
+        where: { phone_number: displayPhone },
+      });
+      if (!number) return;
+      const account = await this.prisma.wa_accounts.findFirst({
+        where: { id: number.wa_account_id },
+      });
+      if (!account) return;
+
+      await this.createWaLog(event, WHATSAPP_ACCOUNT_MODELABLE, account.id, data);
+
+      if (event === 'PHONE_NUMBER_REMOVED') {
+        await this.cascadeRemoveNumberLocal(number as any, account as any);
+        this.logger.log(
+          `WA_ACCOUNT_UPDATE/PHONE_NUMBER_REMOVED: removed number ${number.id} (${number.display_phone_number}) from account ${account.id}`,
+        );
+        this.emitWaAccountRefresh(account.workspace_id);
+      } else if (event === 'VERIFIED_ACCOUNT') {
+        await this.prisma.wa_accounts.update({
+          where: { id: account.id },
+          data: { business_verification_status: 'verified', updated_at: new Date() },
+        });
+        this.emitWaAccountRefresh(account.workspace_id);
+      } else if (event === 'DISABLED_UPDATE') {
+        const upd: any = { business_verification_status: 'not_verified', updated_at: new Date() };
+        if (data.ban_info?.waba_ban_state) {
+          upd.business_verification_status = String(data.ban_info.waba_ban_state);
+          upd.status = 'BANNED';
+        }
+        await this.prisma.wa_accounts.update({ where: { id: account.id }, data: upd });
+        this.logger.warn(
+          `WA_ACCOUNT_UPDATE/DISABLED_UPDATE: account ${account.id} → ${upd.status ?? 'not_verified'}`,
+        );
+        this.emitWaAccountRefresh(account.workspace_id);
+      }
+    }
+  }
+
+  /**
+   * WA_PHONE_NUMBER_QUALITY_UPDATE — quality rating + messaging tier limit.
+   * Mirrors replyagent HandleBrokerEvents "WA_PHONE_NUMBER_QUALITY_UPDATE".
+   */
+  private async onPhoneNumberQualityUpdate(data: any): Promise<void> {
+    if (!data) return;
+
+    if (data.wa_bussiness_id) {
+      const acc = await this.prisma.wa_accounts.findFirst({
+        where: { waba_id: String(data.wa_bussiness_id) },
+      });
+      if (acc) {
+        await this.createWaLog(
+          'WA_PHONE_NUMBER_QUALITY_UPDATE',
+          WHATSAPP_ACCOUNT_MODELABLE,
+          acc.id,
+          data,
+        );
+      }
+    }
+
+    if (!data.display_phone_number) return;
+    const displayPhone = this.normalizeStoredPhone(data.display_phone_number);
+    const number = await this.prisma.wa_phone_numbers.findFirst({
+      where: { phone_number: displayPhone },
+    });
+    if (!number) return;
+
+    await this.createWaLog('WA_PHONE_NUMBER_QUALITY_UPDATE', WHATSAPP_NUMBER_MODELABLE, number.id, data);
+
+    const upd: any = { updated_at: new Date() };
+    if (data.event) upd.quality_rating = String(data.event);
+    if (data.current_limit != null) upd.current_limit = String(data.current_limit);
+    await this.prisma.wa_phone_numbers.update({ where: { id: number.id }, data: upd });
+
+    const account = await this.prisma.wa_accounts.findFirst({
+      where: { id: number.wa_account_id },
+      select: { workspace_id: true },
+    });
+    if (account) this.emitWaAccountRefresh(account.workspace_id);
+  }
+
+  /**
+   * WA_PHONE_NUMBER_NAME_UPDATE — display-name (verified name) approval result.
+   * Mirrors replyagent HandleBrokerEvents "WA_PHONE_NUMBER_NAME_UPDATE".
+   */
+  private async onPhoneNumberNameUpdate(data: any): Promise<void> {
+    if (!data) return;
+    try {
+      if (data.wa_bussiness_id) {
+        const acc = await this.prisma.wa_accounts.findFirst({
+          where: { waba_id: String(data.wa_bussiness_id) },
+        });
+        if (acc) {
+          await this.createWaLog(
+            'WA_PHONE_NUMBER_NAME_UPDATE',
+            WHATSAPP_ACCOUNT_MODELABLE,
+            acc.id,
+            data,
+          );
+        }
+      }
+
+      if (!data.display_phone_number) return;
+      const displayPhone = this.normalizeStoredPhone(data.display_phone_number);
+      const number = await this.prisma.wa_phone_numbers.findFirst({
+        where: { phone_number: displayPhone },
+      });
+      if (!number) {
+        this.logger.debug(`WA_PHONE_NUMBER_NAME_UPDATE: number not registered (${data.display_phone_number})`);
+        return;
+      }
+
+      const upd: any = { updated_at: new Date() };
+      if (data.requested_verified_name != null && data.decision != null) {
+        upd.verified_name = String(data.requested_verified_name);
+        upd.name_status = String(data.decision);
+      }
+      if (data.rejection_reason != null) {
+        upd.error_code = String(data.rejection_reason);
+      }
+      await this.prisma.wa_phone_numbers.update({ where: { id: number.id }, data: upd });
+
+      const account = await this.prisma.wa_accounts.findFirst({
+        where: { id: number.wa_account_id },
+        select: { workspace_id: true },
+      });
+      if (account) this.emitWaAccountRefresh(account.workspace_id);
+    } catch (e: any) {
+      this.logger.warn(`onPhoneNumberNameUpdate failed: ${e?.message ?? e}`);
     }
   }
 
@@ -836,6 +1488,9 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
         wamid: incomingWamid,
         timestamp: msg.timestamp ? String(msg.timestamp) : null,
         payload: JSON.stringify(msg),
+        // CTWA ad-referral raw object — replyagent stores it on wa_messages.referral
+        // whenever the inbound carries referral.source_id (WhatsappHelper.php:919).
+        ...(msg.referral && msg.referral.source_id ? { referral: JSON.stringify(msg.referral) } : {}),
         communication_mode: 'INBOX',
         created_at: now,
         updated_at: now,
@@ -896,11 +1551,22 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       });
     }
 
-    // 6b. Download inbound media from Meta → S3 (fire-and-forget, non-blocking)
+    // 6b. Media: consume the microservice-provided media (already on S3 + thumb)
+    //     into a media_gallery row (replyagent parity, no re-download). Fallback
+    //     to a Graph download only when the microservice didn't attach media.
+    let mediaEntry: any = null;
     const MEDIA_TYPES = ['image', 'video', 'audio', 'voice', 'document', 'sticker'];
     if (MEDIA_TYPES.includes(messageType)) {
-      this.downloadWaMediaToS3(insertedMessage.id, msg, account.access_token, account.workspace_id, inboxRow.id)
-        .catch((e) => this.logger.warn(`[WA MEDIA] download failed for wa_message ${insertedMessage.id}: ${e?.message ?? e}`));
+      if (payload.media && (payload.media.fileUrl || payload.media.filePath)) {
+        mediaEntry = await this.persistWaInboundMedia(insertedMessage.id, payload.media, account).catch((e) => {
+          this.logger.warn(`[WA MEDIA] gallery persist failed for wa_message ${insertedMessage.id}: ${e?.message ?? e}`);
+          return null;
+        });
+      } else {
+        // Fire-and-forget fallback → emits `message_media_ready` when done.
+        this.downloadWaMediaToS3(insertedMessage.id, msg, account.access_token, account.workspace_id, inboxRow.id)
+          .catch((e) => this.logger.warn(`[WA MEDIA] download failed for wa_message ${insertedMessage.id}: ${e?.message ?? e}`));
+      }
     }
 
     // 7. Real-time broadcast — frontend subscribes per workspace room.
@@ -920,7 +1586,7 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
         type: messageType,
         status: 'received',
         reactions: [],
-        parsed_files: messageType === 'text' ? [] : null,
+        parsed_files: mediaEntry ? [mediaEntry] : (messageType === 'text' ? [] : null),
         created_at: insertedMessage.created_at?.toISOString?.() ?? new Date().toISOString(),
         updated_at: insertedMessage.updated_at?.toISOString?.() ?? new Date().toISOString(),
       },
@@ -953,6 +1619,10 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       contactId: contact.id,
       channel: 'whatsapp',
       text,
+      // Number scoping for the auto-reply trigger (replyagent fires the
+      // wa_auto_reply activity whose properties.wa_number_id matches this chat).
+      waNumberId: chat.wa_number_id,
+      waChatId: chat.id,
     });
 
     const refMatch = typeof text === 'string' ? text.match(/^\s*ref[_:\-]([A-Za-z0-9_\-.]+)/i) : null;
@@ -971,7 +1641,17 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     );
 
     const referral = msg?.referral;
-    if (referral && (referral.source_type === 'ad' || referral.source_type === 'ctwa_ad')) {
+    // replyagent guard: referral present AND has source_id (WhatsappHelper.php:916).
+    // NOT gated on source_type — that field is only read (with an "ad" fallback)
+    // when writing columns, so a wider set of ad-referrals is captured.
+    if (referral && referral.source_id != null) {
+      // CTWA click id → wa_chats.ctwa_clid (separate inner guard; every inbound
+      // that carries it overwrites with the latest — WhatsappHelper.php:920-921).
+      if (referral.ctwa_clid) {
+        this.prisma.wa_chats
+          .update({ where: { id: chat.id }, data: { ctwa_clid: String(referral.ctwa_clid), updated_at: new Date() } })
+          .catch((e) => this.logger.warn(`[WA CTWA] ctwa_clid update failed: ${e?.message ?? e}`));
+      }
       // Persist the ad-click so it shows in the contact's AD CLICKS panel.
       // Mirrors replyagent WhatsappHelper: new Referral() field mapping.
       this.prisma.referrals
@@ -993,16 +1673,21 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
         })
         .catch((e) => this.logger.warn(`[WA REFERRAL] persist failed: ${e?.message ?? e}`));
 
-      this.events.emit('message.wa_ad_clicked', {
-        contactId: contact.id,
-        workspaceId: account.workspace_id,
-        adId:
-          referral.source_id ??
-          referral.source?.id ??
-          referral.ad_id ??
-          null,
-        referral,
-      });
+      // ad_clicked automation trigger — replyagent gates THIS specifically on
+      // ctwa_clid presence (OnWhatsappMessageCreated.php:298), even though the
+      // referrals row + wa_messages.referral are stored on any source_id.
+      if (referral.ctwa_clid) {
+        this.events.emit('message.wa_ad_clicked', {
+          contactId: contact.id,
+          workspaceId: account.workspace_id,
+          adId:
+            referral.source_id ??
+            referral.source?.id ??
+            referral.ad_id ??
+            null,
+          referral,
+        });
+      }
     }
 
     this.logger.log(`WA inbound saved: chat=${chat.id} message=${insertedMessage.id} from=${fullMobile}`);
@@ -1037,7 +1722,7 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
       select: { id: true },
     });
     if (exists) return;
-    await this.prisma.channel_opts.create({
+    const opt = await this.prisma.channel_opts.create({
       data: {
         contact_id: contactId,
         channel: 'whatsapp',
@@ -1049,6 +1734,25 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
         updated_at: new Date(),
       },
     });
+    // Timeline Note — mirrors replyagent ChannelOpt::optIn → Note::createNote
+    // ("Opted in to channel whatsapp", morph=ChannelOpt, user_id NULL = system).
+    // Only on first opt-in (guarded by the `exists` check above).
+    await this.prisma.notes
+      .create({
+        data: {
+          user_id: null,
+          company_id: null,
+          contact_id: contactId,
+          type: 'NOTE',
+          modelable_type: 'App\\Models\\ChannelOpt',
+          modelable_id: opt.id,
+          text: 'Opted in to channel whatsapp',
+          icon: '<i class="fa-light fa-note"></i>',
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      })
+      .catch((e) => this.logger.warn(`[WA OPTIN NOTE] failed: ${e?.message ?? e}`));
   }
 
   /**
@@ -1137,10 +1841,98 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
    * empty or unusual phone code). A proper parser ships in Phase 5B.
    */
   /**
+   * MIME → media_gallery media_type. Mirrors replyagent GalleryHelper::getMediaType()
+   * (video/audio/image prefix → VIDEO/AUDIO/IMAGE; everything else incl. documents
+   * → FILE — replyagent never emits DOCUMENT from this path).
+   */
+  private mediaTypeFromMime(mime?: string | null): 'IMAGE' | 'VIDEO' | 'AUDIO' | 'FILE' {
+    const m = String(mime ?? '').toLowerCase();
+    if (m.startsWith('video')) return 'VIDEO';
+    if (m.startsWith('audio')) return 'AUDIO';
+    if (m.startsWith('image')) return 'IMAGE';
+    return 'FILE';
+  }
+
+  /**
+   * Consume the microservice-provided media object (already downloaded, uploaded
+   * to S3, and thumbnailed by the Node service) into a media_gallery row, and
+   * link it on the wa_messages row via gallery_media_id + the raw `media` column.
+   * Mirrors replyagent WhatsappHelper::inboundMessage — GalleryHelper::createObject
+   * (modelable = the WhatsappMessage, object_type USER, privacy PRIVATE) + the
+   * gallery_media_id / caption→text write-back. NO re-download from Meta Graph.
+   *
+   * Returns a parsed_files entry (signed url + thumb) so the caller can hand the
+   * media to the realtime `new_message` emit without a follow-up round-trip.
+   */
+  private async persistWaInboundMedia(
+    messageId: bigint,
+    media: any,
+    account: { workspace_id: bigint; user_id: bigint },
+  ): Promise<any | null> {
+    if (!media || (!media.fileUrl && !media.filePath)) return null;
+    const now = new Date();
+    // replyagent GalleryHelper::generateId() = strtolower(time . '_' . randomKey()).
+    const objectId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`.toLowerCase();
+
+    const gallery = await this.prisma.media_gallery.create({
+      data: {
+        workspace_id: account.workspace_id,
+        user_id: account.user_id,
+        modelable_type: WHATSAPP_MESSAGE_MODELABLE,
+        modelable_id: messageId,
+        object_type: 'USER',
+        object_name: media.fileName ?? media.originalName ?? null,
+        extension: media.extension ?? null,
+        mime_type: media.mimeType ?? media.contentType ?? null,
+        object_id: objectId,
+        file_url: media.fileUrl ?? null,
+        file_path: media.filePath ?? null,
+        thumb_200: media.thumb?.fileUrl ?? null,
+        thumb_200_path: media.thumb?.filePath ?? null,
+        file_size: Number(media.fileSize ?? 0),
+        hidden: false,
+        privacy: 'PRIVATE',
+        media_type: this.mediaTypeFromMime(media.mimeType ?? media.contentType),
+        object_status: 'AVAILABLE',
+        created_at: now,
+        updated_at: now,
+      },
+    });
+
+    // Link the gallery row + store the raw media object verbatim (replyagent
+    // `media` column). Overwrite text ONLY when a non-empty caption is present.
+    const update: any = {
+      media: JSON.stringify(media),
+      gallery_media_id: String(gallery.id),
+      updated_at: now,
+    };
+    if (media.caption && String(media.caption).trim()) update.text = String(media.caption);
+    await this.prisma.wa_messages.update({ where: { id: messageId }, data: update });
+
+    // Signed URLs for the realtime patch — getChatMessages() re-signs on reload.
+    const url = media.filePath
+      ? (await this.s3.getSignedUrl(media.filePath, 3600 * 24 * 7)) || media.fileUrl
+      : media.fileUrl;
+    const thumb = media.thumb?.filePath
+      ? (await this.s3.getSignedUrl(media.thumb.filePath, 3600 * 24 * 7)) || media.thumb?.fileUrl
+      : media.thumb?.fileUrl ?? null;
+
+    return {
+      url,
+      thumb: thumb || null,
+      name: media.fileName ?? media.originalName ?? 'attachment',
+      size: Number(media.fileSize ?? 0),
+      mime: media.mimeType ?? media.contentType ?? 'application/octet-stream',
+      media_type: this.mediaTypeFromMime(media.mimeType ?? media.contentType),
+    };
+  }
+
+  /**
    * Download inbound WhatsApp media from Meta Graph API and store in S3.
    * Updates wa_messages.files with [{url, name, size, mime}] so getMessages()
    * returns it as parsed_files automatically.
    * Called fire-and-forget — errors are logged but don't fail the message save.
+   * FALLBACK path only — used when the microservice did not attach `payload.media`.
    */
   private async downloadWaMediaToS3(
     messageId: bigint,

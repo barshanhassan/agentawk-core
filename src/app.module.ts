@@ -58,6 +58,7 @@ import { AiThemesModule } from './ai-themes/ai-themes.module';
 import { AiProductsModule } from './ai-products/ai-products.module';
 import { IntegrationsModule } from './integrations/integrations.module';
 import { AiFeedersModule } from './ai-feeders/ai-feeders.module';
+import { AiFeederModule } from './ai-feeder/ai-feeder.module';
 import { InboxModule } from './inbox/inbox.module';
 import { ConversationEventsModule } from './conversation-events/conversation-events.module';
 import { SupervisorChatStatisticsModule } from './supervisor-chat-statistics/supervisor-chat-statistics.module';
@@ -135,6 +136,7 @@ import { PermissionsGuard } from './auth/permissions.guard';
     AiThemesModule,
     AiProductsModule,
     AiFeedersModule,
+    AiFeederModule,
     InboxModule,
     ConversationEventsModule,
     SupervisorChatStatisticsModule,

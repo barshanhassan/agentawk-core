@@ -870,14 +870,17 @@ export class StatisticsService {
       };
     }
 
-    // wa_templates.wa_account_id is a STRING storing the WABA id (NOT wa_accounts.id),
-    // so categorize templates by the accounts' waba_id values.
-    const wabaIds = waAccounts.map(a => a.waba_id).filter((x): x is string => !!x);
+    // wa_templates.wa_account_id is a VARCHAR, but it holds the INTERNAL
+    // wa_accounts.id as a string — that is what waba.service writes and what the
+    // replyagent dump contains. This used to match on waba_id (the Meta id) and
+    // therefore always came back empty, which silently billed every templated
+    // message at the 'utility' fallback rate regardless of its real category.
+    const accountKeys = waAccounts.map(a => a.id.toString());
 
     // Bulk pull templates so we can categorize message-by-template lookups.
-    const templates = wabaIds.length
+    const templates = accountKeys.length
       ? await this.prisma.wa_templates.findMany({
-          where: { wa_account_id: { in: wabaIds } },
+          where: { wa_account_id: { in: accountKeys } },
           select: { id: true, category: true },
         })
       : [];

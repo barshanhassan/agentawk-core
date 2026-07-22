@@ -149,25 +149,57 @@ export class InboxService {
     }
 
     // Channels filter (multi-select chip row in the filter popover). Each
-    // channel maps to one or more `modelable_type` patterns.
+    // channel maps to one or more `modelable_type` patterns. WhatsApp can be
+    // additionally scoped to specific phone numbers for per-number ISOLATION —
+    // when the client sends `wa_number_ids`, only those numbers' chats are
+    // listed (a workspace with 2+ numbers can view one number in isolation).
+    // Mirrors replyagent's per-instance scoping (`{column:'wa_number_id', channel_id}`).
+    const waNumberIds: bigint[] = Array.isArray(filters.wa_number_ids)
+      ? (filters.wa_number_ids
+          .map((n: any) => { try { return BigInt(n); } catch { return null; } })
+          .filter(Boolean) as bigint[])
+      : [];
+
+    // Resolve the set of wa_chat ids owned by the selected numbers (once).
+    // A number with zero chats yields an impossible id so it stays isolated
+    // (never falls back to showing every number's chats).
+    const scopedWaChatIds = async (): Promise<bigint[]> => {
+      const rows = await this.prisma.wa_chats.findMany({
+        where: { wa_number_id: { in: waNumberIds } },
+        select: { id: true },
+      });
+      const ids = rows.map((r) => r.id);
+      return ids.length ? ids : [BigInt(-1)];
+    };
+
     if (Array.isArray(channel_types) && channel_types.length > 0) {
-      const modelablePatterns: string[] = [];
+      const channelOr: any[] = [];
       for (const c of channel_types) {
         const lc = String(c).toLowerCase();
-        if (lc === 'whatsapp') modelablePatterns.push('WhatsappChat');
-        else if (lc === 'zapi') modelablePatterns.push('ZapiChat');
-        else if (lc === 'telegram') modelablePatterns.push('TelegramChat');
-        else if (lc === 'messenger' || lc === 'fb' || lc === 'facebook')
-          modelablePatterns.push('FbChat', 'FacebookChat');
-        else if (lc === 'instagram') modelablePatterns.push('InstaChat', 'InstagramChat');
-        else if (lc === 'sms') modelablePatterns.push('TwilioChat');
-        else if (lc === 'webchat') modelablePatterns.push('WcChat', 'WebchatChat');
+        if (lc === 'whatsapp') {
+          if (waNumberIds.length) {
+            const ids = await scopedWaChatIds();
+            channelOr.push({ modelable_type: { contains: 'WhatsappChat' }, modelable_id: { in: ids } });
+          } else {
+            channelOr.push({ modelable_type: { contains: 'WhatsappChat' } });
+          }
+        } else if (lc === 'zapi') channelOr.push({ modelable_type: { contains: 'ZapiChat' } });
+        else if (lc === 'telegram') channelOr.push({ modelable_type: { contains: 'TelegramChat' } });
+        else if (lc === 'messenger' || lc === 'fb' || lc === 'facebook') {
+          channelOr.push({ modelable_type: { contains: 'FbChat' } }, { modelable_type: { contains: 'FacebookChat' } });
+        } else if (lc === 'instagram') {
+          channelOr.push({ modelable_type: { contains: 'InstaChat' } }, { modelable_type: { contains: 'InstagramChat' } });
+        } else if (lc === 'sms') channelOr.push({ modelable_type: { contains: 'TwilioChat' } });
+        else if (lc === 'webchat') {
+          channelOr.push({ modelable_type: { contains: 'WcChat' } }, { modelable_type: { contains: 'WebchatChat' } });
+        }
       }
-      if (modelablePatterns.length) {
-        where.OR = modelablePatterns.map((p) => ({
-          modelable_type: { contains: p },
-        }));
-      }
+      if (channelOr.length) where.OR = channelOr;
+    } else if (waNumberIds.length) {
+      // Number filter supplied without an explicit channel selection → scope to
+      // WhatsApp implicitly (the number filter only applies to WhatsApp).
+      const ids = await scopedWaChatIds();
+      where.OR = [{ modelable_type: { contains: 'WhatsappChat' }, modelable_id: { in: ids } }];
     }
 
     // Mode-based filtering
@@ -429,6 +461,17 @@ export class InboxService {
     }
     const contactIdArr = Array.from(allContactIds);
 
+    // WhatsApp per-row badge data (M19 / replyagent WhatsappChatResource): the
+    // owning number label (verified_name + display_phone_number) and has_opted_in.
+    // Named distinctly from the filter-scoping `waNumberIds` above (that one is
+    // the user's requested number FILTER; this is the set of numbers actually
+    // present on this page's chats) — reusing the name shadowed the filter
+    // variable and crashed the whole module at require-time (duplicate const
+    // in the same function scope).
+    const pageWaNumberIds = Array.from(
+      new Set((waChats as any[]).map((c: any) => c.wa_number_id).filter((v: any) => v != null)),
+    ) as bigint[];
+
     // Which channel types appear in this page (for mobile-number lookup)
     const neededChannels = new Set<string>();
     for (const inv of dedupedInboxes) {
@@ -445,7 +488,7 @@ export class InboxService {
       .filter((inv: any) => inv.modelable_type && inv.modelable_id)
       .map((inv: any) => ({ chatable_type: inv.modelable_type as string, chatable_id: inv.modelable_id as bigint }));
 
-    const [allContacts, allUsers, allFolders, allLastMsgs, allMobiles] = await Promise.all([
+    const [allContacts, allUsers, allFolders, allLastMsgs, allMobiles, waNumbers, waOpts] = await Promise.all([
       contactIdArr.length
         ? this.prisma.contacts.findMany({ where: { id: { in: contactIdArr } } })
         : Promise.resolve([]),
@@ -474,7 +517,33 @@ export class InboxService {
             orderBy: { is_primary: 'desc' },
           })
         : Promise.resolve([]),
+      // WhatsApp number labels for the page's chats.
+      pageWaNumberIds.length
+        ? this.prisma.wa_phone_numbers.findMany({
+            where: { id: { in: pageWaNumberIds } },
+            select: { id: true, verified_name: true, display_phone_number: true },
+          })
+        : Promise.resolve([]),
+      // has_opted_in per (wa_number_id, contact_id) — ChannelOpt existence
+      // (replyagent WhatsappChat::getHasOptedInAttribute). `channel` filter avoids
+      // the flaky backslash morph-string comparison.
+      pageWaNumberIds.length && contactIdArr.length
+        ? this.prisma.channel_opts.findMany({
+            where: { channel: 'whatsapp', modelable_id: { in: pageWaNumberIds }, contact_id: { in: contactIdArr } },
+            select: { modelable_id: true, contact_id: true },
+          })
+        : Promise.resolve([]),
     ]);
+
+    const waNumberMap = new Map(
+      (waNumbers as any[]).map((n: any) => [
+        String(n.id),
+        { name: n.verified_name ?? null, phone_number: n.display_phone_number ?? null },
+      ]),
+    );
+    const optedInSet = new Set(
+      (waOpts as any[]).map((o: any) => `${String(o.modelable_id)}:${String(o.contact_id)}`),
+    );
 
     const contactMap = new Map((allContacts as any[]).map((c: any) => [String(c.id), c]));
     const userMap    = new Map((allUsers    as any[]).map((u: any) => [String(u.id), u]));
@@ -518,6 +587,22 @@ export class InboxService {
             if (mobile) item.contacts.mobile_number = mobile;
           }
         }
+      }
+
+      // WhatsApp per-row badge fields (M19 / replyagent WhatsappChatResource):
+      // profile_name, wa_id, wa_account_id, the owning number label (phoneNumber),
+      // and has_opted_in. Lets the FE render per-row channel/number badges without
+      // hitting the detail endpoint. (replyagent has NO `interactions` count — omitted.)
+      if (channelType === 'whatsapp' && chat) {
+        item.profile_name = chat.profile_name ?? null;
+        item.wa_id = chat.wa_id ?? null;
+        item.wa_account_id = chat.wa_account_id != null ? String(chat.wa_account_id) : null;
+        item.phoneNumber = chat.wa_number_id ? (waNumberMap.get(String(chat.wa_number_id)) ?? null) : null;
+        item.has_opted_in = !!(
+          chat.wa_number_id &&
+          chat.contact_id &&
+          optedInSet.has(`${String(chat.wa_number_id)}:${String(chat.contact_id)}`)
+        );
       }
 
       const lastMsg = lastMsgMap.get(`${mType}:${String(inbox.modelable_id)}`);
@@ -691,6 +776,51 @@ export class InboxService {
     
     // Base where clause for counts
     const baseWhere: any = { workspace_id: workspaceId };
+
+    // Channel + per-number scoping so the tab badges match the filtered list
+    // (e.g. when a single WhatsApp number is selected, badges show that number's
+    // totals — not the workspace-wide totals). Mirrors the list's channel filter.
+    {
+      const channelTypes: any[] = Array.isArray(filters.channel_types) ? filters.channel_types : [];
+      const waNumberIds: bigint[] = Array.isArray(filters.wa_number_ids)
+        ? (filters.wa_number_ids
+            .map((n: any) => { try { return BigInt(n); } catch { return null; } })
+            .filter(Boolean) as bigint[])
+        : [];
+      const scopedWaChatIds = async (): Promise<bigint[]> => {
+        const rows = await this.prisma.wa_chats.findMany({
+          where: { wa_number_id: { in: waNumberIds } },
+          select: { id: true },
+        });
+        const ids = rows.map((r) => r.id);
+        return ids.length ? ids : [BigInt(-1)];
+      };
+      let channelOr: any[] = [];
+      if (channelTypes.length > 0) {
+        for (const c of channelTypes) {
+          const lc = String(c).toLowerCase();
+          if (lc === 'whatsapp') {
+            if (waNumberIds.length) {
+              const ids = await scopedWaChatIds();
+              channelOr.push({ modelable_type: { contains: 'WhatsappChat' }, modelable_id: { in: ids } });
+            } else channelOr.push({ modelable_type: { contains: 'WhatsappChat' } });
+          } else if (lc === 'zapi') channelOr.push({ modelable_type: { contains: 'ZapiChat' } });
+          else if (lc === 'telegram') channelOr.push({ modelable_type: { contains: 'TelegramChat' } });
+          else if (lc === 'messenger' || lc === 'fb' || lc === 'facebook') {
+            channelOr.push({ modelable_type: { contains: 'FbChat' } }, { modelable_type: { contains: 'FacebookChat' } });
+          } else if (lc === 'instagram') {
+            channelOr.push({ modelable_type: { contains: 'InstaChat' } }, { modelable_type: { contains: 'InstagramChat' } });
+          } else if (lc === 'sms') channelOr.push({ modelable_type: { contains: 'TwilioChat' } });
+          else if (lc === 'webchat') {
+            channelOr.push({ modelable_type: { contains: 'WcChat' } }, { modelable_type: { contains: 'WebchatChat' } });
+          }
+        }
+      } else if (waNumberIds.length) {
+        const ids = await scopedWaChatIds();
+        channelOr.push({ modelable_type: { contains: 'WhatsappChat' }, modelable_id: { in: ids } });
+      }
+      if (channelOr.length) baseWhere.OR = channelOr;
+    }
 
     // Function to get count for a specific set of conditions
     const getCount = async (additionalWhere: any) => {
@@ -945,6 +1075,26 @@ export class InboxService {
             }
           } catch {}
         }
+        // WhatsApp inbound/echo media — replyagent stores it as a media_gallery
+        // row linked via gallery_media_id (not the `files` column). Build
+        // parsed_files from the gallery row with re-signed S3 URLs + thumbnail.
+        if (!item.parsed_files && item.gallery_media) {
+          const g: any = item.gallery_media;
+          const url = g.file_path ? (await this.getCachedSignedUrl(g.file_path)) || g.file_url : g.file_url;
+          const thumb = g.thumb_200_path
+            ? (await this.getCachedSignedUrl(g.thumb_200_path)) || g.thumb_200
+            : (g.thumb_200 ?? null);
+          if (url) {
+            item.parsed_files = [{
+              url,
+              thumb: thumb || null,
+              name: g.object_name ?? 'attachment',
+              size: Number(g.file_size ?? 0),
+              mime: g.mime_type ?? 'application/octet-stream',
+              media_type: g.media_type,
+            }];
+          }
+        }
         // Instagram inbound/echo: payload has [{type, media:{fileUrl(direct S3 URL),...}}]
         if (!item.parsed_files && item.payload && typeof item.payload === 'string' && item.insta_chat_id) {
           try {
@@ -998,6 +1148,78 @@ export class InboxService {
       }
     }
 
+    // ── Reply previews — resolve each message's `reply_to` → a compact preview of
+    //    the quoted message, so the "replying to" bubble persists across reloads
+    //    (not just at compose time). Mirrors replyagent WhatsappMessageResource
+    //    `reply` (belongsTo WhatsappMessage via reply_to, with galleryMedia). ──
+    if (type.includes('whatsapp')) {
+      const replyIds = Array.from(
+        new Set(
+          enrichedMessages
+            .filter((m: any) => m.reply_to)
+            .map((m: any) => {
+              try { return BigInt(m.reply_to); } catch { return null; }
+            })
+            .filter(Boolean) as bigint[],
+        ),
+      );
+      if (replyIds.length) {
+        const repliedRows = await this.prisma.wa_messages.findMany({ where: { id: { in: replyIds } } });
+        // Batch-load gallery media for any quoted media messages.
+        const rGalleryIds = repliedRows
+          .filter((r: any) => r.gallery_media_id)
+          .map((r: any) => {
+            try {
+              return typeof r.gallery_media_id === 'string'
+                ? BigInt((r.gallery_media_id as string).split(',')[0])
+                : BigInt(r.gallery_media_id);
+            } catch { return null; }
+          })
+          .filter(Boolean) as bigint[];
+        const rGalleryMap = new Map<string, any>();
+        if (rGalleryIds.length) {
+          const gis = await this.prisma.media_gallery.findMany({ where: { id: { in: rGalleryIds } } });
+          for (const gi of gis) rGalleryMap.set(String(gi.id), gi);
+        }
+        const replyMap = new Map<string, any>();
+        for (const r of repliedRows) {
+          const ri: any = r;
+          let parsed: any = null;
+          if (ri.files && typeof ri.files === 'string') {
+            try {
+              const raw = JSON.parse(ri.files);
+              if (Array.isArray(raw) && raw.length) {
+                const f = raw[0];
+                const url = f.s3Key ? (await this.getCachedSignedUrl(f.s3Key)) || f.url : f.url;
+                parsed = [{ ...f, url }];
+              }
+            } catch {}
+          }
+          let gallery: any = null;
+          if (ri.gallery_media_id) {
+            try {
+              const gid = typeof ri.gallery_media_id === 'string'
+                ? BigInt((ri.gallery_media_id as string).split(',')[0])
+                : BigInt(ri.gallery_media_id);
+              gallery = rGalleryMap.get(String(gid)) ?? null;
+            } catch {}
+          }
+          replyMap.set(String(ri.id), {
+            id: ri.id?.toString?.() ?? String(ri.id),
+            text: ri.text ?? null,
+            type: ri.type ?? 'text',
+            direction: ri.direction ?? null,
+            sender_id: ri.sender_id?.toString?.() ?? null,
+            parsed_files: parsed,
+            gallery_media: gallery,
+          });
+        }
+        for (const m of enrichedMessages) {
+          if ((m as any).reply_to) (m as any).reply = replyMap.get(String((m as any).reply_to)) ?? null;
+        }
+      }
+    }
+
     // ── Template previews — resolve type='template' messages to their wa_template
     //    structure (header/body/footer/buttons) so the thread can render a card. ──
     const templateMsgs = enrichedMessages.filter((m: any) => m.type === 'template');
@@ -1011,14 +1233,19 @@ export class InboxService {
         } catch {}
       }
       if (names.size) {
+        // wa_templates.wa_account_id is a VARCHAR, but it holds the INTERNAL
+        // wa_accounts.id as a string — that is what waba.service writes on sync
+        // and create, and it is what the replyagent dump contains. Matching on
+        // waba_id (the Meta id) silently returned zero rows, so template message
+        // bubbles never received their components and rendered as a bare name.
         const accounts = await this.prisma.wa_accounts.findMany({
           where: { workspace_id: inbox.workspace_id },
-          select: { waba_id: true },
+          select: { id: true },
         });
-        const wabaIds = accounts.map((a) => a.waba_id);
-        const tpls = wabaIds.length
+        const accountKeys = accounts.map((a) => a.id.toString());
+        const tpls = accountKeys.length
           ? await this.prisma.wa_templates.findMany({
-              where: { wa_account_id: { in: wabaIds }, name: { in: Array.from(names) } },
+              where: { wa_account_id: { in: accountKeys }, name: { in: Array.from(names) } },
             })
           : [];
         const tplMap = new Map(tpls.map((t) => [t.name, t]));
@@ -1158,14 +1385,40 @@ export class InboxService {
     const isNote = composeMode === 'note';
 
     // Reply-to context: when the agent used the reply-arrow on a specific
-    // earlier message, the bubble id comes through here. We persist it as the
-    // outgoing row's `replied_to_message_id` so the thread can render the
-    // quoted-reply preview client-side, and so the customer sees the same
-    // quoted reply on their end (WhatsApp `context.message_id`).
+    // earlier message, the bubble id comes through here. We persist it on the
+    // outgoing row's `reply_to` column so the thread can render the quoted-reply
+    // preview client-side, and so the customer sees the same quoted reply on
+    // their end (WhatsApp `context.message_id`).
     const replyToMessageId = data.reply_to_message_id ? Number(data.reply_to_message_id) : null;
 
+    // Template send (replyagent message_template): the composer posts
+    // { wa_template_id, type:'template' } with no free text. Detected here so the
+    // empty-body guard below doesn't reject it.
+    const waTemplateId = data.wa_template_id ?? null;
+    const isTemplateSend = String(data.type ?? '').toLowerCase() === 'template' || !!waTemplateId;
+
+    // Location + GIF sends (replyagent WhatsappHelper::sendLocationMessage /
+    // sendGifMessage). The composer posts { type:'location', location:<JSON> } or
+    // { type:'gif', gif:<JSON {mp4,webp}> } with no free text — detected here so
+    // the empty-body guard doesn't reject them.
+    const msgSendType = String(data.type ?? '').toLowerCase();
+    const isLocationSend = msgSendType === 'location';
+    const isGifSend = msgSendType === 'gif';
+    let locationObj: any = null;
+    if (isLocationSend) {
+      try { locationObj = typeof data.location === 'string' ? JSON.parse(data.location) : data.location; } catch {}
+      if (!locationObj || locationObj.latitude == null || locationObj.longitude == null) {
+        throw new BadRequestException('location requires latitude and longitude');
+      }
+    }
+    let gifObj: any = null;
+    if (isGifSend) {
+      try { gifObj = typeof data.gif === 'string' ? JSON.parse(data.gif) : data.gif; } catch {}
+      if (!gifObj || !gifObj.mp4) throw new BadRequestException('gif requires an mp4 url');
+    }
+
     this.logger.log(
-      `Processing outgoing message for inbox ${inboxId} (Type: ${type}, ID: ${modelableId}, mode=${composeMode}${replyToMessageId ? `, reply_to=${replyToMessageId}` : ''})`,
+      `Processing outgoing message for inbox ${inboxId} (Type: ${type}, ID: ${modelableId}, mode=${composeMode}${replyToMessageId ? `, reply_to=${replyToMessageId}` : ''}${isTemplateSend ? ', template' : ''})`,
     );
 
     // Upload any attached files to S3 and build URL list for the message payload.
@@ -1223,7 +1476,7 @@ export class InboxService {
       uploadedFileUrls.push(...uploadResults);
     }
 
-    if (!String(text).trim() && uploadedFileUrls.length === 0) {
+    if (!String(text).trim() && uploadedFileUrls.length === 0 && !isTemplateSend && !isLocationSend && !isGifSend) {
       throw new BadRequestException('Message body is empty — provide message_text/text or attach a file');
     }
 
@@ -1276,18 +1529,66 @@ export class InboxService {
             : 'document')
           : 'text';
 
+        // Resolve a template send: build the Meta template payload (name +
+        // language + optional body params) and a readable preview for the bubble.
+        let templatePayload: any = null;
+        let templatePreview: string | null = null;
+        if (isTemplateSend) {
+          const tpl = waTemplateId
+            ? await this.prisma.wa_templates.findFirst({ where: { id: BigInt(waTemplateId) } })
+            : null;
+          if (!tpl) throw new BadRequestException('WhatsApp template not found');
+          const params: string[] = Array.isArray(data.templateParams)
+            ? data.templateParams.map((v: any) => String(v ?? ''))
+            : [];
+          templatePayload = { name: tpl.name, language: { code: tpl.language || 'en' } };
+          if (params.length > 0) {
+            templatePayload.components = [
+              { type: 'body', parameters: params.map((t) => ({ type: 'text', text: t })) },
+            ];
+          }
+          // Preview = the template's BODY text with {{n}} filled from params.
+          let bodyText = tpl.name;
+          try {
+            const comps = JSON.parse(tpl.components ?? '[]');
+            const body = Array.isArray(comps)
+              ? comps.find((c: any) => String(c.type).toUpperCase() === 'BODY')
+              : null;
+            if (body?.text) {
+              bodyText = String(body.text);
+              params.forEach((p, i) => {
+                bodyText = bodyText.replace(new RegExp(`\\{\\{${i + 1}\\}\\}`, 'g'), p);
+              });
+            }
+          } catch {}
+          templatePreview = bodyText;
+        }
+
         savedMessage = await this.prisma.wa_messages.create({
           data: {
             wa_chat_id: modelableId,
             wa_number_id: chat.wa_number_id,
             sender_id: userId,
-            text: text || null,
+            // replyagent local store: location→text=address, gif→text=webp preview.
+            text: isTemplateSend ? templatePreview
+              : isLocationSend ? (locationObj.address ?? null)
+              : isGifSend ? (gifObj.webp ?? null)
+              : (text || null),
             direction: 'OUTGOING',
-            type: isNote ? 'note' : (hasFiles ? fileType : 'text'),
+            // Local type: location→'location', gif→'image_url' (replyagent).
+            type: isNote ? 'note'
+              : isTemplateSend ? 'message_template'
+              : isLocationSend ? 'location'
+              : isGifSend ? 'image_url'
+              : (hasFiles ? fileType : 'text'),
             mobile_number: chat.wa_id || '',
             status: isNote ? 'sent' : 'pending',
+            ...(isTemplateSend && waTemplateId ? { wa_template_id: BigInt(waTemplateId) } : {}),
             ...(hasFiles ? { files: JSON.stringify(uploadedFileUrls) } : {}),
-            ...(replyToMessageId ? { replied_to_message_id: replyToMessageId as any } : {}),
+            // lat/lng/name/address (location) or full gif object → `data` column.
+            ...(isLocationSend ? { data: JSON.stringify(locationObj) } : {}),
+            ...(isGifSend ? { data: JSON.stringify(gifObj) } : {}),
+            ...(replyToMessageId ? { reply_to: BigInt(replyToMessageId) } : {}),
             created_at: sentAt,
             updated_at: sentAt,
           } as any,
@@ -1328,7 +1629,34 @@ export class InboxService {
 
         // Build waContext first (may involve one DB lookup for reply-to)
         const waContext: any = { messaging_product: 'whatsapp', to: chat.wa_id };
-        if (hasFiles) {
+
+        // Reply-to context (Meta `context.message_id`) applies to EVERY message
+        // type, not just text — mirror replyagent prepareMessage which sets
+        // `context` on the base payload before branching (WhatsappHelper.php:578-583).
+        // Previously this only ran in the text branch, so media replies lost the
+        // "replying to" quote in the customer's WhatsApp.
+        if (replyToMessageId) {
+          try {
+            const repliedTo = await this.prisma.wa_messages.findUnique({
+              where: { id: BigInt(replyToMessageId) },
+              select: { wamid: true } as any,
+            });
+            if ((repliedTo as any)?.wamid) waContext.context = { message_id: (repliedTo as any).wamid };
+          } catch {}
+        }
+
+        if (isTemplateSend) {
+          waContext.type = 'template';
+          waContext.template = templatePayload;
+        } else if (isLocationSend) {
+          // Cloud API location message — forward the object verbatim (replyagent).
+          waContext.type = 'location';
+          waContext.location = locationObj;
+        } else if (isGifSend) {
+          // Cloud API: a GIF goes out as a `video` with the mp4 link (replyagent).
+          waContext.type = 'video';
+          waContext.video = { link: gifObj.mp4 };
+        } else if (hasFiles) {
           const mediaUrl = uploadedFileUrls[0].url;
           waContext.type = fileType;
           if (fileType === 'image') waContext.image = { link: mediaUrl };
@@ -1339,15 +1667,6 @@ export class InboxService {
         } else {
           waContext.type = 'text';
           waContext.text = { body: text };
-          if (replyToMessageId) {
-            try {
-              const repliedTo = await this.prisma.wa_messages.findUnique({
-                where: { id: BigInt(replyToMessageId) },
-                select: { wamid: true } as any,
-              });
-              if ((repliedTo as any)?.wamid) waContext.context = { message_id: (repliedTo as any).wamid };
-            } catch {}
-          }
         }
 
         // Publish to RabbitMQ — fire-and-forget, mark failed on error
@@ -2648,10 +2967,13 @@ export class InboxService {
       where: { id: inboxId, workspace_id: workspaceId },
     });
     if (!inbox) throw new NotFoundException('Inbox not found');
-    if (inbox.is_read === 1) return { success: true, already_read: true };
+    // Opening a conversation clears BOTH the unread flag AND the transfer/assign
+    // flag (replyagent getChatMessages:708 `['is_read'=>true, 'is_assigned'=>false]`,
+    // unconditional). Skip only when there is genuinely nothing to change.
+    if (inbox.is_read === 1 && inbox.is_assigned === 0) return { success: true, already_read: true };
     await this.prisma.inbox.update({
       where: { id: inboxId },
-      data: { is_read: 1 },
+      data: { is_read: 1, is_assigned: 0 },
     });
     this.chatGateway.emitToWorkspace(workspaceId, 'inbox_read', {
       inbox_id: inboxId.toString(),
