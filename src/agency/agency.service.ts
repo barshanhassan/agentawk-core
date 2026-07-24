@@ -8,6 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ChargebeeService } from '../billing/chargebee.service';
 import { DomainsService } from '../domains/domains.service';
 import { S3Service } from '../s3/s3.service';
+import { MailerService } from '../mail/mailer.service';
 import * as bcrypt from 'bcrypt';
 
 // Date-only strings (YYYY-MM-DD) need explicit start/end-of-day so a request
@@ -32,6 +33,7 @@ export class AgencyService {
     private readonly chargebee: ChargebeeService,
     private readonly domainsService: DomainsService,
     private readonly s3: S3Service,
+    private readonly mailer: MailerService,
   ) { }
 
   /** If the value looks like an S3 key (no scheme), return a 1h signed URL; otherwise pass-through. */
@@ -498,6 +500,11 @@ export class AgencyService {
       //    can later log in at the workspace's subdomain (login flow filters by
       //    modelable_id + modelable_type matching the host's site_domain).
       //    Pattern mirrors gateway: separate user row, agency_user_id cross-links back.
+      //    PENDING + no password — the agent gets an invite email (sent after the
+      //    transaction commits, see below) and sets their own password for THIS
+      //    workspace login via the existing accept-invitation flow, instead of
+      //    silently reusing their agency-level password hash.
+      let inviteUser: { id: bigint; email: string } | null = null;
       if (data.agent_id) {
         const agentId = BigInt(data.agent_id);
         const agencyUser = await tx.users.findFirst({
@@ -517,25 +524,26 @@ export class AgencyService {
             },
           });
           if (!existing) {
-            await tx.users.create({
+            const created = await tx.users.create({
               data: {
                 first_name: agencyUser.first_name,
                 last_name: agencyUser.last_name,
                 full_name: agencyUser.full_name,
                 email: agencyUser.email,
-                password: agencyUser.password,
+                password: '',
                 modelable_type: 'App\\Models\\Workspace',
                 modelable_id: ws.id,
                 agency_user_id: agencyUser.id,
                 is_owner: true,
                 locale: agencyUser.locale,
                 timezone: agencyUser.timezone,
-                status: 'ACTIVE',
+                status: 'PENDING',
                 creator_id: creatorId,
                 created_at: new Date(),
                 updated_at: new Date(),
               },
             });
+            inviteUser = { id: created.id, email: created.email };
           }
         }
       }
@@ -562,23 +570,43 @@ export class AgencyService {
         }
       }
 
-      return ws;
+      return { ws, inviteUser };
     });
 
     // 3. Domain creation
     await this.domainsService.addCustomDomain(
-      workspace.id,
+      workspace.ws.id,
       'WORKSPACE',
       data.slug,
-      process.env.ACCOUNTS_DOMAIN || 'ezconn.io',
+      process.env.ACCOUNTS_DOMAIN || 'agentawk.com',
       creatorId,
     );
 
-    await this.logAgencyEvent(agencyId, 'workspace_created', creatorId, 'App\\Models\\Workspace', workspace.id, {
-      workspace_name: workspace.name,
+    if (workspace.inviteUser) {
+      const invitationId = Buffer.from(workspace.inviteUser.id.toString()).toString('base64');
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+      const inviteLink = `${frontendUrl}/accept-invitation?invitation_id=${invitationId}`;
+      this.mailer
+        .sendMail({
+          to: workspace.inviteUser.email,
+          subject: `Set your password for ${workspace.ws.name}`,
+          html: `
+            <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
+              <h2 style="color:#4f46e5">You've been assigned a workspace</h2>
+              <p>Click below to set your password and log in to <b>${workspace.ws.name}</b>.</p>
+              <p style="text-align:center"><a href="${inviteLink}" style="display:inline-block;background:#4f46e5;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Set password</a></p>
+              <p style="color:#888;font-size:12px">If the button doesn't work, copy this link: ${inviteLink}</p>
+            </div>`,
+          text: `You've been assigned to workspace "${workspace.ws.name}". Set your password: ${inviteLink}`,
+        })
+        .catch((err) => this.logger.warn(`Failed to send workspace invite email to ${workspace.inviteUser?.email}: ${err?.message ?? err}`));
+    }
+
+    await this.logAgencyEvent(agencyId, 'workspace_created', creatorId, 'App\\Models\\Workspace', workspace.ws.id, {
+      workspace_name: workspace.ws.name,
     });
 
-    return { success: true, workspace: this.serialize(workspace) };
+    return { success: true, workspace: this.serialize(workspace.ws) };
   }
 
   async updateWorkspace(workspaceId: bigint, agencyId: bigint, data: any, actorId: bigint = 0n) {

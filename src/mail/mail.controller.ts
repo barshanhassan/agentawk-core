@@ -24,14 +24,14 @@ export class MailController {
     if (!to) throw new BadRequestException('Recipient "to" is required');
     return this.mailer.sendMail({
       to,
-      subject: 'EZCONN test email ✅',
+      subject: 'AGENTAWK test email ✅',
       html: `
         <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
-          <h2 style="color:#4f46e5">EZCONN email is working ✅</h2>
+          <h2 style="color:#4f46e5">AGENTAWK email is working ✅</h2>
           <p>This is a test message sent through your configured SMTP server.</p>
           <p style="color:#888;font-size:12px">If you received this, the mailer is set up correctly.</p>
         </div>`,
-      text: 'EZCONN email is working — this is a test message from your configured SMTP server.',
+      text: 'AGENTAWK email is working — this is a test message from your configured SMTP server.',
     });
   }
 }

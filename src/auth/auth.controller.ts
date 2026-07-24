@@ -3,6 +3,7 @@ import {
   Post,
   Body,
   Get,
+  Param,
   UseGuards,
   Request,
   Headers,
@@ -142,6 +143,26 @@ export class AuthController {
   @Post('register')
   async register(@Body() body: any) {
     return this.authService.register(body);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('workspaces/:id/login')
+  async loginToWorkspace(@Request() req: any, @Param('id') id: string) {
+    return this.authService.loginToWorkspace(
+      BigInt(req.user.sub),
+      BigInt(req.user.modelable_id),
+      BigInt(id),
+    );
+  }
+
+  @Post('verify-signup-otp')
+  async verifySignupOtp(@Body('email') email: string, @Body('code') code: string) {
+    return this.authService.verifySignupOtp(email, code);
+  }
+
+  @Post('resend-signup-otp')
+  async resendSignupOtp(@Body('email') email: string) {
+    return this.authService.resendSignupOtp(email);
   }
 
   @Get('init-registration')
