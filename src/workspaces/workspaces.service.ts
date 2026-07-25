@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
+import { MailerService } from '../mail/mailer.service';
 
 @Injectable()
 export class WorkspacesService {
@@ -15,6 +16,7 @@ export class WorkspacesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly s3: S3Service,
+    private readonly mailer: MailerService,
   ) {}
 
   /** S3 key → 1h signed URL (pass-through for absolute URLs / empty). */
@@ -622,8 +624,12 @@ export class WorkspacesService {
         full_name: full_name || email.split('@')[0],
         modelable_id: workspaceId,
         modelable_type: 'App\\Models\\Workspace',
-        status: 'ACTIVE',
-        password: '', // Handled via invite link typically
+        // PENDING until they accept the invite email below and set their own
+        // password — matches AuthService.acceptInvitation's expectations
+        // (looks up `status: 'PENDING'`), and login() only ever matches
+        // status: 'ACTIVE', so this account can't log in until then.
+        status: 'PENDING',
+        password: '',
         creator_id: creatorId,
         active_workspace_id: workspaceId,
         locale: locale || 'en-US',
@@ -669,6 +675,26 @@ export class WorkspacesService {
     } catch (err: any) {
       this.logger.warn(`Failed to save access scopes: ${err?.message ?? err}`);
     }
+
+    // Invite email — invitation_id is base64(userId), matching what
+    // AuthService.validateInvitation/acceptInvitation already expect.
+    const invitationId = Buffer.from(user.id.toString()).toString('base64');
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const inviteLink = `${frontendUrl}/accept-invitation?invitation_id=${invitationId}`;
+    this.mailer
+      .sendMail({
+        to: email,
+        subject: "You've been invited to join a workspace on AGENTAWK",
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
+            <h2 style="color:#4f46e5">You're invited</h2>
+            <p>You've been added as a team member. Click below to set your password and get started.</p>
+            <p style="text-align:center"><a href="${inviteLink}" style="display:inline-block;background:#4f46e5;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Accept invitation</a></p>
+            <p style="color:#888;font-size:12px">If the button doesn't work, copy this link: ${inviteLink}</p>
+          </div>`,
+        text: `You've been invited to join a workspace. Accept your invitation and set your password: ${inviteLink}`,
+      })
+      .catch((err) => this.logger.warn(`Failed to send invite email to ${email}: ${err?.message ?? err}`));
 
     return user;
   }

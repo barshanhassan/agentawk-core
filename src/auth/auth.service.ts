@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
+import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mail/mailer.service';
 import { generateSecret, verify, generateURI } from 'otplib';
@@ -35,6 +36,16 @@ export class AuthService {
         hostname.includes('run.app'));
     const useTenantScope =
       !isCentral && !!domainInfo?.modelable_id && !!domainInfo?.modelable_type;
+
+    // Neither a recognized dev/central host nor a registered tenant subdomain
+    // (e.g. the public app.agentawk.com / agentawk.com marketing host) — refuse
+    // rather than silently falling back to an unscoped, email-only lookup that
+    // would let any account log in from a host that isn't theirs.
+    if (!isCentral && !useTenantScope) {
+      throw new UnauthorizedException(
+        'Please log in using your workspace login URL — the link emailed to you when your account was created.',
+      );
+    }
 
     const baseWhere: any = { email: userDto.email, status: 'ACTIVE' };
     if (useTenantScope) {
@@ -163,22 +174,131 @@ export class AuthService {
     };
   }
 
-  async register(userDto: any) {
-    // Validation logic
-    if (userDto.password !== userDto.re_password) {
-      throw new BadRequestException('Passwords do not match');
+  /**
+   * Signup email OTP — 4-digit numeric code stored in `otp_codes` (key=email),
+   * mirroring the replyagent-backend OtpCode::getCode pattern this was modeled on.
+   */
+  private async sendSignupOtp(email: string): Promise<{ sent: boolean; debugCode?: string }> {
+    const code = Math.floor(1000 + Math.random() * 9000).toString();
+    const expiry = new Date(Date.now() + 15 * 60 * 1000);
+
+    // No unique constraint on `key` — clear any previous code first so
+    // verifySignupOtp always matches against the latest one sent.
+    await this.prisma.otp_codes.deleteMany({ where: { key: email } });
+    await this.prisma.otp_codes.create({ data: { key: email, code, expiry } });
+
+    const mailResult = await this.mailer.sendMail({
+      to: email,
+      subject: 'Verify your AGENTAWK account',
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
+          <h2 style="color:#4f46e5">Welcome to AGENTAWK</h2>
+          <p>Use the code below to verify your email and activate your account. It is valid for 15 minutes.</p>
+          <p style="font-size:32px;font-weight:bold;letter-spacing:10px;background:#f3f4f6;padding:14px 20px;border-radius:10px;text-align:center">${code}</p>
+          <p style="color:#888;font-size:12px">If you didn't create an AGENTAWK account, you can ignore this email.</p>
+        </div>`,
+      text: `Your AGENTAWK verification code is: ${code}`,
+    });
+
+    return { sent: mailResult.sent, debugCode: code };
+  }
+
+  /**
+   * "Login" button on an Agency Manager's workspace card — issues a fresh
+   * workspace-scoped token for the CURRENTLY authenticated agency manager,
+   * without asking for a password again.
+   *
+   * Security: workspaces sharing the same name ("Default Workspace") across
+   * different agencies must never be confused — this always resolves by the
+   * numeric workspaceId and hard-checks workspace.agency_id against the
+   * caller's own agency (modelable_id from their JWT), never by name.
+   */
+  async loginToWorkspace(agencyUserId: bigint, agencyModelableId: bigint, workspaceId: bigint) {
+    const workspace = await this.prisma.workspaces.findUnique({
+      where: { id: workspaceId },
+      select: { id: true, agency_id: true, name: true, status: true },
+    });
+    if (!workspace) throw new BadRequestException('Workspace not found');
+
+    // Tenant check — this agency manager may only enter workspaces that
+    // belong to THEIR OWN agency, regardless of workspace name collisions.
+    if (workspace.agency_id !== agencyModelableId) {
+      throw new UnauthorizedException('This workspace does not belong to your agency');
+    }
+    if (workspace.status !== 'ACTIVE') {
+      throw new BadRequestException('Workspace is not active');
     }
 
+    const agencyUser = await this.prisma.users.findUnique({ where: { id: agencyUserId } });
+    if (!agencyUser) throw new UnauthorizedException('Invalid session');
+
+    const workspaceUser = await this.prisma.users.findFirst({
+      where: {
+        email: agencyUser.email,
+        modelable_type: 'App\\Models\\Workspace',
+        modelable_id: workspace.id,
+        status: 'ACTIVE',
+      },
+    });
+    if (!workspaceUser) {
+      throw new BadRequestException('No active login found for you in this workspace');
+    }
+
+    const permissions = await this.loadUserPermissions(workspaceUser.id, workspaceUser.is_owner);
+    const payload = {
+      email: workspaceUser.email,
+      sub: workspaceUser.id.toString(),
+      modelable_id: workspace.id.toString(),
+      modelable_type: 'App\\Models\\Workspace',
+      role: 'WORKSPACE',
+      tfa_enabled: workspaceUser.tfa_enabled,
+      is_owner: workspaceUser.is_owner,
+      workspace_id: workspace.id.toString(),
+      permissions,
+    };
+
+    return {
+      user: {
+        id: workspaceUser.id.toString(),
+        email: workspaceUser.email,
+        first_name: workspaceUser.first_name,
+        last_name: workspaceUser.last_name,
+        tfa_enabled: workspaceUser.tfa_enabled,
+        role: 'WORKSPACE',
+        is_owner: workspaceUser.is_owner,
+        modelable_id: workspace.id.toString(),
+        modelable_type: 'App\\Models\\Workspace',
+      },
+      token: this.jwtService.sign(payload, { expiresIn: '12h' }),
+      redirect_to: '/workspace',
+    };
+  }
+
+  async register(userDto: any) {
+    // No password field anymore — the user sets nothing at signup. A random
+    // password is generated and emailed (with the login URL + username) once
+    // they verify their email via sendSignupOtp/verifySignupOtp below.
     const emailExists = await this.prisma.users.findFirst({
       where: { email: userDto.email, modelable_type: 'App\\Models\\Agency' },
     });
 
-    if (emailExists) {
+    if (emailExists && emailExists.status === 'ACTIVE') {
       throw new BadRequestException('Email already taken');
     }
 
-    const saltOrRounds = 10;
-    const hashedPassword = await bcrypt.hash(userDto.password, saltOrRounds);
+    if (emailExists && emailExists.status === 'PENDING') {
+      // A previous signup never finished verification — resend a fresh code
+      // instead of creating a duplicate agency for the same email.
+      const resent = await this.sendSignupOtp(userDto.email);
+      return {
+        error: false,
+        message: 'Verification code resent',
+        error_code: 'OTP_RESENT',
+        email: userDto.email,
+        emailSent: resent.sent,
+        debugCode: resent.debugCode,
+      };
+    }
 
     const agencyName = userDto.agencyName || `${userDto.firstName}'s Agency`;
     const baseSlug = this.slugify(agencyName);
@@ -187,7 +307,7 @@ export class AuthService {
 
     // Transaction for all associated creation
     try {
-      return await this.prisma.$transaction(async (tx) => {
+      const result = await this.prisma.$transaction(async (tx) => {
         // 1. Create Agency
         const agency = await tx.agencies.create({
           data: {
@@ -227,8 +347,8 @@ export class AuthService {
             modelable_type: 'App\\Models\\Agency', // Can be workspace in other contexts
             modelable_id: agency.id,
             sub_domain: subdomain,
-            root_domain: process.env.ROOT_DOMAIN || 'ezconn.com',
-            domain: `${subdomain}.${process.env.ROOT_DOMAIN || 'ezconn.com'}`,
+            root_domain: process.env.ROOT_DOMAIN || 'agentawk.com',
+            domain: `${subdomain}.${process.env.ROOT_DOMAIN || 'agentawk.com'}`,
             active: true,
             is_default: true,
           },
@@ -255,11 +375,14 @@ export class AuthService {
             first_name: userDto.firstName,
             last_name: userDto.lastName,
             email: userDto.email,
-            password: hashedPassword,
+            // No password yet — generated + emailed once verifySignupOtp succeeds.
+            password: '',
             modelable_type: 'App\\Models\\Agency',
             modelable_id: agency.id,
             is_owner: true,
-            status: 'ACTIVE',
+            // PENDING until the signup email OTP is verified (see sendSignupOtp
+            // below) — login only ever matches status: 'ACTIVE' (see login()).
+            status: 'PENDING',
             creator_id: BigInt(0),
             locale: userDto.locale || 'en-US',
           },
@@ -277,20 +400,48 @@ export class AuthService {
           },
         });
 
+        // 7b. Matching workspace-scoped login for the same person (same email,
+        // same generated password as the agency user above once verified).
+        // PENDING like the agency user — verifySignupOtp activates both rows
+        // together on the same OTP.
+        await tx.users.create({
+          data: {
+            first_name: userDto.firstName,
+            last_name: userDto.lastName,
+            email: userDto.email,
+            password: '',
+            modelable_type: 'App\\Models\\Workspace',
+            modelable_id: workspace.id,
+            is_owner: true,
+            status: 'PENDING',
+            creator_id: newUser.id,
+            active_workspace_id: workspace.id,
+            locale: userDto.locale || 'en-US',
+          },
+        });
+
         // 8. Legal terms acceptance snippet
         // await tx.agency_accepted_terms.create(...)
 
-        return {
-          error: false,
-          message: 'Registration successful',
-          error_code: 'CREATED',
-          agency: {
-            id: agency.id.toString(),
-            name: agency.name,
-          },
-          redirect_url: `https://${domain.domain}/login`,
-        };
+        return { agency, domain };
       });
+
+      const otpResult = await this.sendSignupOtp(userDto.email);
+
+      return {
+        error: false,
+        message: 'Verification code sent to your email',
+        error_code: 'OTP_SENT',
+        agency: {
+          id: result.agency.id.toString(),
+          name: result.agency.name,
+        },
+        email: userDto.email,
+        emailSent: otpResult.sent,
+        // debugCode stays so dev/testing works even before SMTP is configured.
+        debugCode: otpResult.debugCode,
+        redirect_url: `https://${result.domain.domain}/login`,
+      };
     } catch (error) {
       console.error(error);
       throw new InternalServerErrorException(
@@ -537,20 +688,89 @@ export class AuthService {
   }
 
   async findAccount(email: string) {
-    // Find if user account exists on the platform
-    const user = await this.prisma.users.findFirst({
-      where: {
-        email,
-        modelable_type: 'App\\Models\\Agency',
-        status: 'ACTIVE',
-      },
+    // "Find my account" — used on the central app.agentawk.com host where the
+    // user has no tenant subdomain yet. We email every login URL tied to this
+    // address (the agency AND each workspace it belongs to). Anti-enumeration:
+    // we ALWAYS return the same success shape, so a caller can't probe which
+    // emails exist. The email is best-effort — sent only if rows are found.
+    const users = await this.prisma.users.findMany({
+      where: { email, status: 'ACTIVE' },
+      orderBy: { id: 'asc' },
     });
 
-    if (user) {
-      console.log(`Stub: SendAccountFound Email dispatched to ${email}`);
+    if (users.length) {
+      const links: { label: string; url: string }[] = [];
+      const seen = new Set<string>();
+
+      for (const u of users) {
+        // Each tenant's active/default domain (fall back to the latest row).
+        const domain = await this.prisma.domains.findFirst({
+          where: {
+            modelable_id: u.modelable_id,
+            modelable_type: u.modelable_type,
+          },
+          orderBy: [{ active: 'desc' }, { is_default: 'desc' }, { id: 'desc' }],
+        });
+        if (!domain?.domain) continue;
+
+        const isAgency = u.modelable_type.toLowerCase().includes('agency');
+        // Name is best-effort — a nice label in the email, not critical.
+        let name = isAgency ? 'Organization' : 'Workspace';
+        try {
+          if (isAgency) {
+            const a = await this.prisma.agencies.findUnique({
+              where: { id: u.modelable_id },
+            });
+            if (a?.name) name = a.name;
+          } else {
+            const w = await this.prisma.workspaces.findUnique({
+              where: { id: u.modelable_id },
+            });
+            if (w?.name) name = w.name;
+          }
+        } catch {
+          /* label falls back to the generic name above */
+        }
+
+        const url = `https://${domain.domain}/login`;
+        const key = url.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        links.push({
+          label: `${name} (${isAgency ? 'Organization' : 'Workspace'})`,
+          url,
+        });
+      }
+
+      if (links.length) {
+        const rows = links
+          .map(
+            (l) =>
+              `<tr><td style="padding:6px 10px;color:#666;font-size:13px">${l.label}</td><td style="padding:6px 10px;font-weight:bold"><a href="${l.url}">${l.url}</a></td></tr>`,
+          )
+          .join('');
+        const textLines = links.map((l) => `${l.label}: ${l.url}`).join('\n');
+        await this.mailer.sendMail({
+          to: email,
+          subject: 'Your AGENTAWK login links',
+          html: `
+        <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto">
+          <h2 style="color:#4f46e5">Find your account</h2>
+          <p>Here are the login links associated with <b>${email}</b>:</p>
+          <table style="width:100%;background:#f3f4f6;border-radius:10px;padding:16px;border-collapse:collapse">${rows}</table>
+          <p style="color:#888;font-size:12px">If you didn't request this, you can safely ignore this email.</p>
+        </div>`,
+          text: `Your AGENTAWK login links for ${email}:\n${textLines}`,
+        });
+      }
     }
 
-    return { success: true };
+    // Always identical — never reveal whether the email exists.
+    return {
+      success: true,
+      message:
+        "If an account exists for that email, we've sent its login links.",
+    };
   }
 
   async forgotPassword(email: string, domainInfo: any) {
@@ -606,6 +826,88 @@ export class AuthService {
       // debugCode stays so dev/testing works even before SMTP is configured.
       debugCode: code,
     };
+  }
+
+  async verifySignupOtp(email: string, code: string) {
+    const record = await this.prisma.otp_codes.findFirst({
+      where: { key: email },
+      orderBy: { id: 'desc' },
+    });
+
+    if (!record || record.code.trim() !== (code || '').trim() || record.expiry < new Date()) {
+      throw new BadRequestException('Invalid or expired code');
+    }
+
+    const user = await this.prisma.users.findFirst({
+      where: { email, modelable_type: 'App\\Models\\Agency', status: 'PENDING' },
+    });
+    if (!user) {
+      throw new BadRequestException('No pending signup found for this email');
+    }
+
+    // No password was set at signup — generate one now and email it (with the
+    // login URL + username) since this is the only time the user can learn it.
+    const generatedPassword = crypto
+      .randomBytes(9)
+      .toString('base64')
+      .replace(/[+/=]/g, '')
+      .slice(0, 12);
+    const hashedPassword = await bcrypt.hash(generatedPassword, 10);
+
+    // Activate every PENDING row for this email together, all sharing the same
+    // generated password — the agency owner login AND its matching Default
+    // Workspace login (see register()) are gated behind the same one-time OTP.
+    await this.prisma.users.updateMany({
+      where: { email, status: 'PENDING' },
+      data: { status: 'ACTIVE', email_verified_at: new Date(), password: hashedPassword },
+    });
+
+    // Single-use — clear it so the same code can't be replayed.
+    await this.prisma.otp_codes.deleteMany({ where: { key: email } });
+
+    const domain = await this.prisma.domains.findFirst({
+      where: { modelable_id: user.modelable_id, modelable_type: 'App\\Models\\Agency' },
+      orderBy: { id: 'desc' },
+    });
+    const loginUrl = domain ? `https://${domain.domain}/login` : (process.env.FRONTEND_URL || 'http://localhost:5173') + '/login';
+
+    const mailResult = await this.mailer.sendMail({
+      to: email,
+      subject: 'Your AGENTAWK login details',
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
+          <h2 style="color:#4f46e5">You're all set!</h2>
+          <p>Your email is verified and your account is ready. Here are your login details:</p>
+          <table style="width:100%;background:#f3f4f6;border-radius:10px;padding:16px;border-collapse:collapse">
+            <tr><td style="padding:6px 10px;color:#666;font-size:13px">URL</td><td style="padding:6px 10px;font-weight:bold"><a href="${loginUrl}">${loginUrl}</a></td></tr>
+            <tr><td style="padding:6px 10px;color:#666;font-size:13px">Username</td><td style="padding:6px 10px;font-weight:bold">${email}</td></tr>
+            <tr><td style="padding:6px 10px;color:#666;font-size:13px">Password</td><td style="padding:6px 10px;font-weight:bold;letter-spacing:1px">${generatedPassword}</td></tr>
+          </table>
+          <p style="color:#888;font-size:12px">You can change this password any time from your profile after logging in.</p>
+        </div>`,
+      text: `Your AGENTAWK login details:\nURL: ${loginUrl}\nUsername: ${email}\nPassword: ${generatedPassword}`,
+    });
+
+    return {
+      error: false,
+      message: 'Email verified successfully — check your email for your login details',
+      code: 'VERIFIED',
+      emailSent: mailResult.sent,
+      // debugPassword stays so dev/testing works even before SMTP is configured.
+      debugPassword: generatedPassword,
+      loginUrl,
+    };
+  }
+
+  async resendSignupOtp(email: string) {
+    const user = await this.prisma.users.findFirst({
+      where: { email, modelable_type: 'App\\Models\\Agency', status: 'PENDING' },
+    });
+    if (!user) {
+      throw new BadRequestException('No pending signup found for this email');
+    }
+    const result = await this.sendSignupOtp(email);
+    return { error: false, message: 'Verification code resent', emailSent: result.sent, debugCode: result.debugCode };
   }
 
   async resetPassword(data: any, domainInfo: any) {

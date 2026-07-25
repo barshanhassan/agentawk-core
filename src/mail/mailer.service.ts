@@ -47,7 +47,7 @@ export class MailerService {
   }
 
   private fromHeader(override?: string): string {
-    const name = process.env.SMTP_FROM_NAME || 'EZCONN';
+    const name = process.env.SMTP_FROM_NAME || 'AGENTAWK';
     const addr = override || process.env.SMTP_FROM || process.env.SMTP_USER || '';
     return `"${name}" <${addr}>`;
   }
