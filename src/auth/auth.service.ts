@@ -688,20 +688,89 @@ export class AuthService {
   }
 
   async findAccount(email: string) {
-    // Find if user account exists on the platform
-    const user = await this.prisma.users.findFirst({
-      where: {
-        email,
-        modelable_type: 'App\\Models\\Agency',
-        status: 'ACTIVE',
-      },
+    // "Find my account" — used on the central app.agentawk.com host where the
+    // user has no tenant subdomain yet. We email every login URL tied to this
+    // address (the agency AND each workspace it belongs to). Anti-enumeration:
+    // we ALWAYS return the same success shape, so a caller can't probe which
+    // emails exist. The email is best-effort — sent only if rows are found.
+    const users = await this.prisma.users.findMany({
+      where: { email, status: 'ACTIVE' },
+      orderBy: { id: 'asc' },
     });
 
-    if (user) {
-      console.log(`Stub: SendAccountFound Email dispatched to ${email}`);
+    if (users.length) {
+      const links: { label: string; url: string }[] = [];
+      const seen = new Set<string>();
+
+      for (const u of users) {
+        // Each tenant's active/default domain (fall back to the latest row).
+        const domain = await this.prisma.domains.findFirst({
+          where: {
+            modelable_id: u.modelable_id,
+            modelable_type: u.modelable_type,
+          },
+          orderBy: [{ active: 'desc' }, { is_default: 'desc' }, { id: 'desc' }],
+        });
+        if (!domain?.domain) continue;
+
+        const isAgency = u.modelable_type.toLowerCase().includes('agency');
+        // Name is best-effort — a nice label in the email, not critical.
+        let name = isAgency ? 'Organization' : 'Workspace';
+        try {
+          if (isAgency) {
+            const a = await this.prisma.agencies.findUnique({
+              where: { id: u.modelable_id },
+            });
+            if (a?.name) name = a.name;
+          } else {
+            const w = await this.prisma.workspaces.findUnique({
+              where: { id: u.modelable_id },
+            });
+            if (w?.name) name = w.name;
+          }
+        } catch {
+          /* label falls back to the generic name above */
+        }
+
+        const url = `https://${domain.domain}/login`;
+        const key = url.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        links.push({
+          label: `${name} (${isAgency ? 'Organization' : 'Workspace'})`,
+          url,
+        });
+      }
+
+      if (links.length) {
+        const rows = links
+          .map(
+            (l) =>
+              `<tr><td style="padding:6px 10px;color:#666;font-size:13px">${l.label}</td><td style="padding:6px 10px;font-weight:bold"><a href="${l.url}">${l.url}</a></td></tr>`,
+          )
+          .join('');
+        const textLines = links.map((l) => `${l.label}: ${l.url}`).join('\n');
+        await this.mailer.sendMail({
+          to: email,
+          subject: 'Your AGENTAWK login links',
+          html: `
+        <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto">
+          <h2 style="color:#4f46e5">Find your account</h2>
+          <p>Here are the login links associated with <b>${email}</b>:</p>
+          <table style="width:100%;background:#f3f4f6;border-radius:10px;padding:16px;border-collapse:collapse">${rows}</table>
+          <p style="color:#888;font-size:12px">If you didn't request this, you can safely ignore this email.</p>
+        </div>`,
+          text: `Your AGENTAWK login links for ${email}:\n${textLines}`,
+        });
+      }
     }
 
-    return { success: true };
+    // Always identical — never reveal whether the email exists.
+    return {
+      success: true,
+      message:
+        "If an account exists for that email, we've sent its login links.",
+    };
   }
 
   async forgotPassword(email: string, domainInfo: any) {
