@@ -257,6 +257,20 @@ export class AuthService {
       permissions,
     };
 
+    // The workspace lives on its OWN subdomain. Return that base URL so the
+    // frontend can open the workspace in a new tab (a different origin) and
+    // hand off the token there — an agency-subdomain localStorage token can't
+    // carry across origins.
+    const wsDomain = await this.prisma.domains.findFirst({
+      where: {
+        modelable_id: workspace.id,
+        modelable_type: 'App\\Models\\Workspace',
+      },
+      orderBy: [{ active: 'desc' }, { is_default: 'desc' }, { id: 'desc' }],
+    });
+    const proto = process.env.NODE_ENV === 'production' ? 'https' : 'http';
+    const workspaceUrl = wsDomain?.domain ? `${proto}://${wsDomain.domain}` : null;
+
     return {
       user: {
         id: workspaceUser.id.toString(),
@@ -270,8 +284,41 @@ export class AuthService {
         modelable_type: 'App\\Models\\Workspace',
       },
       token: this.jwtService.sign(payload, { expiresIn: '12h' }),
+      // Full URL to the workspace's own subdomain (null if it has no domain yet
+      // — e.g. legacy default workspaces created before subdomains were added).
+      workspace_url: workspaceUrl,
       redirect_to: '/workspace',
     };
+  }
+
+  /**
+   * Retry a DB operation that fails with a TRANSIENT connection/transaction
+   * error. Observed symptom: the first attempt fails with "Transaction not
+   * found ... obtained before disconnecting" and the immediate retry succeeds —
+   * a stale pooled connection the remote DB had already closed while idle.
+   * Prisma discards the dead connection on error, so simply re-running the
+   * operation picks up a healthy one. This is NOT a timeout problem.
+   */
+  private async runWithDbRetry<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
+    let lastErr: any;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        lastErr = err;
+        const msg = String(err?.message ?? err);
+        const transient =
+          err?.code === 'P1017' || // "Server has closed the connection"
+          err?.code === 'P2028' || // transaction API error
+          /transaction (not found|api error)|closed the connection|connection.*(closed|reset)|before disconnecting/i.test(
+            msg,
+          );
+        if (!transient || attempt === retries) throw err;
+        // Brief backoff; the next attempt gets a fresh connection from the pool.
+        await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
   }
 
   async register(userDto: any) {
@@ -305,9 +352,13 @@ export class AuthService {
     const agencySlug = `${baseSlug}-${Math.random().toString(36).substring(2, 7)}`;
     const subdomain = userDto.subdomain || agencySlug;
 
-    // Transaction for all associated creation
+    // Transaction for all associated creation. Wrapped in runWithDbRetry so a
+    // stale pooled connection (remote DB closed it while idle) doesn't fail the
+    // whole signup — the failed transaction rolls back and re-runs on a fresh
+    // connection, which is why the 2nd attempt always worked.
     try {
-      const result = await this.prisma.$transaction(async (tx) => {
+      const result = await this.runWithDbRetry(() =>
+        this.prisma.$transaction(async (tx) => {
         // 1. Create Agency
         const agency = await tx.agencies.create({
           data: {
@@ -400,6 +451,23 @@ export class AuthService {
           },
         });
 
+        // 7a. Default workspace gets its OWN subdomain (like manually-created
+        // workspaces do via addCustomDomain). Without this the default workspace
+        // had no domain, so "login to workspace" fell back to the agency
+        // subdomain instead of opening the workspace on its own URL. The slug
+        // embeds agency.id, so the resulting domain is unique.
+        await tx.domains.create({
+          data: {
+            modelable_type: 'App\\Models\\Workspace',
+            modelable_id: workspace.id,
+            sub_domain: workspace.slug,
+            root_domain: process.env.ROOT_DOMAIN || 'agentawk.com',
+            domain: `${workspace.slug}.${process.env.ROOT_DOMAIN || 'agentawk.com'}`,
+            active: true,
+            is_default: true,
+          },
+        });
+
         // 7b. Matching workspace-scoped login for the same person (same email,
         // same generated password as the agency user above once verified).
         // PENDING like the agency user — verifySignupOtp activates both rows
@@ -424,7 +492,15 @@ export class AuthService {
         // await tx.agency_accepted_terms.create(...)
 
         return { agency, domain };
-      });
+      },
+      {
+        // Defensive headroom for the remote DB. The real intermittent failure
+        // ("Transaction not found ... obtained before disconnecting", which
+        // works on retry) is a stale pooled connection — handled by
+        // runWithDbRetry above, not by these timeouts.
+        maxWait: 15000,
+        timeout: 30000,
+      }));
 
       const otpResult = await this.sendSignupOtp(userDto.email);
 
