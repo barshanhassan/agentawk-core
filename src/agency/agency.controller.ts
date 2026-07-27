@@ -16,7 +16,10 @@ import { JwtAuthGuard } from '../auth/auth.guard';
 import { RequirePermission } from '../auth/permissions.decorator';
 
 @UseGuards(JwtAuthGuard)
-@Controller('agencies')
+// "organizations" is the customer-facing name; "agencies" stays as an alias so
+// older frontend builds keep working during/after the rename. DB tables and
+// internal identifiers intentionally still say "agency".
+@Controller(['organizations', 'agencies'])
 export class AgencyController {
   constructor(
     private readonly service: AgencyService,

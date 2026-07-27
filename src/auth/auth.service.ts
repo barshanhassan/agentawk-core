@@ -128,7 +128,9 @@ export class AuthService {
           },
         });
 
-    const redirectTo = isAgency ? '/agency' : '/workspace';
+    // "/org" is the organization (formerly agency) dashboard route on the
+    // frontend; old "/agency" URLs are redirected client-side.
+    const redirectTo = isAgency ? '/org' : '/workspace';
 
     // Run the log write and permission load concurrently (pass is_owner so the
     // loader skips a redundant users query) — fewer serial DB round-trips.

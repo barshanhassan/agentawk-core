@@ -98,7 +98,7 @@ export class BillingController {
   }
 
   @UseGuards(JwtAuthGuard)
-  @Post('agency-branding')
+  @Post(['organization-branding', 'agency-branding'])
   async agencyBranding(@Request() req: any) {
     return this.service.agencyBranding(BigInt(req.user.workspace_id || 1));
   }

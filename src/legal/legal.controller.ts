@@ -39,7 +39,7 @@ export class LegalController {
     return this.service.getUserAccepted(BigInt(req.user.sub || req.user.id));
   }
 
-  @Get('legal/agency_accepted')
+  @Get(['legal/organization_accepted', 'legal/agency_accepted'])
   async agencyAccepted(@Request() req: any) {
     return this.service.getAgencyAccepted(BigInt(req.user.modelable_id));
   }

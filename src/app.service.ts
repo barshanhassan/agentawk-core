@@ -11,7 +11,7 @@ export class AppService {
 
   async ignite(hostname: string) {
     if (!hostname) {
-      return { app: { name: 'Ezconn', site_type: 'WORKSPACE' } };
+      return { app: { name: 'agentawk', site_type: 'WORKSPACE' } };
     }
 
     // Standardize hostname: 
@@ -25,7 +25,7 @@ export class AppService {
 
     // Dev shortcut: agency.localhost → treat as AGENCY context
     if (domainName.startsWith('agency.localhost')) {
-      return { app: { name: 'Ezconn Agency', site_type: 'AGENCY', hostname } };
+      return { app: { name: 'agentawk Organization', site_type: 'AGENCY', hostname } };
     }
 
     // Extract subdomain part: 'app1' from 'app1.laglobal.local'
@@ -49,7 +49,7 @@ export class AppService {
       // Default to WORKSPACE if no domain found (e.g. localhost)
       return {
         app: {
-          name: 'Ezconn',
+          name: 'agentawk',
           site_type: 'WORKSPACE',
           hostname: hostname
         }
@@ -71,7 +71,7 @@ export class AppService {
 
     return {
       app: {
-        name: siteData?.name || 'Ezconn',
+        name: siteData?.name || 'agentawk',
         site_type: siteType,
         domain: domainRecord.domain
       },
