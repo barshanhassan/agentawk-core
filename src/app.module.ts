@@ -57,6 +57,7 @@ import { DifyModule } from './dify/dify.module';
 import { AiThemesModule } from './ai-themes/ai-themes.module';
 import { AiProductsModule } from './ai-products/ai-products.module';
 import { IntegrationsModule } from './integrations/integrations.module';
+import { SwichModule } from './swich/swich.module';
 import { AiFeedersModule } from './ai-feeders/ai-feeders.module';
 import { AiFeederModule } from './ai-feeder/ai-feeder.module';
 import { InboxModule } from './inbox/inbox.module';
@@ -141,6 +142,7 @@ import { PermissionsGuard } from './auth/permissions.guard';
     ConversationEventsModule,
     SupervisorChatStatisticsModule,
     IntegrationsModule,
+    SwichModule,
     QuickResponseModule,
     CompaniesModule,
     S3Module,

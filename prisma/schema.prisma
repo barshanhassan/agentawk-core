@@ -3103,6 +3103,55 @@ model support_numbers {
   @@index([chatable_type, chatable_id], map: "support_numbers_chatable_type_chatable_id_index")
 }
 
+model swich_accounts {
+  id                 BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  // Owned by exactly one of these — agency-level (shared across the agency's
+  // billing/plans checkout) or workspace-level (per-tenant Payments settings).
+  workspace_id       BigInt?   @db.UnsignedBigInt
+  agency_id          BigInt?   @db.UnsignedBigInt
+  environment        String    @default("sandbox") @db.VarChar(20)
+  // "FOR API" pair — Bearer token OAuth (Section 4), used to call E-Wallet/
+  // Bank/QR/RTP/Refund/Inquire/Card APIs directly.
+  client_id          String    @db.VarChar(255)
+  client_secret      String    @db.VarChar(255)
+  // "FOR PWA" pair — Landing Page / hosted checkout (Section 5/6). No token
+  // involved; clientId just tells Swich which merchant's page to render.
+  pwa_client_id      String?   @db.VarChar(255)
+  pwa_client_secret  String?   @db.VarChar(255)
+  checksum_secret    String?   @db.VarChar(255)
+  aes_encryption_key String?   @db.VarChar(255)
+  status             String    @default("ACTIVE") @db.VarChar(20)
+  created_at         DateTime? @db.Timestamp(0)
+  updated_at         DateTime? @db.Timestamp(0)
+
+  @@index([workspace_id], map: "idx_swich_accounts_workspace_id")
+  @@index([agency_id], map: "idx_swich_accounts_agency_id")
+}
+
+model swich_transactions {
+  id                      BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  workspace_id            BigInt?   @db.UnsignedBigInt
+  agency_id               BigInt?   @db.UnsignedBigInt
+  swich_account_id        BigInt    @db.UnsignedBigInt
+  customer_transaction_id String    @unique(map: "uq_swich_transactions_customer_transaction_id") @db.VarChar(50)
+  channel                 String    @db.VarChar(30)
+  swich_transaction_id    String?   @db.VarChar(50)
+  swich_order_id          String?   @db.VarChar(50)
+  amount                  Decimal?  @db.Decimal(12, 2)
+  currency                String?   @default("PKR") @db.VarChar(10)
+  status                  String    @default("pending") @db.VarChar(30)
+  msisdn                  String?   @db.VarChar(20)
+  request_payload         Json?
+  response_payload        Json?
+  callback_payload        Json?
+  created_at              DateTime? @db.Timestamp(0)
+  updated_at              DateTime? @db.Timestamp(0)
+
+  @@index([workspace_id], map: "idx_swich_transactions_workspace_id")
+  @@index([agency_id], map: "idx_swich_transactions_agency_id")
+  @@index([swich_account_id], map: "idx_swich_transactions_swich_account_id")
+}
+
 model system_fields {
   id         BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
   name       String    @db.VarChar(255)
