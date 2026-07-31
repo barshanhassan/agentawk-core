@@ -270,8 +270,7 @@ export class AuthService {
       },
       orderBy: [{ active: 'desc' }, { is_default: 'desc' }, { id: 'desc' }],
     });
-    const proto = process.env.NODE_ENV === 'production' ? 'https' : 'http';
-    const workspaceUrl = wsDomain?.domain ? `${proto}://${wsDomain.domain}` : null;
+    const workspaceUrl = wsDomain?.domain ? this.buildTenantUrl(wsDomain.domain) : null;
 
     return {
       user: {
@@ -765,6 +764,21 @@ export class AuthService {
     }
   }
 
+  /**
+   * Builds a tenant subdomain's full URL. Both local and production serve
+   * HTTPS (local via vite-plugin-basic-ssl's self-signed cert) — the only
+   * difference is the port: production has none (nginx fronts it on 443),
+   * while local Vite serves on a specific port that doesn't appear in
+   * `domain` at all, so links generated here (find-account emails,
+   * workspace-login handoff) would otherwise connection-refuse/empty-response
+   * locally. LOCAL_FRONTEND_PORT lets local testing supply that port;
+   * production should never set it.
+   */
+  private buildTenantUrl(domain: string): string {
+    const port = process.env.NODE_ENV === 'production' ? '' : `:${process.env.LOCAL_FRONTEND_PORT || '5173'}`;
+    return `https://${domain}${port}`;
+  }
+
   async findAccount(email: string) {
     // "Find my account" — used on the central app.agentawk.com host where the
     // user has no tenant subdomain yet. We email every login URL tied to this
@@ -810,7 +824,7 @@ export class AuthService {
           /* label falls back to the generic name above */
         }
 
-        const url = `https://${domain.domain}/login`;
+        const url = `${this.buildTenantUrl(domain.domain)}/login`;
         const key = url.toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
@@ -1020,8 +1034,11 @@ export class AuthService {
 
     const hashedPassword = await bcrypt.hash(data.new_password, 10);
 
-    await this.prisma.users.update({
-      where: { id: user.id },
+    // Keep the Agency-owner + Default-Workspace login (same email, created
+    // together at signup) in sync — see the matching note in
+    // UsersService.changePassword. Scoped strictly by email match.
+    await this.prisma.users.updateMany({
+      where: { email: user.email, status: 'ACTIVE' },
       data: { password: hashedPassword },
     });
 

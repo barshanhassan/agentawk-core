@@ -1,14 +1,14 @@
-import { Body, Controller, Delete, ForbiddenException, Get, Param, Post, Query, Request, UseGuards } from '@nestjs/common';
+import { Body, Controller, ForbiddenException, Get, Param, Post, Query, Request, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/auth.guard';
 import { SwichService, SwichOwner } from './swich.service';
 
 /**
- * Agency-scoped Swich PayIn — separate credential set from any tenant
- * workspace's. Used by the Agency's own Billing/Plans checkout (e.g. a plan
- * priced in PKR that settles through Swich instead of Chargebee), and by an
- * Agency-level Payments settings page. Same JwtAuthGuard as the workspace
- * controller, but resolves the owner via `modelable_id`/`modelable_type`
- * (the JWT's agency identity) instead of `workspace_id`.
+ * Agency-scoped Swich PayIn — powers the Agency's own Billing/Plans checkout
+ * (Agentawk is the merchant here, agencies are the payers), so credentials
+ * are a single Agentawk-wide account read from server config (.env), not a
+ * per-agency DB row — see SwichService.getEnvAccount(). Same JwtAuthGuard as
+ * the workspace controller, but resolves the owner via `modelable_id`/
+ * `modelable_type` (the JWT's agency identity) instead of `workspace_id`.
  */
 @UseGuards(JwtAuthGuard)
 @Controller('swich/agency')
@@ -22,19 +22,10 @@ export class SwichAgencyController {
     return { agencyId: BigInt(req.user.modelable_id) };
   }
 
+  /** Reflects the server-configured (.env) Swich account — nothing to edit here. */
   @Get('credentials')
   getCredentials(@Request() req: any) {
     return this.swich.getAccountSummary(this.owner(req));
-  }
-
-  @Post('credentials')
-  saveCredentials(@Body() body: any, @Request() req: any) {
-    return this.swich.saveCredentials(this.owner(req), body);
-  }
-
-  @Delete('credentials')
-  removeCredentials(@Request() req: any) {
-    return this.swich.removeCredentials(this.owner(req));
   }
 
   /** Powers the Billing/Plans checkout — same Landing Page builder as the workspace flow. */

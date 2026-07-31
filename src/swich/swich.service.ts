@@ -49,7 +49,35 @@ export class SwichService {
     return owner.agencyId != null ? `agency:${owner.agencyId}` : `workspace:${owner.workspaceId}`;
   }
 
+  /**
+   * The Agency's own Billing/Plans checkout charges agencies on behalf of
+   * Agentawk itself (Agentawk is the merchant, agencies are the payers) — so
+   * unlike per-workspace credentials, there's exactly one Agentawk-wide
+   * Swich account, held in server config rather than a per-tenant DB row.
+   */
+  private getEnvAccount() {
+    const clientId = process.env.SWICH_CLIENT_ID;
+    const clientSecret = process.env.SWICH_CLIENT_SECRET;
+    if (!clientId || !clientSecret) {
+      throw new BadRequestException('Swich is not configured on the server yet.');
+    }
+    return {
+      id: null as bigint | null,
+      client_id: clientId,
+      client_secret: clientSecret,
+      pwa_client_id: process.env.SWICH_PWA_CLIENT_ID || clientId,
+      pwa_client_secret: process.env.SWICH_PWA_CLIENT_SECRET || null,
+      checksum_secret: process.env.SWICH_CHECKSUM_SECRET || null,
+      aes_encryption_key: process.env.SWICH_AES_ENCRYPTION_KEY || null,
+      environment: (process.env.SWICH_ENVIRONMENT === 'sandbox' ? 'sandbox' : 'production') as SwichEnvironment,
+      status: 'ACTIVE',
+      updated_at: null as Date | null,
+    };
+  }
+
   async getAccount(owner: SwichOwner) {
+    if (owner.agencyId != null) return this.getEnvAccount();
+
     const account = await this.prisma.swich_accounts.findFirst({
       where: this.ownerWhere(owner),
       orderBy: { id: 'desc' },
@@ -62,6 +90,21 @@ export class SwichService {
 
   /** Masked — safe to return to the frontend (never echoes secrets back). */
   async getAccountSummary(owner: SwichOwner) {
+    if (owner.agencyId != null) {
+      if (!process.env.SWICH_CLIENT_ID || !process.env.SWICH_CLIENT_SECRET) return { connected: false };
+      const account = this.getEnvAccount();
+      return {
+        connected: true,
+        environment: account.environment,
+        client_id: account.client_id,
+        has_pwa_credentials: !!process.env.SWICH_PWA_CLIENT_ID,
+        pwa_client_id: account.pwa_client_id,
+        has_checksum_secret: !!account.checksum_secret,
+        has_aes_key: !!account.aes_encryption_key,
+        updated_at: null,
+      };
+    }
+
     const account = await this.prisma.swich_accounts.findFirst({
       where: this.ownerWhere(owner),
       orderBy: { id: 'desc' },
@@ -91,6 +134,9 @@ export class SwichService {
       aes_encryption_key?: string;
     },
   ) {
+    if (owner.agencyId != null) {
+      throw new BadRequestException('Agency-level Swich credentials are configured on the server (.env), not editable here.');
+    }
     const existing = await this.prisma.swich_accounts.findFirst({ where: this.ownerWhere(owner) });
 
     // First-time connect requires the core API pair; updates may leave any
@@ -133,6 +179,9 @@ export class SwichService {
   }
 
   async removeCredentials(owner: SwichOwner) {
+    if (owner.agencyId != null) {
+      throw new BadRequestException('Agency-level Swich credentials are configured on the server (.env), not editable here.');
+    }
     const account = await this.prisma.swich_accounts.findFirst({ where: this.ownerWhere(owner) });
     if (!account) throw new NotFoundException('Swich is not connected');
     await this.prisma.swich_accounts.update({ where: { id: account.id }, data: { status: 'REMOVED' } });
@@ -164,7 +213,7 @@ export class SwichService {
 
   private async recordTransaction(
     owner: SwichOwner,
-    swichAccountId: bigint,
+    swichAccountId: bigint | null,
     customerTransactionId: string,
     channel: string,
     extra: { amount?: number; currency?: string; msisdn?: string; request_payload?: any } = {},
@@ -393,8 +442,14 @@ export class SwichService {
       return { status: 'success' };
     }
 
-    const account = await this.prisma.swich_accounts.findUnique({ where: { id: tx.swich_account_id } });
-    const secret = account?.checksum_secret || account?.pwa_client_secret || account?.client_secret;
+    let secret: string | null | undefined;
+    if (tx.swich_account_id != null) {
+      const account = await this.prisma.swich_accounts.findUnique({ where: { id: tx.swich_account_id } });
+      secret = account?.checksum_secret || account?.pwa_client_secret || account?.client_secret;
+    } else {
+      // Agency-scoped (env-based) transaction — no DB account row to look up.
+      secret = process.env.SWICH_CHECKSUM_SECRET || process.env.SWICH_PWA_CLIENT_SECRET || process.env.SWICH_CLIENT_SECRET;
+    }
     if (secret) {
       const expected = this.client.buildCallbackChecksum(
         secret,

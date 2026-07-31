@@ -469,8 +469,13 @@ export class UsersService {
     }
 
     const hashedPassword = await bcrypt.hash(newPassword, 10);
-    await this.prisma.users.update({
-      where: { id: userId },
+    // Signup creates a matching Agency-owner + Default-Workspace login sharing
+    // the same email and (initially) the same password — keep them in sync so
+    // changing one doesn't leave the other stuck on the old password. Scoped
+    // strictly by email match, so an independently-invited teammate (their
+    // own email on a different workspace) is never touched by this.
+    await this.prisma.users.updateMany({
+      where: { email: user.email, status: 'ACTIVE' },
       data: { password: hashedPassword },
     });
 

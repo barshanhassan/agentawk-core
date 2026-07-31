@@ -3132,7 +3132,7 @@ model swich_transactions {
   id                      BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
   workspace_id            BigInt?   @db.UnsignedBigInt
   agency_id               BigInt?   @db.UnsignedBigInt
-  swich_account_id        BigInt    @db.UnsignedBigInt
+  swich_account_id        BigInt?   @db.UnsignedBigInt
   customer_transaction_id String    @unique(map: "uq_swich_transactions_customer_transaction_id") @db.VarChar(50)
   channel                 String    @db.VarChar(30)
   swich_transaction_id    String?   @db.VarChar(50)
