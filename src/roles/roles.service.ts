@@ -47,9 +47,12 @@ export class RolesService {
           groups[perm.slug] = { slug: perm.slug, name: perm.name, description: perm.description || '', icon: perm.icon || null, tooltip: perm.tooltip || null, children: [] };
         }
       } else {
-        // Leaf permission — find its group parent
+        // Leaf permission — find its group parent. The group's OWN public
+        // flag must also hold here — otherwise a public leaf silently
+        // resurrects a group whose own row was just filtered out above
+        // (e.g. Legal's public=false group with still-public children).
         const groupParent = allPerms.find(p => p.id === perm.parent_id);
-        if (groupParent) {
+        if (groupParent && groupParent.public !== false) {
           if (!groups[groupParent.slug]) {
             groups[groupParent.slug] = { slug: groupParent.slug, name: groupParent.name, description: groupParent.description || '', icon: groupParent.icon || null, tooltip: groupParent.tooltip || null, children: [] };
           }

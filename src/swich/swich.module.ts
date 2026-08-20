@@ -5,11 +5,12 @@ import { SwichAgencyController } from './swich-agency.controller';
 import { SwichCallbackController } from './swich-callback.controller';
 import { SwichService } from './swich.service';
 import { SwichApiClient } from './swich-api.client';
+import { SwichPollingService } from './swich-polling.service';
 
 @Module({
   imports: [PrismaModule],
   controllers: [SwichController, SwichAgencyController, SwichCallbackController],
-  providers: [SwichService, SwichApiClient],
+  providers: [SwichService, SwichApiClient, SwichPollingService],
   exports: [SwichService],
 })
 export class SwichModule {}

@@ -11,6 +11,7 @@ import {
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './auth.guard';
 import { AppService } from '../app.service';
+import { RequirePermission } from './permissions.decorator';
 
 @Controller('auth')
 export class AuthController {
@@ -146,6 +147,12 @@ export class AuthController {
   }
 
   @UseGuards(JwtAuthGuard)
+  // Without this, ANY authenticated agency user — even one whose role was
+  // never granted workspace access — could SSO straight into any client
+  // workspace under the agency via this endpoint. Same permission the
+  // Workspaces list itself requires (agency.controller.ts getWorkspaces),
+  // so only staff who can already see/manage workspaces can enter one.
+  @RequirePermission('agency.workspace.*')
   @Post('workspaces/:id/login')
   async loginToWorkspace(@Request() req: any, @Param('id') id: string) {
     return this.authService.loginToWorkspace(

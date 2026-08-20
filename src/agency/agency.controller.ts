@@ -26,8 +26,54 @@ export class AgencyController {
     private readonly rolesService: RolesService,
   ) {}
 
+  // ─── Billing Plans ─────────────────────────────────────────────────
+  // Declared before the `:id` route below — NestJS matches routes in
+  // declaration order, and "billing-plans" would otherwise be swallowed by
+  // `@Get(':id')` as if it were an agency id.
+
+  @Get('billing-plans')
+  async getBillingPlans() {
+    return this.service.getBillingPlans();
+  }
+
+  /** Checkout-page coupon preview — no agency id needed, just checks the code. */
+  @Get('coupons/:code/validate')
+  async validateCoupon(@Param('code') code: string) {
+    return this.service.validateCoupon(code);
+  }
+
+  @Get(':id/current-plan')
+  async getCurrentPlan(@Param('id') id: string) {
+    return this.service.getCurrentPlan(BigInt(id));
+  }
+
+  @Get(':id/current-usage')
+  async getCurrentUsage(@Param('id') id: string) {
+    return this.service.getCurrentUsage(BigInt(id));
+  }
+
+  @Post(':id/cancel-subscription')
+  async cancelSubscription(@Param('id') id: string) {
+    return this.service.cancelSubscription(BigInt(id));
+  }
+
+  @Get(':id/coupons')
+  async getAppliedCoupons(@Param('id') id: string) {
+    return this.service.getAppliedCoupons(BigInt(id));
+  }
+
+  @Post(':id/coupons')
+  async applyCoupon(@Param('id') id: string, @Body('code') code: string) {
+    return this.service.applyCoupon(BigInt(id), code ?? '');
+  }
+
+  @Delete(':id/coupons/:code')
+  async removeCoupon(@Param('id') id: string, @Param('code') code: string) {
+    return this.service.removeCoupon(BigInt(id), code);
+  }
+
   // ─── Agency Profile ────────────────────────────────────────────────
-  
+
   @Get(':id')
   async getAgency(@Param('id') id: string) {
     return this.service.getAgency(BigInt(id));
@@ -131,6 +177,15 @@ export class AgencyController {
     @Param('workspace_id') workspaceId: string,
   ) {
     return this.service.getWorkspaceUsage(BigInt(workspaceId), BigInt(id));
+  }
+
+  @Get(':id/workspaces/:workspace_id/voice-wallet')
+  @RequirePermission('agency.workspace.*')
+  async getVoiceWallet(
+    @Param('id') id: string,
+    @Param('workspace_id') workspaceId: string,
+  ) {
+    return this.service.getVoiceWallet(BigInt(workspaceId), BigInt(id));
   }
 
   // ─── Member Management ──────────────────────────────────────────────

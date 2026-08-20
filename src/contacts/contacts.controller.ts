@@ -9,14 +9,19 @@ import {
   UseGuards,
   Request,
   Param,
+  ForbiddenException,
 } from '@nestjs/common';
 import { ContactsService } from './contacts.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
+import { PlanFeaturesService } from '../workspaces/plan-features.service';
 
 @UseGuards(JwtAuthGuard)
 @Controller('contacts')
 export class ContactsController {
-  constructor(private readonly service: ContactsService) {}
+  constructor(
+    private readonly service: ContactsService,
+    private readonly planFeatures: PlanFeaturesService,
+  ) {}
 
   @Get()
   async getContacts(@Query() query: any, @Request() req: any) {
@@ -100,6 +105,7 @@ export class ContactsController {
   @Get('export/csv')
   async exportCsv(@Request() req: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
+    await this.requireImportExport(workspaceId);
     const csv = await this.service.exportCsv(workspaceId);
     return { csv, filename: `contacts-${workspaceId}.csv` };
   }
@@ -111,6 +117,7 @@ export class ContactsController {
   @Post('export/psid')
   async exportPsid(@Request() req: any, @Body() body: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
+    await this.requireImportExport(workspaceId);
     const ids = Array.isArray(body?.ids)
       ? body.ids.map((i: any) => BigInt(i))
       : [];
@@ -124,8 +131,19 @@ export class ContactsController {
   @Post('import/csv')
   async importCsv(@Request() req: any, @Body() body: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
+    await this.requireImportExport(workspaceId);
     const userId = BigInt(req.user.sub || req.user.id || 0);
     return this.service.importCsv(workspaceId, userId, body.csv ?? '');
+  }
+
+  // Plan gate — mirrors the allow_api check in users.controller.ts. Surfaces
+  // a 403 so the UI can explain "upgrade to import/export" rather than the
+  // request silently succeeding on a plan that shouldn't have it.
+  private async requireImportExport(workspaceId: bigint) {
+    const features = await this.planFeatures.getForWorkspace(workspaceId);
+    if (!features.allow_import_contacts) {
+      throw new ForbiddenException('Your current plan does not include contact import/export.');
+    }
   }
 
   // ─── Replyagent parity: contact profile modal endpoints ─────────────

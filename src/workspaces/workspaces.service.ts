@@ -19,6 +19,16 @@ export class WorkspacesService {
     private readonly mailer: MailerService,
   ) {}
 
+  /** Mirrors AuthService's private helper of the same name/shape — a bare
+   * domain needs the local dev port appended outside production. */
+  private buildTenantUrl(domain: string): string {
+    // See the identical comment in AuthService.buildTenantUrl — domains.domain
+    // isn't consistently stored bare, so strip any existing scheme first.
+    const bareDomain = domain.replace(/^https?:\/\//, '');
+    const port = process.env.NODE_ENV === 'production' ? '' : `:${process.env.LOCAL_FRONTEND_PORT || '5173'}`;
+    return `https://${bareDomain}${port}`;
+  }
+
   /** S3 key → 1h signed URL (pass-through for absolute URLs / empty). */
   private async toDisplayUrl(value: string | null | undefined): Promise<string> {
     if (!value) return '';
@@ -679,7 +689,17 @@ export class WorkspacesService {
     // Invite email — invitation_id is base64(userId), matching what
     // AuthService.validateInvitation/acceptInvitation already expect.
     const invitationId = Buffer.from(user.id.toString()).toString('base64');
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    // Old generic-URL version kept commented for comparison/rollback — sent
+    // people to the central app host instead of the workspace they were
+    // actually invited to, forcing the "Find Account" step unnecessarily.
+    // const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const wsDomain = await this.prisma.domains.findFirst({
+      where: { modelable_id: workspaceId, modelable_type: 'App\\Models\\Workspace' },
+      orderBy: [{ active: 'desc' }, { is_default: 'desc' }, { id: 'desc' }],
+    });
+    const frontendUrl = wsDomain?.domain
+      ? this.buildTenantUrl(wsDomain.domain)
+      : process.env.FRONTEND_URL || 'http://localhost:5173';
     const inviteLink = `${frontendUrl}/accept-invitation?invitation_id=${invitationId}`;
     this.mailer
       .sendMail({

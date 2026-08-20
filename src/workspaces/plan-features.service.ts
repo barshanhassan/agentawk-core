@@ -27,6 +27,7 @@ export class PlanFeaturesService {
     allow_broadcasts: boolean;
     allow_contact_deletion: boolean;
     allow_contact_merge: boolean;
+    allow_import_contacts: boolean;
   }> {
     const workspace = await this.prisma.workspaces.findUnique({
       where: { id: workspaceId },
@@ -63,6 +64,7 @@ export class PlanFeaturesService {
         allow_broadcasts: true,
         allow_contact_deletion: true,
         allow_contact_merge: true,
+        allow_import_contacts: true,
       },
     });
     if (!plan) {
@@ -73,6 +75,7 @@ export class PlanFeaturesService {
       allow_broadcasts: !!plan.allow_broadcasts,
       allow_contact_deletion: !!plan.allow_contact_deletion,
       allow_contact_merge: !!plan.allow_contact_merge,
+      allow_import_contacts: !!plan.allow_import_contacts,
     };
   }
 
@@ -88,6 +91,7 @@ export class PlanFeaturesService {
     allow_broadcasts: boolean;
     allow_contact_deletion: boolean;
     allow_contact_merge: boolean;
+    allow_import_contacts: boolean;
   } {
     const strict = process.env.EZCONN_DEFAULT_PLAN_FEATURES === 'strict';
     if (strict) {
@@ -96,6 +100,7 @@ export class PlanFeaturesService {
         allow_broadcasts: false,
         allow_contact_deletion: false,
         allow_contact_merge: false,
+        allow_import_contacts: false,
       };
     }
     return {
@@ -103,6 +108,7 @@ export class PlanFeaturesService {
       allow_broadcasts: true,
       allow_contact_deletion: true,
       allow_contact_merge: true,
+      allow_import_contacts: true,
     };
   }
 }

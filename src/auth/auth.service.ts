@@ -143,6 +143,11 @@ export class AuthService {
     const payload = {
       email: user.email,
       sub: user.id.toString(),
+      // Kept in sync with loginToWorkspace()'s payload — GET /auth/au (used
+      // by the cross-subdomain SSO handoff) has no DB access and just echoes
+      // this token back, so name fields must live here too.
+      first_name: user.first_name,
+      last_name: user.last_name,
       modelable_id: contextId.toString(),
       modelable_type: contextType,
       role: userRole,
@@ -218,7 +223,7 @@ export class AuthService {
   async loginToWorkspace(agencyUserId: bigint, agencyModelableId: bigint, workspaceId: bigint) {
     const workspace = await this.prisma.workspaces.findUnique({
       where: { id: workspaceId },
-      select: { id: true, agency_id: true, name: true, status: true },
+      select: { id: true, agency_id: true, name: true, status: true, agency_agent_id: true },
     });
     if (!workspace) throw new BadRequestException('Workspace not found');
 
@@ -234,35 +239,8 @@ export class AuthService {
     const agencyUser = await this.prisma.users.findUnique({ where: { id: agencyUserId } });
     if (!agencyUser) throw new UnauthorizedException('Invalid session');
 
-    const workspaceUser = await this.prisma.users.findFirst({
-      where: {
-        email: agencyUser.email,
-        modelable_type: 'App\\Models\\Workspace',
-        modelable_id: workspace.id,
-        status: 'ACTIVE',
-      },
-    });
-    if (!workspaceUser) {
-      throw new BadRequestException('No active login found for you in this workspace');
-    }
-
-    const permissions = await this.loadUserPermissions(workspaceUser.id, workspaceUser.is_owner);
-    const payload = {
-      email: workspaceUser.email,
-      sub: workspaceUser.id.toString(),
-      modelable_id: workspace.id.toString(),
-      modelable_type: 'App\\Models\\Workspace',
-      role: 'WORKSPACE',
-      tfa_enabled: workspaceUser.tfa_enabled,
-      is_owner: workspaceUser.is_owner,
-      workspace_id: workspace.id.toString(),
-      permissions,
-    };
-
-    // The workspace lives on its OWN subdomain. Return that base URL so the
-    // frontend can open the workspace in a new tab (a different origin) and
-    // hand off the token there — an agency-subdomain localStorage token can't
-    // carry across origins.
+    // The workspace lives on its OWN subdomain. Resolved up front — both the
+    // JIT-provision path and the "go log in yourself" path below need it.
     const wsDomain = await this.prisma.domains.findFirst({
       where: {
         modelable_id: workspace.id,
@@ -271,6 +249,70 @@ export class AuthService {
       orderBy: [{ active: 'desc' }, { is_default: 'desc' }, { id: 'desc' }],
     });
     const workspaceUrl = wsDomain?.domain ? this.buildTenantUrl(wsDomain.domain) : null;
+
+    let workspaceUser = await this.prisma.users.findFirst({
+      where: {
+        email: agencyUser.email,
+        modelable_type: 'App\\Models\\Workspace',
+        modelable_id: workspace.id,
+        status: 'ACTIVE',
+      },
+    });
+    if (!workspaceUser) {
+      // A workspace with its OWN dedicated agent (someone other than the
+      // caller) belongs to that person, not to whoever clicked "Login" in
+      // the agency dashboard — don't silently enter under the caller's own
+      // identity. Send them to that workspace's real login page instead.
+      // Only workspaces with NO assigned agent (Default Workspace) or ones
+      // the caller themselves is the assigned agent for get JIT-provisioned.
+      const hasOtherAgent =
+        workspace.agency_agent_id != null && workspace.agency_agent_id !== agencyUserId;
+      if (hasOtherAgent) {
+        return { requires_login: true, workspace_url: workspaceUrl };
+      }
+
+      // JIT-provision — this endpoint's whole point is letting any agency
+      // manager enter a workspace under their own agency without a password
+      // (see the class doc above). That row only ever got created for the
+      // signup-time Default Workspace or an explicitly-assigned agent, so
+      // every other workspace threw "No active login found" here even
+      // though the tenant check above already confirmed access is allowed.
+      // Provisioned ACTIVE immediately (no invite/password step) since the
+      // caller is already an authenticated agency user.
+      workspaceUser = await this.prisma.users.create({
+        data: {
+          first_name: agencyUser.first_name,
+          last_name: agencyUser.last_name,
+          email: agencyUser.email,
+          password: agencyUser.password,
+          modelable_type: 'App\\Models\\Workspace',
+          modelable_id: workspace.id,
+          is_owner: agencyUser.is_owner,
+          status: 'ACTIVE',
+          creator_id: agencyUser.id,
+          active_workspace_id: workspace.id,
+          locale: agencyUser.locale || 'en-US',
+        },
+      });
+    }
+
+    const permissions = await this.loadUserPermissions(workspaceUser.id, workspaceUser.is_owner);
+    const payload = {
+      email: workspaceUser.email,
+      sub: workspaceUser.id.toString(),
+      // The SSO handoff (SsoHandoffPage → GET /auth/au) has no DB access —
+      // it just echoes back whatever's in this token, so name fields must
+      // travel here too or the workspace topbar shows "undefined".
+      first_name: workspaceUser.first_name,
+      last_name: workspaceUser.last_name,
+      modelable_id: workspace.id.toString(),
+      modelable_type: 'App\\Models\\Workspace',
+      role: 'WORKSPACE',
+      tfa_enabled: workspaceUser.tfa_enabled,
+      is_owner: workspaceUser.is_owner,
+      workspace_id: workspace.id.toString(),
+      permissions,
+    };
 
     return {
       user: {
@@ -390,8 +432,30 @@ export class AuthService {
           },
         });
 
-        // 3. Billing Stub (Chargebee)
-        // In production, you would call Chargebee API here and update agency.customer_id
+        // 3. Free plan subscription — every agency needs a real
+        // billing_subscriptions row from the start so plan-limit enforcement
+        // (createWorkspace, contacts, etc.) has something to check against.
+        // Without this, "Free" was only a cosmetic UI fallback label and
+        // nothing was actually enforced. Missing free-plan seed data isn't
+        // fatal to signup — an agency without a subscription row still just
+        // falls back to unlimited, same as before this change.
+        const freePlan = await tx.billing_plans.findFirst({ where: { item_id: 'free-plan' } });
+        if (freePlan) {
+          await tx.billing_subscriptions.create({
+            data: {
+              agency_id: agency.id,
+              subscription_id: `free-${agency.id}`,
+              customer_id: `agency-${agency.id}`,
+              billing_plan_id: freePlan.id,
+              default: true,
+              status: 'active',
+              activated_at: new Date(),
+              started_at: new Date(),
+              created_at: new Date(),
+              updated_at: new Date(),
+            },
+          });
+        }
 
         // 4. Create Domain
         const domain = await tx.domains.create({
@@ -534,7 +598,7 @@ export class AuthService {
     const secret = generateSecret();
     const otpauth = await generateURI({
       label: user.email,
-      issuer: 'Ezconn Platform',
+      issuer: 'Agentawk Platform',
       secret,
     });
 
@@ -775,8 +839,13 @@ export class AuthService {
    * production should never set it.
    */
   private buildTenantUrl(domain: string): string {
+    // domains.domain isn't consistently stored bare — DomainsService.addCustomDomain
+    // bakes in its own http://(dev)/https://(prod) prefix, while the signup flow
+    // stores a bare hostname. Strip whatever's there so this never double-prefixes
+    // into "https://http://...", which the browser can't resolve.
+    const bareDomain = domain.replace(/^https?:\/\//, '');
     const port = process.env.NODE_ENV === 'production' ? '' : `:${process.env.LOCAL_FRONTEND_PORT || '5173'}`;
-    return `https://${domain}${port}`;
+    return `https://${bareDomain}${port}`;
   }
 
   async findAccount(email: string) {

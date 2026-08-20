@@ -258,6 +258,10 @@ export class SwichService {
     params: {
       customerTransactionId?: string;
       item: string;
+      // Agency Billing/Plans checkout only — matches billing_plans.item_id
+      // (e.g. "ignite-plan"), so a successful payment can activate the real
+      // plan for the agency. Absent for non-plan Swich payments.
+      planItemId?: string;
       amount: number;
       description: string;
       payeeName: string;
@@ -265,6 +269,12 @@ export class SwichService {
       msisdn: string;
       billReferenceNo?: string;
       currency?: string;
+      // Per the Swich PayIn 2.0 Integration Guide (Section 5.2 / Section 17):
+      // this is the ONLY redirect parameter Swich's API accepts, and it only
+      // ever fires on a SUCCESSFUL transaction. There is no failure/reject
+      // redirect parameter — on a failed payment, Swich always sends the
+      // customer to whatever default page is configured on the merchant's
+      // own Swich dashboard (not something this API call can override).
       successRedirectUrl?: string;
     },
   ) {
@@ -391,14 +401,19 @@ export class SwichService {
     // reuse the same updater, it only reads top-level status/ids which
     // Swich also mirrors at the top level for this endpoint's failure case.
     if (result?.data?.transaction) {
+      const status = result.data.transaction.transactionStatus ?? result.data.status;
       await this.prisma.swich_transactions.updateMany({
         where: { customer_transaction_id: customerTransactionId },
         data: {
-          status: result.data.transaction.transactionStatus ?? result.data.status,
+          status,
           response_payload: result.data,
           updated_at: new Date(),
         },
       });
+      if (status === 'success') {
+        const tx = await this.prisma.swich_transactions.findFirst({ where: { customer_transaction_id: customerTransactionId } });
+        if (tx) await this.activatePlanFromTransaction(tx);
+      }
     }
     return result;
   }
@@ -477,7 +492,72 @@ export class SwichService {
       },
     });
 
+    if (payload.Status === 'success') {
+      await this.activatePlanFromTransaction(tx);
+    }
+
     return { status: 'success' };
+  }
+
+  /**
+   * A successful Swich payment for an agency plan (checkout tags the request
+   * with planItemId, matching billing_plans.item_id) activates that plan for
+   * the agency — upserts billing_subscriptions directly, since Chargebee
+   * (replyagent's source of truth for this table) isn't configured here.
+   * No-op for workspace-scoped or non-plan agency payments.
+   */
+  private async activatePlanFromTransaction(tx: { agency_id: bigint | null; request_payload: any; customer_transaction_id: string }) {
+    if (tx.agency_id == null) return;
+    const planItemId = (tx.request_payload as any)?.planItemId;
+    if (!planItemId) return;
+
+    const plan = await this.prisma.billing_plans.findFirst({ where: { item_id: planItemId } });
+    if (!plan) {
+      this.logger.warn(`[swich] planItemId=${planItemId} not found in billing_plans — skipping subscription activation`);
+      return;
+    }
+
+    const agency = await this.prisma.agencies.findUnique({ where: { id: tx.agency_id }, select: { customer_id: true } });
+
+    const existing = await this.prisma.billing_subscriptions.findFirst({
+      where: { agency_id: tx.agency_id, status: { in: ['active', 'in_trial'] } },
+      orderBy: [{ default: 'desc' }, { activated_at: 'desc' }],
+    });
+
+    if (existing) {
+      // No downgrades — plan_order ranks tiers (Free=0 ... Enterprise=3).
+      // Matches the "plans don't support downgrades" notice on the Billing
+      // page: a lower-tier payment still records as a transaction, it just
+      // doesn't demote the active plan.
+      if (existing.billing_plan_id) {
+        const currentPlan = await this.prisma.billing_plans.findUnique({ where: { id: existing.billing_plan_id } });
+        if (currentPlan && plan.plan_order < currentPlan.plan_order) {
+          this.logger.warn(`[swich] agency ${tx.agency_id} paid for "${planItemId}" (order ${plan.plan_order}) below current plan "${currentPlan.item_id}" (order ${currentPlan.plan_order}) — not downgrading`);
+          return;
+        }
+      }
+      await this.prisma.billing_subscriptions.update({
+        where: { id: existing.id },
+        data: { billing_plan_id: plan.id, status: 'active', activated_at: new Date(), updated_at: new Date() },
+      });
+    } else {
+      await this.prisma.billing_subscriptions.create({
+        data: {
+          agency_id: tx.agency_id,
+          subscription_id: `swich-${tx.customer_transaction_id}`,
+          customer_id: agency?.customer_id || `swich-agency-${tx.agency_id}`,
+          billing_plan_id: plan.id,
+          default: true,
+          status: 'active',
+          activated_at: new Date(),
+          started_at: new Date(),
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      });
+    }
+
+    this.logger.log(`[swich] activated plan "${planItemId}" for agency ${tx.agency_id}`);
   }
 
   async getTransaction(owner: SwichOwner, customerTransactionId: string) {
@@ -490,10 +570,28 @@ export class SwichService {
 
   async listTransactions(owner: SwichOwner, limit = 50) {
     const where = owner.agencyId != null ? { agency_id: owner.agencyId } : { workspace_id: owner.workspaceId };
-    return this.prisma.swich_transactions.findMany({
+    const rows = await this.prisma.swich_transactions.findMany({
       where,
       orderBy: { created_at: 'desc' },
       take: Math.min(100, Math.max(1, limit)),
+    });
+    // Swich's own Inquire/callback response (nested under `transaction`) is
+    // the authoritative record of which channel + account actually paid —
+    // prefer it over the msisdn we collected upfront at checkout, which is
+    // only ever what the customer typed into our own form.
+    return rows.map((row) => {
+      const swichTx = (row.response_payload as any)?.transaction ?? (row.callback_payload as any)?.transaction;
+      // `item` is whatever plan/product name the checkout page passed when it
+      // built the Landing Page URL (see buildLandingPageUrl) — already stored
+      // in request_payload, just not surfaced as its own field until now.
+      const planName = (row.request_payload as any)?.item ?? null;
+      return {
+        ...row,
+        plan_name: planName,
+        swich_channel_name: swichTx?.channelName ?? null,
+        swich_category_name: swichTx?.categoryName ?? null,
+        swich_consumer_number: swichTx?.consumerNumber ?? null,
+      };
     });
   }
 

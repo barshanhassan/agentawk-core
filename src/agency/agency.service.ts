@@ -4,6 +4,7 @@ import {
   NotFoundException,
   Logger,
 } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChargebeeService } from '../billing/chargebee.service';
 import { DomainsService } from '../domains/domains.service';
@@ -45,6 +46,208 @@ export class AgencyService {
   }
 
   // ─── Agency Profile & Branding ──────────────────────────────────────
+
+  // ─── Billing Plans (Swich-backed; no Chargebee here) ──────────────────
+
+  /** All active plans + monthly USD price, for the Billing/Plans checkout page. */
+  async getBillingPlans() {
+    const plans = await this.prisma.billing_plans.findMany({
+      where: { status: 'active', deleted_at: null },
+      orderBy: { plan_order: 'asc' },
+    });
+    const prices = await this.prisma.billing_item_prices.findMany({
+      where: { itemable_id: { in: plans.map((p) => p.id) }, status: 'active' },
+    });
+    return plans.map((p) => {
+      const price = prices.find((pr) => pr.itemable_id === p.id);
+      return { ...p, price_cents: price?.price ?? null, currency_code: price?.currency_code ?? null };
+    });
+  }
+
+  /** The agency's active plan (for the "Current Plan" badge) — nulls if none. */
+  async getCurrentPlan(agencyId: bigint) {
+    const subscription = await this.prisma.billing_subscriptions.findFirst({
+      where: { agency_id: agencyId, status: { in: ['active', 'in_trial'] as any }, deleted_at: null },
+      orderBy: [{ activated_at: 'desc' }],
+    });
+    if (!subscription?.billing_plan_id) return { subscription: null, plan: null };
+    const plan = await this.prisma.billing_plans.findUnique({ where: { id: subscription.billing_plan_id } });
+    return { subscription, plan };
+  }
+
+  /** Mirrors AuthService's private helper of the same name/shape — a bare
+   * domain needs the local dev port appended outside production. */
+  private buildTenantUrl(domain: string): string {
+    // See the identical comment in AuthService.buildTenantUrl — domains.domain
+    // isn't consistently stored bare, so strip any existing scheme first.
+    const bareDomain = domain.replace(/^https?:\/\//, '');
+    const port = process.env.NODE_ENV === 'production' ? '' : `:${process.env.LOCAL_FRONTEND_PORT || '5173'}`;
+    return `https://${bareDomain}${port}`;
+  }
+
+  private async getActiveSubscription(agencyId: bigint) {
+    return this.prisma.billing_subscriptions.findFirst({
+      where: { agency_id: agencyId, status: { in: ['active', 'in_trial'] as any }, deleted_at: null },
+      orderBy: [{ activated_at: 'desc' }],
+    });
+  }
+
+  /**
+   * Cancels the agency's active plan — a deliberate opt-out, distinct from
+   * the "no downgrades via checkout" rule (activatePlanFromTransaction).
+   * Marks the subscription cancelled rather than deleting it (keeps
+   * history); getCurrentPlan() only looks at active/in_trial rows, so once
+   * cancelled the agency shows as back on Free automatically — no separate
+   * "revert to free" step needed.
+   */
+  async cancelSubscription(agencyId: bigint) {
+    const subscription = await this.getActiveSubscription(agencyId);
+    if (!subscription) throw new BadRequestException('No active subscription to cancel.');
+
+    await this.prisma.billing_subscriptions.update({
+      where: { id: subscription.id },
+      data: { status: 'cancelled', cancelled_at: new Date(), updated_at: new Date() },
+    });
+    return { success: true };
+  }
+
+  private parseCouponCodes(coupons: string | null): string[] {
+    return (coupons || '').split(',').map((c) => c.trim()).filter(Boolean);
+  }
+
+  /** billing_coupons rows currently applied to the agency's subscription. */
+  async getAppliedCoupons(agencyId: bigint) {
+    const subscription = await this.getActiveSubscription(agencyId);
+    const codes = this.parseCouponCodes(subscription?.coupons ?? null);
+    if (!codes.length) return [];
+    return this.prisma.billing_coupons.findMany({ where: { coupon_id: { in: codes }, status: 'active' } });
+  }
+
+  /**
+   * Checkout-time preview — no subscription needed (the agency may not have
+   * one yet), just tells the checkout page whether the code is real and
+   * what it's worth, so the page can show a discounted price before payment.
+   * Doesn't persist anything; applyCoupon() below does that after purchase.
+   */
+  async validateCoupon(rawCode: string) {
+    const code = rawCode.trim().toUpperCase();
+    const coupon = await this.prisma.billing_coupons.findFirst({ where: { coupon_id: code, status: 'active' } });
+    if (!coupon) throw new BadRequestException('That coupon code is invalid or no longer active.');
+    return {
+      code: coupon.coupon_id,
+      name: coupon.invoice_name || coupon.coupon_id,
+      discount_percentage: coupon.discount_percentage ? Number(coupon.discount_percentage) : null,
+      discount_amount_cents: coupon.discount_amount ? Number(coupon.discount_amount) : null,
+    };
+  }
+
+  async applyCoupon(agencyId: bigint, rawCode: string) {
+    const code = rawCode.trim().toUpperCase();
+    if (!code) throw new BadRequestException('Enter a coupon code.');
+
+    const coupon = await this.prisma.billing_coupons.findFirst({ where: { coupon_id: code, status: 'active' } });
+    if (!coupon) throw new BadRequestException('That coupon code is invalid or no longer active.');
+
+    const subscription = await this.getActiveSubscription(agencyId);
+    if (!subscription) throw new BadRequestException('No active subscription to apply a coupon to.');
+
+    const codes = this.parseCouponCodes(subscription.coupons);
+    if (codes.includes(code)) throw new BadRequestException('That coupon is already applied.');
+    codes.push(code);
+
+    await this.prisma.billing_subscriptions.update({
+      where: { id: subscription.id },
+      data: { coupons: codes.join(','), updated_at: new Date() },
+    });
+    return { success: true, coupons: codes };
+  }
+
+  async removeCoupon(agencyId: bigint, rawCode: string) {
+    const code = rawCode.trim().toUpperCase();
+    const subscription = await this.getActiveSubscription(agencyId);
+    if (!subscription) throw new BadRequestException('No active subscription.');
+
+    const codes = this.parseCouponCodes(subscription.coupons).filter((c) => c !== code);
+    await this.prisma.billing_subscriptions.update({
+      where: { id: subscription.id },
+      data: { coupons: codes.join(',') || null, updated_at: new Date() },
+    });
+    return { success: true, coupons: codes };
+  }
+
+  // Per-unit overage price, in cents — only for the two resources whose
+  // rate the real pricing page actually states ("$19 each additional
+  // workspace" for Ignite, "$16" for Enterprise). Everything else stays a
+  // plain usage count rather than a guessed dollar figure.
+  private static readonly WORKSPACE_OVERAGE_CENTS: Record<string, number> = {
+    'ignite-plan': 1900,
+    'enterprise-plan': 1600,
+  };
+
+  /**
+   * Real usage vs. plan allowance, for the Current Usage modal. Workspaces
+   * is the only resource that's genuinely agency-wide (the plan caps total
+   * workspaces), so it's the only one with a real dollar overage charge;
+   * contacts/agents/AI assistants/channels are capped per-workspace (see
+   * createWorkspace), so they're reported as counts only — summing them
+   * into one agency-wide "over/under" figure would misrepresent how the
+   * limit actually applies.
+   */
+  async getCurrentUsage(agencyId: bigint) {
+    const { plan } = await this.getCurrentPlan(agencyId);
+
+    const workspaces = await this.prisma.workspaces.findMany({
+      where: { agency_id: agencyId, deleted_at: null },
+      select: { id: true },
+    });
+    const workspaceIds = workspaces.map((w) => w.id);
+    const workspacesUsed = workspaces.length;
+
+    const [contactsUsed, aiAssistantsUsed, channelsUsed, agentsUsed] = workspaceIds.length
+      ? await Promise.all([
+          this.prisma.contacts.count({ where: { workspace_id: { in: workspaceIds }, deleted_at: null } }),
+          this.prisma.ai_agents.count({ where: { workspace_id: { in: workspaceIds } } }),
+          this.prisma.wa_accounts.count({ where: { workspace_id: { in: workspaceIds }, deleted_at: null } }),
+          this.prisma.users.count({ where: { modelable_id: { in: workspaceIds }, modelable_type: 'App\\Models\\Workspace' } }),
+        ])
+      : [0, 0, 0, 0];
+
+    const includedWorkspaces = plan?.maximum_workspaces ?? workspacesUsed;
+    const extraWorkspaces = Math.max(0, workspacesUsed - includedWorkspaces);
+    const overageRateCents = plan ? (AgencyService.WORKSPACE_OVERAGE_CENTS[plan.item_id] ?? 0) : 0;
+    const planPriceCents = plan
+      ? (await this.prisma.billing_item_prices.findFirst({ where: { itemable_id: plan.id, status: 'active' } }))?.price ?? null
+      : null;
+
+    const subtotalCents = (planPriceCents ?? 0) + extraWorkspaces * overageRateCents;
+
+    // Real coupons (billing_coupons, applied via applyCoupon()) — each knocks
+    // a % off the subtotal independently (not compounded), matching how the
+    // UI has always listed them as separate line-item discounts.
+    const appliedCoupons = await this.getAppliedCoupons(agencyId);
+    const coupons = appliedCoupons.map((c) => ({
+      code: c.coupon_id,
+      name: c.invoice_name || c.coupon_id,
+      discount_percentage: c.discount_percentage ? Number(c.discount_percentage) : null,
+      discount_cents: c.discount_percentage
+        ? Math.round(subtotalCents * (Number(c.discount_percentage) / 100))
+        : Number(c.discount_amount ?? 0),
+    }));
+    const discountCents = coupons.reduce((sum, c) => sum + c.discount_cents, 0);
+
+    return {
+      plan: plan ? { item_id: plan.item_id, name: plan.external_name, price_cents: planPriceCents } : null,
+      workspaces: { used: workspacesUsed, included: includedWorkspaces, extra: extraWorkspaces, overage_cents: extraWorkspaces * overageRateCents },
+      contacts: { used: contactsUsed, included_per_workspace: plan?.maximum_contacts ?? null },
+      agents: { used: agentsUsed, included_per_workspace: plan?.free_agents ?? null },
+      ai_assistants: { used: aiAssistantsUsed, included_per_workspace: plan?.free_ai_agents ?? null },
+      channels: { used: channelsUsed, included_per_workspace: plan?.free_channels ?? null },
+      subtotal_cents: subtotalCents,
+      coupons,
+      discount_cents: discountCents,
+      total_cents: Math.max(0, subtotalCents - discountCents),
+    };
+  }
 
   async getAgency(agencyId: bigint) {
     const agency = await this.prisma.agencies.findUnique({
@@ -455,9 +658,11 @@ export class AgencyService {
       throw new BadRequestException('Agent limit must be greater than 0 when agents are enabled.');
     }
 
-    const subscription = await this.prisma.billing_subscriptions.findFirst({
-      where: { agency_id: agencyId, deleted_at: null },
-    });
+    // Must match getActiveSubscription's status filter (active/in_trial) — an
+    // unfiltered lookup can return a stale cancelled row that still carries
+    // its old billing_plan_id, silently reinstating limits from a plan the
+    // agency isn't actually on anymore.
+    const subscription = await this.getActiveSubscription(agencyId);
 
     const plan = subscription && subscription.billing_plan_id
       ? await this.prisma.billing_plans.findUnique({
@@ -465,36 +670,100 @@ export class AgencyService {
       })
       : null;
 
+    // Plan-level workspace cap — agencies without a resolvable plan/subscription
+    // aren't blocked (matches PlanFeaturesService's permissive-default stance).
+    if (plan) {
+      const totalWorkspaces = await this.prisma.workspaces.count({
+        where: { agency_id: agencyId, deleted_at: null },
+      });
+      if (totalWorkspaces >= plan.maximum_workspaces) {
+        throw new BadRequestException('Workspace limit reached');
+      }
+    }
+
+    // Plan-level caps on per-workspace resources — same shape as the
+    // workspace-count check above: exceeding the plan's allowance blocks the
+    // request with an explicit error, it doesn't get silently clamped. No
+    // plan/subscription skips these checks (pre-existing defaults apply).
+    const enforcePlanLimit = (label: string, requested: number | undefined, planAllowance: number) => {
+      if (requested != null && requested > planAllowance) {
+        throw new BadRequestException(`${label} exceeds your plan's limit of ${planAllowance}.`);
+      }
+      return requested ?? planAllowance;
+    };
+
+    let agentsLimit = data.agents_limit ?? 4;
+    let maximumContacts = data.maximum_contacts ?? 0;
+    let chatgptAssistantLimit = data.chatgpt_assistant_limit ?? 10;
+    let whatsappChannelsLimit = data.whatsapp_channels_limit ?? 1;
+    let instagramChannelsLimit = data.instagram_channels_limit ?? 1;
+    let facebookChannelsLimit = data.facebook_channels_limit ?? 1;
+    let allowBranding = data.allow_branding ?? false;
+
+    if (plan) {
+      agentsLimit = enforcePlanLimit('Agent limit', data.agents_limit, plan.free_agents);
+      // Every real plan defines a contacts cap (no "unlimited" tier), so the
+      // workspace is always contact-limited once a plan resolves — default
+      // to the plan's own allowance rather than 0, which enforceContactsLimit
+      // (contacts.service.ts) treats as "no cap" and would silently disable
+      // enforcement entirely.
+      maximumContacts = enforcePlanLimit(
+        'Contact limit',
+        data.limited_contacts ? data.maximum_contacts : plan.maximum_contacts,
+        plan.maximum_contacts,
+      );
+      chatgptAssistantLimit = enforcePlanLimit('AI assistant limit', data.chatgpt_assistant_limit, plan.free_ai_agents);
+      whatsappChannelsLimit = enforcePlanLimit('WhatsApp channel limit', data.whatsapp_channels_limit, plan.free_channels);
+      instagramChannelsLimit = enforcePlanLimit('Instagram channel limit', data.instagram_channels_limit, plan.free_channels);
+      facebookChannelsLimit = enforcePlanLimit('Facebook channel limit', data.facebook_channels_limit, plan.free_channels);
+      if (data.allow_branding && !plan.allow_branding) {
+        throw new BadRequestException("White-label branding isn't included in your plan.");
+      }
+    }
+
     const workspace = await this.prisma.$transaction(async (tx) => {
       // 1. Create Workspace
-      const ws = await tx.workspaces.create({
-        data: {
-          name: data.name,
-          slug: data.slug,
-          agency_id: agencyId,
-          creator_id: creatorId,
-          agency_agent_id: data.agent_id ? BigInt(data.agent_id) : null,
-          timezone: data.timezone || 'UTC',
-          status: 'ACTIVE',
-          created_at: new Date(),
-          updated_at: new Date(),
-          contacts_counter: 0,
-          allow_branding: data.allow_branding ?? false,
-          allow_support: data.allow_support ?? false,
-          allow_agents: data.allow_agents ?? true,
-          agents_limit: data.agents_limit ?? 4,
-          limited_contacts: data.limited_contacts ?? false,
-          maximum_contacts: data.maximum_contacts ?? 0,
-          chatgpt_assistant_limit: data.chatgpt_assistant_limit ?? 10,
-          whatsapp_channels_limit: data.whatsapp_channels_limit ?? 1,
-          instagram_channels_limit: data.instagram_channels_limit ?? 1,
-          facebook_channels_limit: data.facebook_channels_limit ?? 1,
-          telegram_channels_limit: data.telegram_channels_limit ?? 1,
-          twilio_channels_limit: data.twilio_channels_limit ?? 1,
-          zapi_channels_limit: data.zapi_channels_limit ?? 0,
-          webchat_channels_limit: data.webchat_channels_limit ?? 0,
-        },
-      });
+      // GAP 2's pre-check above only sees non-deleted workspaces, but the DB's
+      // `workspaces_slug_unique` constraint applies to every row regardless of
+      // deleted_at — a soft-deleted workspace can still hold a slug the
+      // pre-check thinks is free. Catch that race here instead of letting a
+      // raw P2002 crash the request.
+      let ws;
+      try {
+        ws = await tx.workspaces.create({
+          data: {
+            name: data.name,
+            slug: data.slug,
+            agency_id: agencyId,
+            creator_id: creatorId,
+            agency_agent_id: data.agent_id ? BigInt(data.agent_id) : null,
+            timezone: data.timezone || 'UTC',
+            status: 'ACTIVE',
+            created_at: new Date(),
+            updated_at: new Date(),
+            contacts_counter: 0,
+            allow_branding: allowBranding,
+            allow_support: data.allow_support ?? false,
+            allow_agents: data.allow_agents ?? true,
+            agents_limit: agentsLimit,
+            limited_contacts: plan ? true : (data.limited_contacts ?? false),
+            maximum_contacts: maximumContacts,
+            chatgpt_assistant_limit: chatgptAssistantLimit,
+            whatsapp_channels_limit: whatsappChannelsLimit,
+            instagram_channels_limit: instagramChannelsLimit,
+            facebook_channels_limit: facebookChannelsLimit,
+            telegram_channels_limit: data.telegram_channels_limit ?? 1,
+            twilio_channels_limit: data.twilio_channels_limit ?? 1,
+            zapi_channels_limit: data.zapi_channels_limit ?? 0,
+            webchat_channels_limit: data.webchat_channels_limit ?? 0,
+          },
+        });
+      } catch (err) {
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+          throw new BadRequestException('This subdomain is already taken. Please choose a different one.');
+        }
+        throw err;
+      }
 
       // 2. If an agency agent is assigned, mirror them as a workspace user row so they
       //    can later log in at the workspace's subdomain (login flow filters by
@@ -548,43 +817,69 @@ export class AgencyService {
         }
       }
 
-      // 3. Chargebee Sync (if needed)
-      if (subscription && plan) {
-        const totalWs = await tx.workspaces.count({
-          where: { agency_id: agencyId, deleted_at: null },
-        });
-        const extra = totalWs - plan.free_workspaces;
-
-        if (extra > 0) {
-          await this.chargebee.updateSubscriptionForItems(
-            subscription.subscription_id,
-            {
-              subscription_items: [
-                {
-                  item_price_id: process.env.BILLING_WORKSPACE_ADDON_PRICE_ID,
-                  quantity: extra,
-                },
-              ],
-            },
-          );
-        }
-      }
+      // 3. Chargebee Sync — DISABLED (commented, not deleted, in case
+      // Chargebee gets configured later). This project currently uses Swich
+      // + its own billing_plans/billing_subscriptions tables (see
+      // activatePlanFromTransaction in swich.service.ts), not Chargebee.
+      // Chargebee is never configured here (CHARGEBEE_SITE/API_KEY unset in
+      // .env), so ChargebeeService.client is null and this call always threw
+      // "Cannot read properties of null (reading 'subscription')" — inside
+      // this $transaction, that exception rolled back the whole workspace
+      // creation. It only started firing once billing_subscriptions actually
+      // had rows (previously `subscription` was always null, so this branch
+      // never ran) — a pre-existing dormant bug, not something introduced
+      // today, just newly triggered by real subscription data existing.
+      //
+      // if (subscription && plan) {
+      //   const totalWs = await tx.workspaces.count({
+      //     where: { agency_id: agencyId, deleted_at: null },
+      //   });
+      //   const extra = totalWs - plan.free_workspaces;
+      //
+      //   if (extra > 0) {
+      //     await this.chargebee.updateSubscriptionForItems(
+      //       subscription.subscription_id,
+      //       {
+      //         subscription_items: [
+      //           {
+      //             item_price_id: process.env.BILLING_WORKSPACE_ADDON_PRICE_ID,
+      //             quantity: extra,
+      //           },
+      //         ],
+      //       },
+      //     );
+      //   }
+      // }
 
       return { ws, inviteUser };
     });
 
-    // 3. Domain creation
+    // 3. Domain creation — ROOT_DOMAIN, same as every other domain created in
+    // this codebase (signup's agency/default-workspace domains in
+    // auth.service.ts). The old ACCOUNTS_DOMAIN var below is unset anywhere
+    // in .env, so it was silently falling back to the production root
+    // ("agentawk.com") — every manually-created workspace got a domain that
+    // can't resolve locally. Left commented (not deleted) — testing the
+    // ROOT_DOMAIN swap before removing the old line for good.
+    // const domainRoot = process.env.ACCOUNTS_DOMAIN || 'agentawk.com';
+    const rootDomain = process.env.ROOT_DOMAIN || 'agentawk.com';
     await this.domainsService.addCustomDomain(
       workspace.ws.id,
       'WORKSPACE',
       data.slug,
-      process.env.ACCOUNTS_DOMAIN || 'agentawk.com',
+      rootDomain,
       creatorId,
     );
 
     if (workspace.inviteUser) {
       const invitationId = Buffer.from(workspace.inviteUser.id.toString()).toString('base64');
-      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+      // The invited workspace's OWN subdomain, not the generic app URL — the
+      // tenant is already known from the invite, so this lands the user
+      // straight on that workspace's login after they set a password,
+      // instead of the ambiguous "Find Account" flow (see buildTenantUrl).
+      // Old generic-URL version kept commented for comparison/rollback:
+      // const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+      const frontendUrl = this.buildTenantUrl(`${data.slug}.${rootDomain}`);
       const inviteLink = `${frontendUrl}/accept-invitation?invitation_id=${invitationId}`;
       this.mailer
         .sendMail({
@@ -632,6 +927,26 @@ export class AgencyService {
       throw new BadRequestException('Agent limit must be greater than 0 when agents are enabled.');
     }
 
+    // Same plan-level caps as createWorkspace — editing a workspace can't be
+    // used to raise a limit past what the agency's plan allows. Only fields
+    // actually present in this update are validated — an unrelated edit
+    // (e.g. renaming the workspace) never fails because some other field was
+    // already over a plan the agency has since downgraded to.
+    // Same status-filtered lookup as createWorkspace — see comment there.
+    const subscriptionForUpdate = await this.getActiveSubscription(agencyId);
+    const planForUpdate = subscriptionForUpdate?.billing_plan_id
+      ? await this.prisma.billing_plans.findUnique({ where: { id: subscriptionForUpdate.billing_plan_id } })
+      : null;
+    const enforcePlanLimitOnUpdate = (label: string, requested: number | undefined, current: number, planAllowance: number) => {
+      if (requested != null && requested > planAllowance) {
+        throw new BadRequestException(`${label} exceeds your plan's limit of ${planAllowance}.`);
+      }
+      return requested ?? current;
+    };
+    if (planForUpdate && data.allow_branding && !planForUpdate.allow_branding) {
+      throw new BadRequestException("White-label branding isn't included in your plan.");
+    }
+
     // Agent reassignment (agency_agent_id holds the agency-level user id).
     const oldAgentId = workspace.agency_agent_id;
     const newAgentId = data.agent_id ? BigInt(data.agent_id) : null;
@@ -649,13 +964,13 @@ export class AgencyService {
           allow_branding: data.allow_branding ?? workspace.allow_branding,
           allow_support: data.allow_support ?? workspace.allow_support,
           allow_agents: data.allow_agents ?? workspace.allow_agents,
-          agents_limit: data.agents_limit ?? workspace.agents_limit,
-          limited_contacts: data.limited_contacts ?? workspace.limited_contacts,
-          maximum_contacts: data.maximum_contacts ?? workspace.maximum_contacts,
-          chatgpt_assistant_limit: data.chatgpt_assistant_limit ?? workspace.chatgpt_assistant_limit,
-          whatsapp_channels_limit: data.whatsapp_channels_limit ?? workspace.whatsapp_channels_limit,
-          instagram_channels_limit: data.instagram_channels_limit ?? workspace.instagram_channels_limit,
-          facebook_channels_limit: data.facebook_channels_limit ?? workspace.facebook_channels_limit,
+          agents_limit: planForUpdate ? enforcePlanLimitOnUpdate('Agent limit', data.agents_limit, Number(workspace.agents_limit), planForUpdate.free_agents) : (data.agents_limit ?? workspace.agents_limit),
+          limited_contacts: planForUpdate ? true : (data.limited_contacts ?? workspace.limited_contacts),
+          maximum_contacts: planForUpdate ? enforcePlanLimitOnUpdate('Contact limit', data.maximum_contacts, Number(workspace.maximum_contacts), planForUpdate.maximum_contacts) : (data.maximum_contacts ?? workspace.maximum_contacts),
+          chatgpt_assistant_limit: planForUpdate ? enforcePlanLimitOnUpdate('AI assistant limit', data.chatgpt_assistant_limit, Number(workspace.chatgpt_assistant_limit), planForUpdate.free_ai_agents) : (data.chatgpt_assistant_limit ?? workspace.chatgpt_assistant_limit),
+          whatsapp_channels_limit: planForUpdate ? enforcePlanLimitOnUpdate('WhatsApp channel limit', data.whatsapp_channels_limit, Number(workspace.whatsapp_channels_limit), planForUpdate.free_channels) : (data.whatsapp_channels_limit ?? workspace.whatsapp_channels_limit),
+          instagram_channels_limit: planForUpdate ? enforcePlanLimitOnUpdate('Instagram channel limit', data.instagram_channels_limit, Number(workspace.instagram_channels_limit), planForUpdate.free_channels) : (data.instagram_channels_limit ?? workspace.instagram_channels_limit),
+          facebook_channels_limit: planForUpdate ? enforcePlanLimitOnUpdate('Facebook channel limit', data.facebook_channels_limit, Number(workspace.facebook_channels_limit), planForUpdate.free_channels) : (data.facebook_channels_limit ?? workspace.facebook_channels_limit),
           telegram_channels_limit: data.telegram_channels_limit ?? workspace.telegram_channels_limit,
           twilio_channels_limit: data.twilio_channels_limit ?? workspace.twilio_channels_limit,
           zapi_channels_limit: data.zapi_channels_limit ?? workspace.zapi_channels_limit,
@@ -786,15 +1101,62 @@ export class AgencyService {
     });
     if (!workspace) throw new NotFoundException('Workspace not found');
 
-    // This is a placeholder for actual usage calculation logic
-    // In a real scenario, you'd aggregate data from various tables (messages, agents, etc.)
+    const [contactsUsed, agentsUsed, aiAssistantsUsed, whatsappUsed, instagramUsed, facebookUsed] =
+      await Promise.all([
+        this.prisma.contacts.count({ where: { workspace_id: workspaceId, deleted_at: null } }),
+        this.prisma.users.count({
+          where: { modelable_id: workspaceId, modelable_type: 'App\\Models\\Workspace' },
+        }),
+        this.prisma.ai_agents.count({ where: { workspace_id: workspaceId } }),
+        this.prisma.wa_accounts.count({ where: { workspace_id: workspaceId, deleted_at: null } }),
+        this.prisma.insta_pages.count({
+          where: { workspace_id: workspaceId, deleted_at: null, platform: 'instagram' },
+        }),
+        this.prisma.insta_pages.count({
+          where: { workspace_id: workspaceId, deleted_at: null, platform: 'facebook' },
+        }),
+      ]);
+
     return {
       success: true,
       usage: {
-        contacts: workspace.contacts_counter || 0,
-        agents: 0, // Placeholder
-        messages: 0, // Placeholder
-      }
+        contacts: {
+          used: contactsUsed,
+          limit: workspace.limited_contacts ? workspace.maximum_contacts : null,
+        },
+        agents: { used: agentsUsed, limit: workspace.agents_limit },
+        ai_assistants: { used: aiAssistantsUsed, limit: workspace.chatgpt_assistant_limit },
+        channels: {
+          whatsapp: { used: whatsappUsed, limit: workspace.whatsapp_channels_limit },
+          instagram: { used: instagramUsed, limit: workspace.instagram_channels_limit },
+          facebook: { used: facebookUsed, limit: workspace.facebook_channels_limit },
+        },
+      },
+    };
+  }
+
+  async getVoiceWallet(workspaceId: bigint, agencyId: bigint) {
+    const workspace = await this.prisma.workspaces.findFirst({
+      where: { id: workspaceId, agency_id: agencyId },
+    });
+    if (!workspace) throw new NotFoundException('Workspace not found');
+
+    const transactions = await this.prisma.voice_wallet.findMany({
+      where: { workspace_id: workspaceId },
+      orderBy: { created_at: 'desc' },
+      take: 50,
+    });
+
+    return {
+      balance_seconds: Number(transactions[0]?.balance ?? 0),
+      transactions: transactions.map((t) => ({
+        id: t.id.toString(),
+        type: t.transaction_type,
+        description: t.description,
+        seconds: Number(t.seconds),
+        balance_after: Number(t.balance),
+        created_at: t.created_at,
+      })),
     };
   }
 
