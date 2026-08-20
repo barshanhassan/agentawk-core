@@ -937,13 +937,22 @@ export class AgencyService {
     const planForUpdate = subscriptionForUpdate?.billing_plan_id
       ? await this.prisma.billing_plans.findUnique({ where: { id: subscriptionForUpdate.billing_plan_id } })
       : null;
+    // Only an actual INCREASE past the plan's allowance is blocked. Plenty of
+    // existing workspaces already sit above their plan (created before limits
+    // were enforced at all, or after the agency moved to a smaller plan), and
+    // the edit form posts EVERY field back on every save — even when the user
+    // only renamed the workspace. Rejecting an unchanged over-limit value
+    // would therefore make those workspaces permanently un-editable. So
+    // grandfathered values may be kept or lowered, never raised.
     const enforcePlanLimitOnUpdate = (label: string, requested: number | undefined, current: number, planAllowance: number) => {
-      if (requested != null && requested > planAllowance) {
+      if (requested != null && requested > planAllowance && requested > current) {
         throw new BadRequestException(`${label} exceeds your plan's limit of ${planAllowance}.`);
       }
       return requested ?? current;
     };
-    if (planForUpdate && data.allow_branding && !planForUpdate.allow_branding) {
+    // Same grandfathering rule as the numeric limits above: only block
+    // TURNING branding on, not re-saving a workspace that already has it.
+    if (planForUpdate && data.allow_branding && !planForUpdate.allow_branding && !workspace.allow_branding) {
       throw new BadRequestException("White-label branding isn't included in your plan.");
     }
 
