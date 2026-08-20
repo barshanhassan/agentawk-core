@@ -9,6 +9,7 @@ import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { MailerService } from '../mail/mailer.service';
+import { buildEmailHtml } from '../mail/email-template';
 import { generateSecret, verify, generateURI } from 'otplib';
 
 @Injectable()
@@ -197,13 +198,13 @@ export class AuthService {
     const mailResult = await this.mailer.sendMail({
       to: email,
       subject: 'Verify your AGENTAWK account',
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
-          <h2 style="color:#4f46e5">Welcome to AGENTAWK</h2>
-          <p>Use the code below to verify your email and activate your account. It is valid for 15 minutes.</p>
-          <p style="font-size:32px;font-weight:bold;letter-spacing:10px;background:#f3f4f6;padding:14px 20px;border-radius:10px;text-align:center">${code}</p>
-          <p style="color:#888;font-size:12px">If you didn't create an AGENTAWK account, you can ignore this email.</p>
-        </div>`,
+      html: buildEmailHtml({
+        heading: 'Welcome to AGENTAWK',
+        bodyHtml: `
+          <p style="margin:0 0 16px">Use the code below to verify your email and activate your account. It is valid for 15 minutes.</p>
+          <p style="font-size:32px;font-weight:bold;letter-spacing:10px;background:#eafaf0;color:#0B1020;padding:14px 20px;border-radius:10px;text-align:center;margin:0">${code}</p>`,
+        footerHtml: `If you didn't create an AGENTAWK account, you can ignore this email.`,
+      }),
       text: `Your AGENTAWK verification code is: ${code}`,
     });
 
@@ -914,13 +915,13 @@ export class AuthService {
         await this.mailer.sendMail({
           to: email,
           subject: 'Your AGENTAWK login links',
-          html: `
-        <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto">
-          <h2 style="color:#4f46e5">Find your account</h2>
-          <p>Here are the login links associated with <b>${email}</b>:</p>
-          <table style="width:100%;background:#f3f4f6;border-radius:10px;padding:16px;border-collapse:collapse">${rows}</table>
-          <p style="color:#888;font-size:12px">If you didn't request this, you can safely ignore this email.</p>
-        </div>`,
+          html: buildEmailHtml({
+            heading: 'Find your account',
+            bodyHtml: `
+              <p style="margin:0 0 16px">Here are the login links associated with <b>${email}</b>:</p>
+              <table style="width:100%;background:#f4fbf7;border-radius:10px;padding:16px;border-collapse:collapse">${rows}</table>`,
+            footerHtml: `If you didn't request this, you can safely ignore this email.`,
+          }),
           text: `Your AGENTAWK login links for ${email}:\n${textLines}`,
         });
       }
@@ -970,13 +971,13 @@ export class AuthService {
     const mailResult = await this.mailer.sendMail({
       to: email,
       subject: 'Your password reset code',
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
-          <h2 style="color:#4f46e5">Password reset</h2>
-          <p>Use the code below to reset your password. It is valid for a short time.</p>
-          <p style="font-size:26px;font-weight:bold;letter-spacing:4px;background:#f3f4f6;padding:14px 20px;border-radius:10px;text-align:center">${code}</p>
-          <p style="color:#888;font-size:12px">If you didn't request this, you can ignore this email.</p>
-        </div>`,
+      html: buildEmailHtml({
+        heading: 'Password reset',
+        bodyHtml: `
+          <p style="margin:0 0 16px">Use the code below to reset your password. It is valid for a short time.</p>
+          <p style="font-size:26px;font-weight:bold;letter-spacing:4px;background:#eafaf0;color:#0B1020;padding:14px 20px;border-radius:10px;text-align:center;margin:0">${code}</p>`,
+        footerHtml: `If you didn't request this, you can ignore this email.`,
+      }),
       text: `Your password reset code is: ${code}`,
     });
 
@@ -1030,22 +1031,22 @@ export class AuthService {
       where: { modelable_id: user.modelable_id, modelable_type: 'App\\Models\\Agency' },
       orderBy: { id: 'desc' },
     });
-    const loginUrl = domain ? `https://${domain.domain}/login` : (process.env.FRONTEND_URL || 'http://localhost:5173') + '/login';
+    const loginUrl = domain ? `${this.buildTenantUrl(domain.domain)}/login` : (process.env.FRONTEND_URL || 'http://localhost:5173') + '/login';
 
     const mailResult = await this.mailer.sendMail({
       to: email,
       subject: 'Your AGENTAWK login details',
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
-          <h2 style="color:#4f46e5">You're all set!</h2>
-          <p>Your email is verified and your account is ready. Here are your login details:</p>
-          <table style="width:100%;background:#f3f4f6;border-radius:10px;padding:16px;border-collapse:collapse">
+      html: buildEmailHtml({
+        heading: "You're all set!",
+        bodyHtml: `
+          <p style="margin:0 0 16px">Your email is verified and your account is ready. Here are your login details:</p>
+          <table style="width:100%;background:#f4fbf7;border-radius:10px;padding:16px;border-collapse:collapse">
             <tr><td style="padding:6px 10px;color:#666;font-size:13px">URL</td><td style="padding:6px 10px;font-weight:bold"><a href="${loginUrl}">${loginUrl}</a></td></tr>
             <tr><td style="padding:6px 10px;color:#666;font-size:13px">Username</td><td style="padding:6px 10px;font-weight:bold">${email}</td></tr>
             <tr><td style="padding:6px 10px;color:#666;font-size:13px">Password</td><td style="padding:6px 10px;font-weight:bold;letter-spacing:1px">${generatedPassword}</td></tr>
-          </table>
-          <p style="color:#888;font-size:12px">You can change this password any time from your profile after logging in.</p>
-        </div>`,
+          </table>`,
+        footerHtml: `You can change this password any time from your profile after logging in.`,
+      }),
       text: `Your AGENTAWK login details:\nURL: ${loginUrl}\nUsername: ${email}\nPassword: ${generatedPassword}`,
     });
 

@@ -8,6 +8,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import { MailerService } from '../mail/mailer.service';
+import { buildEmailHtml } from '../mail/email-template';
 
 @Injectable()
 export class WorkspacesService {
@@ -705,13 +706,13 @@ export class WorkspacesService {
       .sendMail({
         to: email,
         subject: "You've been invited to join a workspace on AGENTAWK",
-        html: `
-          <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
-            <h2 style="color:#4f46e5">You're invited</h2>
-            <p>You've been added as a team member. Click below to set your password and get started.</p>
-            <p style="text-align:center"><a href="${inviteLink}" style="display:inline-block;background:#4f46e5;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Accept invitation</a></p>
-            <p style="color:#888;font-size:12px">If the button doesn't work, copy this link: ${inviteLink}</p>
-          </div>`,
+        html: buildEmailHtml({
+          heading: "You're invited",
+          bodyHtml: `<p style="margin:0">You've been added as a team member. Click below to set your password and get started.</p>`,
+          ctaText: 'Accept invitation',
+          ctaUrl: inviteLink,
+          footerHtml: `If the button doesn't work, copy this link: ${inviteLink}`,
+        }),
         text: `You've been invited to join a workspace. Accept your invitation and set your password: ${inviteLink}`,
       })
       .catch((err) => this.logger.warn(`Failed to send invite email to ${email}: ${err?.message ?? err}`));

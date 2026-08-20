@@ -10,6 +10,7 @@ import { ChargebeeService } from '../billing/chargebee.service';
 import { DomainsService } from '../domains/domains.service';
 import { S3Service } from '../s3/s3.service';
 import { MailerService } from '../mail/mailer.service';
+import { buildEmailHtml } from '../mail/email-template';
 import * as bcrypt from 'bcrypt';
 
 // Date-only strings (YYYY-MM-DD) need explicit start/end-of-day so a request
@@ -885,13 +886,13 @@ export class AgencyService {
         .sendMail({
           to: workspace.inviteUser.email,
           subject: `Set your password for ${workspace.ws.name}`,
-          html: `
-            <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
-              <h2 style="color:#4f46e5">You've been assigned a workspace</h2>
-              <p>Click below to set your password and log in to <b>${workspace.ws.name}</b>.</p>
-              <p style="text-align:center"><a href="${inviteLink}" style="display:inline-block;background:#4f46e5;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Set password</a></p>
-              <p style="color:#888;font-size:12px">If the button doesn't work, copy this link: ${inviteLink}</p>
-            </div>`,
+          html: buildEmailHtml({
+            heading: "You've been assigned a workspace",
+            bodyHtml: `<p style="margin:0">Click below to set your password and log in to <b>${workspace.ws.name}</b>.</p>`,
+            ctaText: 'Set password',
+            ctaUrl: inviteLink,
+            footerHtml: `If the button doesn't work, copy this link: ${inviteLink}`,
+          }),
           text: `You've been assigned to workspace "${workspace.ws.name}". Set your password: ${inviteLink}`,
         })
         .catch((err) => this.logger.warn(`Failed to send workspace invite email to ${workspace.inviteUser?.email}: ${err?.message ?? err}`));
