@@ -15,7 +15,18 @@ export function buildEmailHtml(opts: {
   return `
     <div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:auto;padding:32px 24px;background:#ffffff">
       <div style="margin-bottom:28px">
-        <span style="font-size:20px;font-weight:700;color:#0B1020;letter-spacing:-0.01em">agen<span style="color:#25d366">t</span><span style="color:#25d366">awk</span></span>
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+          <td style="vertical-align:middle;padding-right:8px">
+            <svg width="22" height="29" viewBox="0 0 40 52" xmlns="http://www.w3.org/2000/svg">
+              <path fill-rule="evenodd" clip-rule="evenodd" d="M6 3 H34 A4 4 0 0 1 38 7 V17 A4 4 0 0 1 34 21 H6 A4 4 0 0 1 2 17 V7 A4 4 0 0 1 6 3 Z M11 12 a3.2 3.2 0 1 0 6.4 0 a3.2 3.2 0 1 0 -6.4 0 Z M22.6 12 a3.2 3.2 0 1 0 6.4 0 a3.2 3.2 0 1 0 -6.4 0 Z" fill="#25d366" />
+              <rect x="4" y="25" width="32" height="5.5" rx="2" fill="#25d366" />
+              <rect x="16.5" y="30" width="7" height="20" rx="2" fill="#25d366" />
+            </svg>
+          </td>
+          <td style="vertical-align:middle">
+            <span style="font-size:20px;font-weight:700;color:#0B1020;letter-spacing:-0.01em">agen<span style="color:#25d366">t</span><span style="color:#25d366">awk</span></span>
+          </td>
+        </tr></table>
       </div>
       <h2 style="color:#0B1020;font-size:20px;margin:0 0 12px">${heading}</h2>
       <div style="color:#33475b;font-size:14px;line-height:1.6">${bodyHtml}</div>
