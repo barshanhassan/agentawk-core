@@ -244,7 +244,7 @@ export class WorkspacesService {
         data: {
           brandable_id: workspaceId,
           brandable_type: 'App\\Models\\Workspace',
-          color: '#0a7a22',
+          color: '#25d366',
           link_color: '#5742f5',
           incoming_chat_color: '#705800',
           incoming_chat_text_color: '#ffffff',

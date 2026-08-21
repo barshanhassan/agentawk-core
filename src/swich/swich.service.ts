@@ -557,7 +557,46 @@ export class SwichService {
       });
     }
 
+    await this.syncWorkspacesToPlan(tx.agency_id, plan);
+
     this.logger.log(`[swich] activated plan "${planItemId}" for agency ${tx.agency_id}`);
+  }
+
+  // A plan upgrade only touches billing_subscriptions above — without this,
+  // workspaces created under the OLD plan never see the new plan's higher
+  // limits/features (e.g. White Label) until someone happens to re-save that
+  // workspace's settings. Raises every existing workspace's plan-derived
+  // fields up to the new plan's allowance; never lowers them, since a
+  // downgrade already returns early above and can't reach this point.
+  private async syncWorkspacesToPlan(agencyId: bigint, plan: { allow_branding: boolean; free_channels: number; free_agents: number; maximum_contacts: number; free_ai_agents: number }) {
+    const workspaces = await this.prisma.workspaces.findMany({
+      where: { agency_id: agencyId, deleted_at: null },
+      select: {
+        id: true,
+        allow_branding: true,
+        whatsapp_channels_limit: true,
+        instagram_channels_limit: true,
+        facebook_channels_limit: true,
+        agents_limit: true,
+        maximum_contacts: true,
+        chatgpt_assistant_limit: true,
+      },
+    });
+
+    for (const ws of workspaces) {
+      await this.prisma.workspaces.update({
+        where: { id: ws.id },
+        data: {
+          allow_branding: ws.allow_branding || plan.allow_branding,
+          whatsapp_channels_limit: Math.max(ws.whatsapp_channels_limit, plan.free_channels),
+          instagram_channels_limit: Math.max(ws.instagram_channels_limit, plan.free_channels),
+          facebook_channels_limit: Math.max(ws.facebook_channels_limit, plan.free_channels),
+          agents_limit: Math.max(ws.agents_limit, plan.free_agents),
+          maximum_contacts: Math.max(ws.maximum_contacts, plan.maximum_contacts),
+          chatgpt_assistant_limit: Math.max(ws.chatgpt_assistant_limit, plan.free_ai_agents),
+        },
+      });
+    }
   }
 
   async getTransaction(owner: SwichOwner, customerTransactionId: string) {

@@ -1088,21 +1088,464 @@ export class AgencyService {
     return { success: updated.count > 0 };
   }
 
+  /**
+   * PERMANENT hard-delete of a workspace and (almost) everything it owns.
+   * Replaces the old soft-delete (`deleted_at`) behaviour — every
+   * workspace-scoped row across the schema is purged inside one big
+   * transaction, then the `workspaces` row itself is deleted.
+   *
+   * Deliberately excluded from the purge (stakeholder decision):
+   *  - `audit_logs` — the workspace's own audit trail survives the delete.
+   *  - `agency_logs` — has no `workspace_id` column, never touched here;
+   *    the `logAgencyEvent` call below writes the "workspace_deleted" entry
+   *    into it AFTER the transaction commits, which is exactly why it's
+   *    safe even though the workspace row no longer exists by then.
+   *
+   * `bundles` gets a safety check: a bundle owned by this workspace that
+   * another workspace has downloaded/shared is left in place (collected
+   * into `skippedBundles`) instead of being deleted out from under them.
+   *
+   * `media_gallery` rows are captured (id/file_path/file_url) before
+   * deletion into `mediaToCleanup`, for a future S3 object-cleanup job —
+   * actual S3 deletion is NOT performed here.
+   */
   async deleteWorkspace(workspaceId: bigint, agencyId: bigint, actorId: bigint = 0n) {
     const workspace = await this.prisma.workspaces.findFirst({
       where: { id: workspaceId, agency_id: agencyId },
       select: { name: true },
     });
-    const updated = await this.prisma.workspaces.updateMany({
-      where: { id: workspaceId, agency_id: agencyId },
-      data: { deleted_at: new Date() },
-    });
-    if (updated.count > 0) {
-      await this.logAgencyEvent(agencyId, 'workspace_deleted', actorId, 'App\\Models\\Workspace', workspaceId, {
-        workspace_name: workspace?.name,
+    if (!workspace) throw new NotFoundException('Workspace not found in this agency');
+
+    const skippedBundles: { id: string; name: string }[] = [];
+    const mediaToCleanup: { id: string; file_path: string | null; file_url: string | null }[] = [];
+
+    await this.prisma.$transaction(async (tx) => {
+      // ── WhatsApp ──────────────────────────────────────────────────────
+      const waAccounts = await tx.wa_accounts.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const waAccountIds = waAccounts.map((a) => a.id);
+      if (waAccountIds.length) {
+        const waChats = await tx.wa_chats.findMany({ where: { wa_account_id: { in: waAccountIds } }, select: { id: true } });
+        const waChatIds = waChats.map((c) => c.id);
+        if (waChatIds.length) await tx.wa_messages.deleteMany({ where: { wa_chat_id: { in: waChatIds } } });
+        await tx.wa_chats.deleteMany({ where: { wa_account_id: { in: waAccountIds } } });
+        // wa_templates.wa_account_id is stored as String, not BigInt — cast.
+        await tx.wa_templates.deleteMany({ where: { wa_account_id: { in: waAccountIds.map(String) } } });
+        await tx.wa_phone_numbers.deleteMany({ where: { wa_account_id: { in: waAccountIds } } });
+      }
+      await tx.wa_statistics.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.wa_accounts.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Instagram / Messenger (insta_pages serves both platforms) ──────
+      const instaPages = await tx.insta_pages.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const instaPageIds = instaPages.map((p) => p.id);
+      if (instaPageIds.length) {
+        const instaChats = await tx.insta_chats.findMany({ where: { insta_page_id: { in: instaPageIds } }, select: { id: true } });
+        const instaChatIds = instaChats.map((c) => c.id);
+        if (instaChatIds.length) await tx.insta_messages.deleteMany({ where: { insta_chat_id: { in: instaChatIds } } });
+        await tx.insta_chats.deleteMany({ where: { insta_page_id: { in: instaPageIds } } });
+        await tx.insta_page_users.deleteMany({ where: { insta_page_id: { in: instaPageIds } } });
+        await tx.insta_features.deleteMany({ where: { insta_page_id: { in: instaPageIds } } });
+      }
+      await tx.insta_statistics.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.insta_pages.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Facebook (legacy, separate fb_pages table) ─────────────────────
+      const fbPages = await tx.fb_pages.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const fbPageIds = fbPages.map((p) => p.id);
+      if (fbPageIds.length) {
+        const fbChats = await tx.fb_chats.findMany({ where: { fb_page_id: { in: fbPageIds } }, select: { id: true } });
+        const fbChatIds = fbChats.map((c) => c.id);
+        if (fbChatIds.length) await tx.fb_messages.deleteMany({ where: { fb_chat_id: { in: fbChatIds } } });
+        const fbOtnRequests = await tx.fb_otn_requests.findMany({ where: { fb_page_id: { in: fbPageIds } }, select: { id: true } });
+        const fbOtnRequestIds = fbOtnRequests.map((r) => r.id);
+        if (fbOtnRequestIds.length) await tx.fb_otn_subscribers.deleteMany({ where: { fb_otn_request_id: { in: fbOtnRequestIds } } });
+        await tx.fb_otn_requests.deleteMany({ where: { fb_page_id: { in: fbPageIds } } });
+        await tx.fb_chats.deleteMany({ where: { fb_page_id: { in: fbPageIds } } });
+        await tx.fb_page_users.deleteMany({ where: { fb_page_id: { in: fbPageIds } } });
+        await tx.fb_features.deleteMany({ where: { fb_page_id: { in: fbPageIds } } });
+      }
+      await tx.fb_statistics.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.fb_pages.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Telegram ─────────────────────────────────────────────────────
+      const telegramBots = await tx.telegram_bots.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const telegramBotIds = telegramBots.map((b) => b.id);
+      if (telegramBotIds.length) {
+        const telegramChats = await tx.telegram_chats.findMany({ where: { telegram_bot_id: { in: telegramBotIds } }, select: { id: true } });
+        const telegramChatIds = telegramChats.map((c) => c.id);
+        if (telegramChatIds.length) {
+          await tx.telegram_messages.deleteMany({ where: { telegram_chat_id: { in: telegramChatIds } } });
+          await tx.telegram_contacts.deleteMany({ where: { telegram_chat_id: { in: telegramChatIds } } });
+        }
+        await tx.telegram_chats.deleteMany({ where: { telegram_bot_id: { in: telegramBotIds } } });
+        await tx.telegram_bot_users.deleteMany({ where: { telegram_bot_id: { in: telegramBotIds } } });
+      }
+      await tx.telegram_statistics.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.telegram_bots.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Twilio (voice/SMS) ───────────────────────────────────────────
+      const twilioAccounts = await tx.twilio_accounts.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const twilioAccountIds = twilioAccounts.map((a) => a.id);
+      if (twilioAccountIds.length) {
+        const twilioChats = await tx.twilio_chats.findMany({ where: { twilio_account_id: { in: twilioAccountIds } }, select: { id: true } });
+        const twilioChatIds = twilioChats.map((c) => c.id);
+        if (twilioChatIds.length) await tx.twilio_messages.deleteMany({ where: { twilio_chat_id: { in: twilioChatIds } } });
+        await tx.twilio_chats.deleteMany({ where: { twilio_account_id: { in: twilioAccountIds } } });
+        await tx.twilio_call_logs.deleteMany({ where: { twilio_account_id: { in: twilioAccountIds } } });
+        await tx.twilio_account_users.deleteMany({ where: { twilio_account_id: { in: twilioAccountIds } } });
+        await tx.twilio_numbers.deleteMany({ where: { twilio_account_id: { in: twilioAccountIds } } });
+      }
+      await tx.twilio_sip_credentials.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.twilio_sms_statistics.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.twilio_accounts.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Z-API ────────────────────────────────────────────────────────
+      const zapiInstances = await tx.zapi_instances.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const zapiInstanceIds = zapiInstances.map((i) => i.id);
+      if (zapiInstanceIds.length) {
+        const zapiChats = await tx.zapi_chats.findMany({ where: { zapi_instance_id: { in: zapiInstanceIds } }, select: { id: true } });
+        const zapiChatIds = zapiChats.map((c) => c.id);
+        if (zapiChatIds.length) await tx.zapi_messages.deleteMany({ where: { zapi_chat_id: { in: zapiChatIds } } });
+        await tx.zapi_chats.deleteMany({ where: { zapi_instance_id: { in: zapiInstanceIds } } });
+      }
+      await tx.zapi_statistics.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.zapi_instances.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Evolution API ────────────────────────────────────────────────
+      const evolutionInstances = await tx.evolution_instances.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const evolutionInstanceIds = evolutionInstances.map((i) => i.id);
+      if (evolutionInstanceIds.length) {
+        const evolutionChats = await tx.evolution_chats.findMany({ where: { evolution_instance_id: { in: evolutionInstanceIds } }, select: { id: true } });
+        const evolutionChatIds = evolutionChats.map((c) => c.id);
+        if (evolutionChatIds.length) await tx.evolution_messages.deleteMany({ where: { evolution_chat_id: { in: evolutionChatIds } } });
+        await tx.evolution_chats.deleteMany({ where: { evolution_instance_id: { in: evolutionInstanceIds } } });
+      }
+      await tx.evolution_statistics.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.evolution_instances.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Webchat (wc_*) ───────────────────────────────────────────────
+      const wcInstances = await tx.wc_instances.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const wcInstanceIds = wcInstances.map((i) => i.id);
+      if (wcInstanceIds.length) {
+        const wcChats = await tx.wc_chats.findMany({ where: { wc_instance_id: { in: wcInstanceIds } }, select: { id: true } });
+        const wcChatIds = wcChats.map((c) => c.id);
+        if (wcChatIds.length) await tx.wc_messages.deleteMany({ where: { wc_chat_id: { in: wcChatIds } } });
+        await tx.wc_chats.deleteMany({ where: { wc_instance_id: { in: wcInstanceIds } } });
+      }
+      await tx.wc_statistics.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.wc_instances.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Chatbots ─────────────────────────────────────────────────────
+      const chatbots = await tx.chatbots.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const chatbotIds = chatbots.map((c) => c.id);
+      if (chatbotIds.length) {
+        const chatbotChats = await tx.chatbot_chats.findMany({ where: { chatbot_id: { in: chatbotIds } }, select: { id: true } });
+        const chatbotChatIds = chatbotChats.map((c) => c.id);
+        if (chatbotChatIds.length) await tx.chatbot_messages.deleteMany({ where: { chat_id: { in: chatbotChatIds } } });
+        await tx.chatbot_chats.deleteMany({ where: { chatbot_id: { in: chatbotIds } } });
+      }
+      await tx.chatbot_statistics.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.chatbots.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Cross-channel inbox/misc ─────────────────────────────────────
+      await tx.message_reactions.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.chat_inputs.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.inbox.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.inbox_folders.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.inbox_settings.deleteMany({ where: { workspace_id: workspaceId } });
+      // inbox_system_fields.workspace_id is Int, not BigInt — cast.
+      await tx.inbox_system_fields.deleteMany({ where: { workspace_id: Number(workspaceId) } });
+      await tx.support_numbers.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Channels / integrations ──────────────────────────────────────
+      const difyBots = await tx.dify_bots.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const difyBotIds = difyBots.map((b) => b.id);
+      if (difyBotIds.length) await tx.dify_messages.deleteMany({ where: { dify_bot_id: { in: difyBotIds } } });
+      await tx.dify_bots.deleteMany({ where: { workspace_id: workspaceId } });
+
+      await tx.baserow_accounts.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.cal_accounts.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.integrations.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.make_webhooks.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.make_hooks.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.webhooks.deleteMany({ where: { workspace_id: workspaceId } });
+
+      const apiTriggers = await tx.api_triggers.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const apiTriggerIds = apiTriggers.map((t) => t.id);
+      if (apiTriggerIds.length) await tx.api_trigger_requests.deleteMany({ where: { api_trigger_id: { in: apiTriggerIds } } });
+      await tx.api_triggers.deleteMany({ where: { workspace_id: workspaceId } });
+
+      await tx.capi_logs.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.capi.deleteMany({ where: { workspace_id: workspaceId } });
+
+      const widgets = await tx.widgets.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const widgetIds = widgets.map((w) => w.id);
+      if (widgetIds.length) await tx.widget_actions.deleteMany({ where: { widget_id: { in: widgetIds } } });
+      await tx.widgets.deleteMany({ where: { workspace_id: workspaceId } });
+
+      const iframes = await tx.iframes.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const iframeIds = iframes.map((f) => f.id);
+      if (iframeIds.length) await tx.iframe_permissions.deleteMany({ where: { iframe_id: { in: iframeIds } } });
+      await tx.iframes.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.iframe_menus.deleteMany({ where: { workspace_id: workspaceId } });
+
+      await tx.voice_wallet.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.swich_accounts.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.swich_transactions.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── AI ────────────────────────────────────────────────────────────
+      const aiAgents = await tx.ai_agents.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const aiAgentIds = aiAgents.map((a) => a.id);
+      if (aiAgentIds.length) {
+        const aiThreads = await tx.ai_threads.findMany({ where: { agent_id: { in: aiAgentIds } }, select: { id: true } });
+        const aiThreadIds = aiThreads.map((t) => t.id);
+        if (aiThreadIds.length) await tx.ai_messages.deleteMany({ where: { thread_id: { in: aiThreadIds } } });
+        await tx.ai_threads.deleteMany({ where: { agent_id: { in: aiAgentIds } } });
+        await tx.ai_logs.deleteMany({ where: { agent_id: { in: aiAgentIds } } });
+        await tx.ai_files.deleteMany({ where: { agent_id: { in: aiAgentIds } } });
+        await tx.ai_functions.deleteMany({ where: { agent_id: { in: aiAgentIds } } });
+      }
+      await tx.ai_agents.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.ai_accounts.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.ai_feeders.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.ai_knowledgebases.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.ai_message_daily_stats.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.ai_products.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.ai_questions.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.ai_themes.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.ai_topics.deleteMany({ where: { workspace_id: workspaceId } });
+
+      const aiVoiceAgents = await tx.ai_voice_agents.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const aiVoiceAgentIds = aiVoiceAgents.map((a) => a.id);
+      if (aiVoiceAgentIds.length) {
+        await tx.ai_voice_agent_file.deleteMany({ where: { ai_voice_agent_id: { in: aiVoiceAgentIds } } });
+        await tx.ai_voice_agent_functions.deleteMany({ where: { ai_voice_agent_id: { in: aiVoiceAgentIds } } });
+        await tx.ai_voice_agent_knowledgebase.deleteMany({ where: { ai_voice_agent_id: { in: aiVoiceAgentIds } } });
+      }
+      await tx.ai_voice_agents.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.ai_voice_files.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.ai_voice_logs.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Automations ──────────────────────────────────────────────────
+      const automations = await tx.automations.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const automationIds = automations.map((a) => a.id);
+      if (automationIds.length) {
+        const automationVersions = await tx.automation_versions.findMany({ where: { automation_id: { in: automationIds } }, select: { id: true } });
+        const automationVersionIds = automationVersions.map((v) => v.id);
+        if (automationVersionIds.length) {
+          const automationSteps = await tx.automation_steps.findMany({ where: { automation_version_id: { in: automationVersionIds } }, select: { id: true } });
+          const automationStepIds = automationSteps.map((s) => s.id);
+          if (automationStepIds.length) {
+            await tx.automation_quick_replies.deleteMany({ where: { automation_step_id: { in: automationStepIds } } });
+            await tx.automation_quick_reply_followups.deleteMany({ where: { automation_step_id: { in: automationStepIds } } });
+            await tx.automation_quick_reply_retries.deleteMany({ where: { automation_step_id: { in: automationStepIds } } });
+            const stepActivities = await tx.automation_step_activities.findMany({ where: { step_id: { in: automationStepIds } }, select: { id: true } });
+            const stepActivityIds = stepActivities.map((s) => s.id);
+            if (stepActivityIds.length) await tx.automation_activity_iterations.deleteMany({ where: { activity_id: { in: stepActivityIds } } });
+            await tx.automation_step_activities.deleteMany({ where: { step_id: { in: automationStepIds } } });
+          }
+          await tx.automation_flow.deleteMany({ where: { automation_version_id: { in: automationVersionIds } } });
+          await tx.automation_steps.deleteMany({ where: { automation_version_id: { in: automationVersionIds } } });
+        }
+        await tx.automation_versions.deleteMany({ where: { automation_id: { in: automationIds } } });
+        await tx.automation_objects.deleteMany({ where: { automation_id: { in: automationIds } } });
+        await tx.automation_runs.deleteMany({ where: { automation_id: { in: automationIds } } });
+        await tx.automation_activity_clicks.deleteMany({ where: { automation_id: { in: automationIds } } });
+        await tx.automation_quick_reply_clicks.deleteMany({ where: { automation_id: { in: automationIds } } });
+      }
+      await tx.automations.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.automation_folders.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Bookings / pipeline / tasks / teams ──────────────────────────
+      await tx.bookings.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.booking_logs.deleteMany({ where: { workspace_id: workspaceId } });
+
+      const pipelines = await tx.pipelines.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const pipelineIds = pipelines.map((p) => p.id);
+      const opportunities = await tx.pipeline_opportunities.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const opportunityIds = opportunities.map((o) => o.id);
+      if (opportunityIds.length) {
+        await tx.pipeline_opportunity_contacts.deleteMany({ where: { opportunity_id: { in: opportunityIds } } });
+        await tx.pipeline_opportunity_notes.deleteMany({ where: { opportunity_id: { in: opportunityIds } } });
+        await tx.pipeline_opportunity_step_logs.deleteMany({ where: { opportunity_id: { in: opportunityIds } } });
+      }
+      await tx.pipeline_opportunities.deleteMany({ where: { workspace_id: workspaceId } });
+      if (pipelineIds.length) {
+        await tx.pipeline_actions.deleteMany({ where: { pl_id: { in: pipelineIds } } });
+        await tx.pipeline_lost_reasons.deleteMany({ where: { pl_id: { in: pipelineIds } } });
+        await tx.pipeline_permissions.deleteMany({ where: { pl_id: { in: pipelineIds } } });
+        await tx.pipeline_steps.deleteMany({ where: { pl_id: { in: pipelineIds } } });
+      }
+      await tx.pipelines.deleteMany({ where: { workspace_id: workspaceId } });
+
+      await tx.tasks.deleteMany({ where: { workspace_id: workspaceId } });
+
+      const teams = await tx.teams.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const teamIds = teams.map((t) => t.id);
+      if (teamIds.length) await tx.team_members.deleteMany({ where: { team_id: { in: teamIds } } });
+      await tx.teams.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Billing / usage ───────────────────────────────────────────────
+      await tx.workspace_usage.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.mobile_app_tokens.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Custom fields / tags ─────────────────────────────────────────
+      const customFields = await tx.custom_fields.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const customFieldIds = customFields.map((f) => f.id);
+      if (customFieldIds.length) {
+        const cfEntities = await tx.custom_field_entities.findMany({ where: { custom_field_id: { in: customFieldIds } }, select: { id: true } });
+        const cfEntityIds = cfEntities.map((e) => e.id);
+        if (cfEntityIds.length) await tx.custom_field_entity_values.deleteMany({ where: { cf_entity_id: { in: cfEntityIds } } });
+        await tx.custom_field_entities.deleteMany({ where: { custom_field_id: { in: customFieldIds } } });
+        await tx.custom_field_properties.deleteMany({ where: { custom_field_id: { in: customFieldIds } } });
+      }
+      await tx.custom_fields.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.custom_field_folders.deleteMany({ where: { workspace_id: workspaceId } });
+
+      const tags = await tx.tags.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const tagIds = tags.map((t) => t.id);
+      if (tagIds.length) await tx.tag_links.deleteMany({ where: { tag_id: { in: tagIds } } });
+      await tx.tags.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.tag_folders.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Contacts & companies ─────────────────────────────────────────
+      const contacts = await tx.contacts.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const contactIds = contacts.map((c) => c.id);
+      if (contactIds.length) {
+        await tx.automation_activity_iterations.deleteMany({ where: { contact_id: { in: contactIds } } });
+        await tx.channel_opts.deleteMany({ where: { contact_id: { in: contactIds } } });
+        await tx.contact_date_triggers.deleteMany({ where: { contact_id: { in: contactIds } } });
+        await tx.contact_date_values.deleteMany({ where: { contact_id: { in: contactIds } } });
+        await tx.contact_last_messages.deleteMany({ where: { contact_id: { in: contactIds } } });
+        await tx.contact_opting.deleteMany({ where: { contact_id: { in: contactIds } } });
+        await tx.notes.deleteMany({ where: { contact_id: { in: contactIds } } });
+      }
+      await tx.contact_export_requests.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.conversion_events.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.referrals.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.quick_filters.deleteMany({ where: { workspace_id: workspaceId } });
+
+      const quickResponses = await tx.quick_responses.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const quickResponseIds = quickResponses.map((q) => q.id);
+      if (quickResponseIds.length) await tx.quick_response_media.deleteMany({ where: { quick_response_id: { in: quickResponseIds } } });
+      await tx.quick_responses.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // contact_mobiles / contact_emails are polymorphic on the OWNED entity
+      // (modelable_type=Contact or User) but always carry ownership_type /
+      // ownership_id pinned to the owning Workspace (see contacts.service.ts
+      // findContactByEmail and workspaces.service.ts upsertWorkspaceUserMobile)
+      // — a single filter on ownership_* catches both contact-owned and
+      // workspace-user-owned rows for this workspace in one shot.
+      await tx.contact_mobiles.deleteMany({ where: { ownership_type: 'App\\Models\\Workspace', ownership_id: workspaceId } });
+      await tx.contact_emails.deleteMany({ where: { ownership_type: 'App\\Models\\Workspace', ownership_id: workspaceId } });
+
+      const companies = await tx.companies.findMany({ where: { workspace_id: workspaceId }, select: { id: true } });
+      const companyIds = companies.map((c) => c.id);
+      if (companyIds.length) await tx.notes.deleteMany({ where: { company_id: { in: companyIds } } });
+      await tx.companies.deleteMany({ where: { workspace_id: workspaceId } });
+
+      await tx.contacts.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Workspace's own users + auxiliary tables ─────────────────────
+      const users = await tx.users.findMany({
+        where: { modelable_id: workspaceId, modelable_type: 'App\\Models\\Workspace' },
+        select: { id: true },
       });
-    }
-    return { success: updated.count > 0 };
+      const userIds = users.map((u) => u.id);
+      if (userIds.length) {
+        await tx.acl_roleables.deleteMany({ where: { roleable_type: 'App\\Models\\User', roleable_id: { in: userIds } } });
+        await tx.user_accesses.deleteMany({ where: { user_id: { in: userIds } } });
+        await tx.user_limits.deleteMany({ where: { user_id: { in: userIds } } });
+        await tx.user_login_policies.deleteMany({ where: { user_id: { in: userIds } } });
+        await tx.user_states.deleteMany({ where: { user_id: { in: userIds } } });
+        await tx.user_call_counters.deleteMany({ where: { user_id: { in: userIds } } });
+        await tx.user_accepted_terms.deleteMany({ where: { user_id: { in: userIds } } });
+        // Legacy Laravel-Passport-style tables — unused by this Node app (no
+        // references anywhere in src/), kept as a defensive cleanup in case
+        // rows exist from the pre-rewrite system. user_id is a plain column
+        // here, not polymorphic.
+        await tx.oauth_access_tokens.deleteMany({ where: { user_id: { in: userIds } } });
+        await tx.oauth_auth_codes.deleteMany({ where: { user_id: { in: userIds } } });
+        // personal_access_tokens for individual users, IF the legacy PHP app's
+        // Sanctum convention was ever used (defensive; unconfirmed in this repo).
+        await tx.personal_access_tokens.deleteMany({ where: { tokenable_type: 'App\\Models\\User', tokenable_id: { in: userIds } } });
+      }
+      await tx.users.deleteMany({ where: { modelable_id: workspaceId, modelable_type: 'App\\Models\\Workspace' } });
+
+      // Workspace-level API keys — confirmed real usage in
+      // integrations.service.ts (getApiKeys/generateApiKey): tokenable_type
+      // is the literal string 'Workspace' (not 'App\Models\Workspace'), and
+      // tokenable_id is the workspace id directly, not a user id.
+      await tx.personal_access_tokens.deleteMany({ where: { tokenable_type: 'Workspace', tokenable_id: workspaceId } });
+
+      // ── ACL roles owned by this workspace ────────────────────────────
+      const roles = await tx.acl_roles.findMany({
+        where: { ownerable_id: workspaceId, ownerable_type: 'App\\Models\\Workspace' },
+        select: { id: true },
+      });
+      // acl_role_permissions.role_id / acl_roleables.role_id are Int, not BigInt — cast.
+      const roleIdsNum = roles.map((r) => Number(r.id));
+      if (roleIdsNum.length) {
+        await tx.acl_role_permissions.deleteMany({ where: { role_id: { in: roleIdsNum } } });
+        await tx.acl_roleables.deleteMany({ where: { role_id: { in: roleIdsNum } } });
+      }
+      await tx.acl_roles.deleteMany({ where: { ownerable_id: workspaceId, ownerable_type: 'App\\Models\\Workspace' } });
+
+      // ── White-label / domain / email ─────────────────────────────────
+      await tx.brandings.deleteMany({ where: { brandable_id: workspaceId, brandable_type: 'App\\Models\\Workspace' } });
+      await tx.domains.deleteMany({ where: { modelable_id: workspaceId, modelable_type: 'App\\Models\\Workspace' } });
+      await tx.notification_emails.deleteMany({ where: { modelable_id: workspaceId, modelable_type: 'App\\Models\\Workspace' } });
+
+      // ── Misc ──────────────────────────────────────────────────────────
+      await tx.events_queue.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Bundles (cross-workspace-share safety check) ─────────────────
+      // bundles.workspace_id is Int, not BigInt — cast.
+      const ownBundles = await tx.bundles.findMany({ where: { workspace_id: Number(workspaceId) }, select: { id: true, name: true } });
+      for (const bundle of ownBundles) {
+        const [downloadedElsewhere, sharedElsewhere] = await Promise.all([
+          tx.bundle_downloads.findFirst({ where: { bundle_id: bundle.id, workspace_id: { not: workspaceId } }, select: { id: true } }),
+          tx.bundle_shares.findFirst({ where: { bundle_id: bundle.id, workspace_id: { not: workspaceId } }, select: { id: true } }),
+        ]);
+        if (downloadedElsewhere || sharedElsewhere) {
+          skippedBundles.push({ id: bundle.id.toString(), name: bundle.name });
+          continue;
+        }
+        await tx.bundle_instructions.deleteMany({ where: { bundle_id: bundle.id } });
+        await tx.bundle_prompts.deleteMany({ where: { bundle_id: bundle.id } });
+        await tx.bundle_resources.deleteMany({ where: { bundle_id: bundle.id } });
+        await tx.bundle_downloads.deleteMany({ where: { bundle_id: bundle.id } });
+        await tx.bundle_shares.deleteMany({ where: { bundle_id: bundle.id } });
+        await tx.bundles.delete({ where: { id: bundle.id } });
+      }
+      // This workspace's own download/share history as the downloader/recipient
+      // of OTHER workspaces' bundles — always safe, it's just this workspace's history.
+      await tx.bundle_downloads.deleteMany({ where: { workspace_id: workspaceId } });
+      await tx.bundle_shares.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Media gallery (capture for a future S3 cleanup job, then delete) ──
+      const media = await tx.media_gallery.findMany({
+        where: { workspace_id: workspaceId },
+        select: { id: true, file_path: true, file_url: true },
+      });
+      for (const m of media) {
+        mediaToCleanup.push({ id: m.id.toString(), file_path: m.file_path, file_url: m.file_url });
+      }
+      await tx.media_gallery.deleteMany({ where: { workspace_id: workspaceId } });
+
+      // ── Finally, the workspace row itself ────────────────────────────
+      await tx.workspaces.delete({ where: { id: workspaceId } });
+    }, { timeout: 120000 });
+
+    // Outside the transaction, and deliberately AFTER it commits — agency_logs
+    // has no FK to workspaces, so this still works even though the workspace
+    // row is gone by now. This is exactly why agency_logs (and audit_logs)
+    // are excluded from the purge above.
+    await this.logAgencyEvent(agencyId, 'workspace_deleted', actorId, 'App\\Models\\Workspace', workspaceId, {
+      workspace_name: workspace.name,
+    });
+
+    return { success: true, skippedBundles, mediaToCleanup };
   }
 
   async getWorkspaceUsage(workspaceId: bigint, agencyId: bigint) {
