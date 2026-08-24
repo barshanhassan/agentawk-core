@@ -102,6 +102,7 @@ export class InstagramService {
       return saved;
     }
 
+    await this.assertSocialChannelCapacity(workspaceId);
     const saved = await this.prisma.insta_pages.create({
       data: {
         workspace_id: workspaceId,
@@ -137,6 +138,37 @@ export class InstagramService {
     }
 
     return saved;
+  }
+
+  /**
+   * Free plan gets a single shared social-channel slot (Facebook OR Instagram,
+   * not one of each) — WhatsApp is separately blocked via whatsapp_channels_limit
+   * already being 0 on the free plan. Mirrors MessengerService's identically-named
+   * helper (kept duplicated rather than shared, matching this codebase's existing
+   * pattern of small per-module helpers like buildTenantUrl).
+   */
+  private async assertSocialChannelCapacity(workspaceId: bigint) {
+    const workspace = await this.prisma.workspaces.findUnique({ where: { id: workspaceId }, select: { agency_id: true } });
+    if (!workspace) return;
+    const subscription = await this.prisma.billing_subscriptions.findFirst({
+      where: { agency_id: workspace.agency_id, status: { in: ['active', 'in_trial'] } },
+      orderBy: [{ activated_at: 'desc' }],
+    });
+    const plan = subscription?.billing_plan_id
+      ? await this.prisma.billing_plans.findUnique({ where: { id: subscription.billing_plan_id } })
+      : null;
+    const isFreeTier = !plan || plan.plan_order === 0;
+    if (!isFreeTier) return;
+
+    const [fbCount, igCount] = await Promise.all([
+      this.prisma.fb_pages.count({ where: { workspace_id: workspaceId, deleted_at: null } }),
+      this.prisma.insta_pages.count({ where: { workspace_id: workspaceId, deleted_at: null } }),
+    ]);
+    if (fbCount + igCount >= 1) {
+      throw new BadRequestException(
+        'The free plan allows only 1 connected channel (Facebook or Instagram). Upgrade your plan to connect another.',
+      );
+    }
   }
 
   private async subscribeInstaWebhook(igUserId: string, accessToken: string): Promise<void> {

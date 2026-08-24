@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { AgencyService } from './agency.service';
 import { RolesService } from '../roles/roles.service';
+import { InvoicesService } from '../invoices/invoices.service';
 import { JwtAuthGuard } from '../auth/auth.guard';
 import { RequirePermission } from '../auth/permissions.decorator';
 
@@ -24,6 +25,7 @@ export class AgencyController {
   constructor(
     private readonly service: AgencyService,
     private readonly rolesService: RolesService,
+    private readonly invoicesService: InvoicesService,
   ) {}
 
   // ─── Billing Plans ─────────────────────────────────────────────────
@@ -92,6 +94,18 @@ export class AgencyController {
   async updateBillingAddress(@Param('id') id: string, @Body() body: any, @Request() req: any) {
     body.user_id = BigInt(req.user.sub);
     return this.service.updateBillingAddress(BigInt(id), body);
+  }
+
+  @Get(':id/invoices')
+  @RequirePermission('agency.settings.billing')
+  async listInvoices(@Param('id') id: string) {
+    return this.invoicesService.list(BigInt(id));
+  }
+
+  @Get(':id/invoices/:invoiceId/download')
+  @RequirePermission('agency.settings.billing')
+  async downloadInvoice(@Param('id') id: string, @Param('invoiceId') invoiceId: string) {
+    return this.invoicesService.getDownloadUrl(BigInt(id), BigInt(invoiceId));
   }
 
   @Patch(':id/branding')

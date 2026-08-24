@@ -402,21 +402,18 @@ export class AgencyService {
     const agency = await this.prisma.agencies.findUnique({ where: { id: agencyId } });
     if (!agency) throw new NotFoundException('Agency not found');
 
-    const billingAddress = {
-      line1: data.address?.street,
-      city: data.address?.city,
-      state: data.address?.state,
-      zip: data.address?.zip,
-      country: data.address?.country_iso2,
-    };
-
-    if (agency.customer_id) {
-      try {
-        await this.chargebee.updateCustomerBillingAddress(agency.customer_id, billingAddress);
-      } catch (err) {
-        this.logger.warn(`Chargebee billing address sync failed: ${err.message}`);
-      }
-    }
+    // Billing Details save covers company/person/tax fields too — this was
+    // previously silently dropped because only the address half was ever
+    // persisted here, even though the frontend sends everything together.
+    await this.prisma.agencies.update({
+      where: { id: agencyId },
+      data: {
+        billing_company: data.billing_company,
+        billing_person: data.billing_person,
+        tax_id: data.tax_id,
+        vat: data.vat,
+      },
+    });
 
     // GAP 1+2: fix upsert — find by agency first, then update or create; persist country_iso2
     const addr = data.address ?? {};
@@ -738,7 +735,7 @@ export class AgencyService {
             agency_id: agencyId,
             creator_id: creatorId,
             agency_agent_id: data.agent_id ? BigInt(data.agent_id) : null,
-            timezone: data.timezone || 'UTC',
+            timezone: data.timezone || agency.timezone || 'UTC',
             status: 'ACTIVE',
             created_at: new Date(),
             updated_at: new Date(),

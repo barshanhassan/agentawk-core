@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, Logger, NotFoundException } from '@nes
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { SwichApiClient, SwichEnvironment } from './swich-api.client';
+import { InvoicesService } from '../invoices/invoices.service';
 
 interface CachedToken {
   accessToken: string;
@@ -35,6 +36,7 @@ export class SwichService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly client: SwichApiClient,
+    private readonly invoices: InvoicesService,
   ) {}
 
   // ─── Credentials ─────────────────────────────────────────────────────
@@ -524,6 +526,7 @@ export class SwichService {
       orderBy: [{ default: 'desc' }, { activated_at: 'desc' }],
     });
 
+    let billingSubscriptionId: bigint;
     if (existing) {
       // No downgrades — plan_order ranks tiers (Free=0 ... Enterprise=3).
       // Matches the "plans don't support downgrades" notice on the Billing
@@ -540,8 +543,9 @@ export class SwichService {
         where: { id: existing.id },
         data: { billing_plan_id: plan.id, status: 'active', activated_at: new Date(), updated_at: new Date() },
       });
+      billingSubscriptionId = existing.id;
     } else {
-      await this.prisma.billing_subscriptions.create({
+      const createdSubscription = await this.prisma.billing_subscriptions.create({
         data: {
           agency_id: tx.agency_id,
           subscription_id: `swich-${tx.customer_transaction_id}`,
@@ -555,9 +559,22 @@ export class SwichService {
           updated_at: new Date(),
         },
       });
+      billingSubscriptionId = createdSubscription.id;
     }
 
     await this.syncWorkspacesToPlan(tx.agency_id, plan);
+
+    // Never let invoice generation block or fail plan activation — the plan
+    // is already active at this point regardless of what happens below.
+    this.invoices
+      .generateInvoice({
+        agencyId: tx.agency_id,
+        billingSubscriptionId,
+        planId: plan.id,
+        planName: plan.external_name || plan.name,
+        customerTransactionId: tx.customer_transaction_id,
+      })
+      .catch((err) => this.logger.error(`Invoice generation threw for agency ${tx.agency_id}: ${err?.message ?? err}`));
 
     this.logger.log(`[swich] activated plan "${planItemId}" for agency ${tx.agency_id}`);
   }
