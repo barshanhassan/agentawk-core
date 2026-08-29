@@ -35,6 +35,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { TriggersModule } from './triggers/triggers.module';
 import { BillingModule } from './billing/billing.module';
 import { StatisticsModule } from './statistics/statistics.module';
+import { CsatModule } from './csat/csat.module';
 import { ChatStatisticsModule } from './chat-statistics/chat-statistics.module';
 import { EventLogsModule } from './event-logs/event-logs.module';
 import { LegalModule } from './legal/legal.module';
@@ -117,6 +118,7 @@ import { PermissionsGuard } from './auth/permissions.guard';
     TriggersModule,
     BillingModule,
     StatisticsModule,
+    CsatModule,
     ChatStatisticsModule,
     EventLogsModule,
     LegalModule,

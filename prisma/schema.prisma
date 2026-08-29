@@ -1128,7 +1128,13 @@ model invoices {
   billing_subscription_id BigInt? @db.UnsignedBigInt
   invoice_number     String    @unique(map: "invoices_invoice_number_unique") @db.VarChar(64)
   plan_name          String    @db.VarChar(255)
+  // amount is the final total actually charged (subtotal - discount). Kept
+  // separate from subtotal/discount so old invoices (pre-coupon-breakdown)
+  // keep reading correctly — subtotal/discount are simply null on those.
   amount             Decimal   @db.Decimal(12, 2)
+  subtotal           Decimal?  @db.Decimal(12, 2)
+  discount           Decimal?  @db.Decimal(12, 2)
+  coupon_codes       String?   @db.VarChar(255)
   currency           String    @default("USD") @db.VarChar(10)
   status             String    @default("paid") @db.VarChar(30)
   // Billing-details snapshot, frozen at issue time — an invoice must not
@@ -2219,6 +2225,23 @@ model iframes {
   html         String?   @db.Text
   created_at   DateTime? @db.Timestamp(0)
   updated_at   DateTime? @db.Timestamp(0)
+}
+
+model csat_responses {
+  id           BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  workspace_id BigInt    @db.UnsignedBigInt
+  inbox_id     BigInt    @db.UnsignedBigInt
+  contact_id   BigInt    @db.UnsignedBigInt
+  agent_id     BigInt?   @db.UnsignedBigInt
+  rating       Int?      @db.TinyInt // 1 = poor, 2 = average, 3 = great; NULL = request sent, no reply yet
+  requested_at DateTime  @default(now()) @db.DateTime(0)
+  responded_at DateTime? @db.DateTime(0)
+
+  @@index([workspace_id], map: "idx_csat_responses_on_workspace_id")
+  @@index([inbox_id], map: "idx_csat_responses_on_inbox_id")
+  @@index([contact_id], map: "idx_csat_responses_on_contact_id")
+  @@index([agent_id], map: "idx_csat_responses_on_agent_id")
+  @@index([workspace_id, rating], map: "idx_csat_responses_workspace_rating")
 }
 
 model inbox {

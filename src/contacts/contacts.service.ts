@@ -2368,7 +2368,7 @@ export class ContactsService {
 
   /**
    * Global simple search — mirrors replyagent's POST /contact/search/simple.
-   * type: first_name | last_name | full_name | id | whatsapp | phone | email | instagram | messenger
+   * type: first_name | last_name | full_name | id | whatsapp | phone | email | instagram | messenger | telegram | support_ticket
    */
   async simpleSearch(workspaceId: bigint, term: string, type: string) {
     const t = term.trim();
@@ -2419,6 +2419,19 @@ export class ContactsService {
         take: 50,
       });
       contactIds = chats.filter((c) => c.contact_id).map((c) => c.contact_id as bigint);
+    } else if (type === 'telegram') {
+      const chats = await this.prisma.telegram_chats.findMany({
+        where: {
+          OR: [
+            { username: { contains: t } },
+            { first_name: { contains: t } },
+            { last_name: { contains: t } },
+          ],
+        },
+        select: { contact_id: true },
+        take: 50,
+      });
+      contactIds = chats.map((c) => c.contact_id);
     } else if (type === 'support_ticket') {
       const rows = await this.prisma.support_numbers.findMany({
         where: { sn_number: { contains: t } },

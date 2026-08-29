@@ -386,6 +386,130 @@ export class UsersService {
   }
 
   /**
+   * Combined "My Profile" fetch — powers the merged Account Details tab
+   * (photo, name, email, role, team, timezone) instead of the old page's
+   * hardcoded "Demo User" placeholder. Resolves avatar via the same
+   * media_gallery + signed-URL path as uploadProfileLogo, and role/team
+   * names the same way workspaces.service.ts#getMembers does, just for a
+   * single user instead of a batch.
+   */
+  async getMe(userId: bigint) {
+    const user = await this.prisma.users.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        first_name: true,
+        last_name: true,
+        full_name: true,
+        email: true,
+        timezone: true,
+        locale: true,
+        is_owner: true,
+        tfa_enabled: true,
+        gallery_media_id: true,
+      },
+    });
+    if (!user) throw new NotFoundException('User not found');
+
+    let avatarUrl: string | null = null;
+    if (user.gallery_media_id) {
+      const media = await this.prisma.media_gallery.findUnique({
+        where: { id: user.gallery_media_id },
+      });
+      if (media?.file_path) {
+        avatarUrl = (await this.s3.getSignedUrl(media.file_path, 3600)) || null;
+      }
+    }
+
+    const roleable = await this.prisma.acl_roleables.findFirst({
+      where: { roleable_id: userId, roleable_type: 'App\\Models\\User' },
+    });
+    let roleName: string | null = null;
+    if (roleable) {
+      const role = await this.prisma.acl_roles.findUnique({
+        where: { id: BigInt(roleable.role_id) },
+      });
+      roleName = role?.name ?? null;
+    }
+    if (user.is_owner && !roleName) roleName = 'Owner';
+
+    const teamMember = await this.prisma.team_members.findFirst({
+      where: { user_id: userId },
+    });
+    let teamName: string | null = null;
+    if (teamMember) {
+      const team = await this.prisma.teams.findUnique({
+        where: { id: teamMember.team_id },
+      });
+      teamName = team?.name ?? null;
+    }
+
+    return {
+      id: user.id.toString(),
+      first_name: user.first_name,
+      last_name: user.last_name,
+      full_name:
+        user.full_name ||
+        [user.first_name, user.last_name].filter(Boolean).join(' ').trim(),
+      email: user.email,
+      timezone: user.timezone,
+      locale: user.locale,
+      tfa_enabled: user.tfa_enabled,
+      is_owner: user.is_owner,
+      avatar_url: avatarUrl,
+      role_name: roleName,
+      team_name: teamName,
+    };
+  }
+
+  /**
+   * Personal preferences (auto-hide conversations, disable CSAT prompts,
+   * manual bot handoff, transcript emailing, etc). Stored the same way as
+   * getTheme/updateTheme above — a JSON blob in user_states — since these
+   * are honestly per-user toggles, not workspace-wide settings.
+   */
+  async getPreferences(userId: bigint) {
+    const state = await this.prisma.user_states.findFirst({
+      where: { user_id: userId, type: 'PREFERENCES' },
+    });
+    const defaults = {
+      twoFactorAuth: false,
+      autoHide: false,
+      disableCSAT: false,
+      manualHandoff: false,
+      enableTranscript: false,
+      emailTranscript: false,
+      transcriptEmails: '',
+    };
+    if (!state) return defaults;
+    try {
+      return { ...defaults, ...JSON.parse(state.data) };
+    } catch {
+      return defaults;
+    }
+  }
+
+  async updatePreferences(userId: bigint, data: any) {
+    const existing = await this.prisma.user_states.findFirst({
+      where: { user_id: userId, type: 'PREFERENCES' },
+    });
+    const json = JSON.stringify(data);
+
+    if (existing) {
+      await this.prisma.user_states.update({
+        where: { id: existing.id },
+        data: { data: json },
+      });
+    } else {
+      await this.prisma.user_states.create({
+        data: { user_id: userId, type: 'PREFERENCES', data: json },
+      });
+    }
+
+    return { success: true, message: 'Preferences updated successfully' };
+  }
+
+  /**
    * Dedicated Change Password — mirrors replyagent's
    * `Api\AuthController@changePassword`. Validates server-side (don't trust
    * the client-only rules), checks the current password, rejects reuse of

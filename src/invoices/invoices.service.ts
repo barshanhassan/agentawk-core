@@ -64,10 +64,35 @@ export class InvoicesService {
         return null;
       }
 
-      const amount = price?.price != null ? price.price / 100 : 0;
+      const subtotal = price?.price != null ? price.price / 100 : 0;
       const currency = price?.currency_code || 'USD';
       const issuedAt = new Date();
       const periodEnd = addPeriod(issuedAt, price?.period || 1, price?.period_unit);
+
+      // Coupons applied to this exact subscription, same "each knocks a %
+      // off the subtotal independently" rule as AgencyService's Current
+      // Usage calc (agency.service.ts) — kept in sync with that, not
+      // imported from it, to avoid a circular AgencyModule<->InvoicesModule
+      // dependency for what's a ~10-line lookup.
+      const subscription = params.billingSubscriptionId
+        ? await this.prisma.billing_subscriptions.findUnique({
+            where: { id: params.billingSubscriptionId },
+            select: { coupons: true },
+          })
+        : null;
+      const couponCodes = (subscription?.coupons || '').split(',').map((c) => c.trim()).filter(Boolean);
+      const appliedCoupons = couponCodes.length
+        ? await this.prisma.billing_coupons.findMany({ where: { coupon_id: { in: couponCodes }, status: 'active' } })
+        : [];
+      const coupons = appliedCoupons.map((c) => ({
+        code: c.coupon_id,
+        name: c.invoice_name || c.coupon_id,
+        discount_amount: c.discount_percentage
+          ? Math.round(subtotal * (Number(c.discount_percentage) / 100) * 100) / 100
+          : Number(c.discount_amount ?? 0),
+      }));
+      const discount = coupons.reduce((sum, c) => sum + c.discount_amount, 0);
+      const amount = Math.max(0, subtotal - discount);
 
       // Placeholder invoice_number that's already guaranteed unique (the Swich
       // transaction id), so the unique constraint can't collide before we
@@ -79,6 +104,9 @@ export class InvoicesService {
           invoice_number: `pending-${params.customerTransactionId}`,
           plan_name: params.planName,
           amount,
+          subtotal,
+          discount,
+          coupon_codes: coupons.length ? coupons.map((c) => c.code).join(',') : null,
           currency,
           status: 'paid',
           billing_company: agency.billing_company,
@@ -104,6 +132,8 @@ export class InvoicesService {
         period_end: periodEnd,
         plan_name: params.planName,
         amount,
+        subtotal,
+        coupons,
         currency,
         billing_company: agency.billing_company,
         billing_person: agency.billing_person,

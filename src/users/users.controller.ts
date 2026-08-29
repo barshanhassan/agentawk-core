@@ -33,10 +33,28 @@ export class UsersController {
     return this.service.listWorkspaceUsers(workspaceId);
   }
 
+  @Get('me')
+  async getMe(@Request() req: any) {
+    const userId = BigInt(req.user.sub || 1);
+    return this.service.getMe(userId);
+  }
+
   @Post('update')
   async updateProfile(@Body() body: any, @Request() req: any) {
     const userId = BigInt(req.user.sub || 1);
     return this.service.updateProfile(userId, body);
+  }
+
+  @Get('preferences')
+  async getPreferences(@Request() req: any) {
+    const userId = BigInt(req.user.sub || 1);
+    return this.service.getPreferences(userId);
+  }
+
+  @Post('preferences')
+  async updatePreferences(@Body() body: any, @Request() req: any) {
+    const userId = BigInt(req.user.sub || 1);
+    return this.service.updatePreferences(userId, body);
   }
 
   @Post('language')

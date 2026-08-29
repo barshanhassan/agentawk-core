@@ -115,17 +115,17 @@ export class StatisticsController {
     return this.service.getSentimentDetails(workspaceId);
   }
 
-  /** CSAT → Summary sub-tab (honest empty state). */
+  /** CSAT → Summary sub-tab. Optional ?teamIds=1,2&agentIds=3,4 filters. */
   @Get('csat-summary')
-  async getCsatSummary(@Request() req: any) {
+  async getCsatSummary(@Request() req: any, @Query() query: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.getCsatSummary(workspaceId);
+    return this.service.getCsatSummary(workspaceId, { teamIds: query.teamIds, agentIds: query.agentIds });
   }
 
-  /** CSAT → Details sub-tab (honest empty state). */
+  /** CSAT → Details sub-tab. Optional ?teamIds=1,2&agentIds=3,4 filters. */
   @Get('csat-details')
-  async getCsatDetails(@Request() req: any) {
+  async getCsatDetails(@Request() req: any, @Query() query: any) {
     const workspaceId = BigInt(req.user.workspace_id || 1);
-    return this.service.getCsatDetails(workspaceId);
+    return this.service.getCsatDetails(workspaceId, { teamIds: query.teamIds, agentIds: query.agentIds });
   }
 }

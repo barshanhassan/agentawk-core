@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 
 /**
@@ -15,7 +16,10 @@ import { PrismaService } from '../prisma/prisma.service';
 export class WhatsappWebhookParserService {
   private readonly logger = new Logger(WhatsappWebhookParserService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly events: EventEmitter2,
+  ) {}
 
   async parse(payload: any) {
     const results: Array<{
@@ -152,6 +156,21 @@ export class WhatsappWebhookParserService {
     // window allows free-form replies), so record the opt-in — otherwise the
     // inbox composer shows "contact has opted out" and blocks outbound.
     await this.ensureWhatsappOptIn(contact.id, phoneNumber.id);
+
+    // CSAT reply capture. This webhook path doesn't feed `message.inbound` with
+    // the message text (see inbox.service.notifyInboundMessage), so CsatService
+    // can't listen on that event here — emit a dedicated event carrying the raw
+    // text/button-reply id instead. No-op if the contact has no pending request.
+    const buttonReplyId: string | null =
+      type === 'interactive' && msg.interactive?.type === 'button_reply'
+        ? (msg.interactive?.button_reply?.id ?? null)
+        : null;
+    this.events.emit('csat.whatsapp_inbound', {
+      workspaceId: account.workspace_id,
+      contactId: contact.id,
+      text,
+      buttonReplyId,
+    });
 
     // Idempotency: skip if we already persisted this wamid
     const existing = await this.prisma.wa_messages.findFirst({ where: { wamid } });

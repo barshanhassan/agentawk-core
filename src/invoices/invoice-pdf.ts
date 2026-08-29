@@ -6,6 +6,9 @@ export interface InvoicePdfData {
   period_end: Date;
   plan_name: string;
   amount: number;
+  /** Pre-discount plan price. Falls back to `amount` when omitted (no coupons applied). */
+  subtotal?: number;
+  coupons?: Array<{ code: string; name: string; discount_amount: number }>;
   currency: string;
   billing_company: string | null;
   billing_person: string | null;
@@ -114,10 +117,13 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     doc.moveTo(50, y).lineTo(545, y).strokeColor(BORDER).stroke();
     y += 12;
 
+    const subtotal = data.subtotal ?? data.amount;
+    const coupons = data.coupons ?? [];
+
     doc.fillColor(INK).fontSize(10).font('Helvetica');
     doc.text(data.plan_name, 50, y, { width: 320 });
     doc.text('1', 380, y, { width: 40, align: 'right' });
-    doc.text(`${data.currency} ${data.amount.toFixed(2)}`, 450, y, { width: 95, align: 'right' });
+    doc.text(`${data.currency} ${subtotal.toFixed(2)}`, 450, y, { width: 95, align: 'right' });
     y += 14;
     doc.fillColor(MUTED).fontSize(8).text(
       `${data.issued_at.toISOString().slice(0, 10)} – ${data.period_end.toISOString().slice(0, 10)}`,
@@ -126,12 +132,29 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       { width: 320 },
     );
     y += 22;
+
+    // One row per applied coupon — each already knocks its own % off the
+    // subtotal independently (matches Billing → Manage's "Current Usage").
+    for (const c of coupons) {
+      doc.fillColor(INK).fontSize(9).font('Helvetica').text(`Coupon: ${c.name}`, 50, y, { width: 320 });
+      doc.fillColor(BRAND_GREEN).text(`-${data.currency} ${c.discount_amount.toFixed(2)}`, 450, y, { width: 95, align: 'right' });
+      y += 16;
+    }
+
+    y += 6;
     doc.moveTo(50, y).lineTo(545, y).strokeColor(BORDER).stroke();
     y += 16;
 
     doc.fillColor(MUTED).fontSize(10).font('Helvetica').text('Subtotal', 350, y, { width: 95 });
-    doc.fillColor(INK).text(`${data.currency} ${data.amount.toFixed(2)}`, 450, y, { width: 95, align: 'right' });
+    doc.fillColor(INK).text(`${data.currency} ${subtotal.toFixed(2)}`, 450, y, { width: 95, align: 'right' });
     y += 18;
+
+    if (coupons.length) {
+      const totalDiscount = coupons.reduce((sum, c) => sum + c.discount_amount, 0);
+      doc.fillColor(MUTED).fontSize(10).font('Helvetica').text('Discount', 350, y, { width: 95 });
+      doc.fillColor(BRAND_GREEN).text(`-${data.currency} ${totalDiscount.toFixed(2)}`, 450, y, { width: 95, align: 'right' });
+      y += 18;
+    }
 
     doc.fillColor(INK).fontSize(12).font('Helvetica-Bold');
     doc.text('Total', 350, y, { width: 95 });

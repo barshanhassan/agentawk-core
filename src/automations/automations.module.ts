@@ -17,6 +17,7 @@ import { isQueueEnabled } from '../queue/queue.module';
 import { WhatsappModule } from '../whatsapp/whatsapp.module';
 import { InboxModule } from '../inbox/inbox.module';
 import { AiModule } from '../ai/ai.module';
+import { CsatModule } from '../csat/csat.module';
 
 // Queue worker + producer only when Redis is configured. The cron-based
 // `processReservedQueue` in AutomationProcessor continues to handle delayed
@@ -28,7 +29,7 @@ const queueProviders = isQueueEnabled() ? [AutomationWorker, AutomationQueueProd
 const queueExports = isQueueEnabled() ? [AutomationQueueProducer] : [];
 
 @Module({
-  imports: [PrismaModule, WhatsappModule, InboxModule, AiModule, ...queueImports],
+  imports: [PrismaModule, WhatsappModule, InboxModule, AiModule, CsatModule, ...queueImports],
   controllers: [AutomationsController, AutomationsPublicController],
   providers: [
     AutomationsService,

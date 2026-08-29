@@ -593,9 +593,13 @@ export class StatisticsService {
       this.prisma.inbox.count({ where: { workspace_id: workspaceId, snooze: { gt: new Date() } } }),
     ]);
 
-    // ─── KPI 4: Feedback (CSAT placeholder — no csat_responses table) ────
-    // Until CSAT collection is wired, these are honest zeros.
-    const feedback = { great: 0, average: 0, poor: 0 };
+    // ─── KPI 4: Feedback (from csat_responses) ────────────────────────────
+    const [csatGreat, csatAverage, csatPoor] = await Promise.all([
+      this.prisma.csat_responses.count({ where: { workspace_id: workspaceId, rating: 3 } }),
+      this.prisma.csat_responses.count({ where: { workspace_id: workspaceId, rating: 2 } }),
+      this.prisma.csat_responses.count({ where: { workspace_id: workspaceId, rating: 1 } }),
+    ]);
+    const feedback = { great: csatGreat, average: csatAverage, poor: csatPoor };
 
     // ─── Agent Availability board ────────────────────────────────────────
     const members = await this.prisma.users.findMany({
@@ -613,6 +617,18 @@ export class StatisticsService {
       },
       take: 200,
     });
+
+    // A user can technically belong to more than one team; the board only
+    // has room for one name per row, so take the first membership found.
+    const teamMemberships = await this.prisma.team_members.findMany({
+      where: { user_id: { in: members.map((m) => m.id) } },
+      select: { user_id: true, teams: { select: { name: true } } },
+    });
+    const teamByUserId = new Map<string, string>();
+    for (const tm of teamMemberships) {
+      const key = tm.user_id.toString();
+      if (!teamByUserId.has(key)) teamByUserId.set(key, tm.teams.name);
+    }
 
     // Status derivation: combine the user's own `availability` enum
     // (AVAILABLE/AWAY/OFFLINE) with last_seen freshness as a fallback. The
@@ -642,7 +658,7 @@ export class StatisticsService {
       }
       agents.push({
         name: [m.first_name, m.last_name].filter(Boolean).join(' ') || m.email || `#${m.id}`,
-        team: '—',
+        team: teamByUserId.get(m.id.toString()) ?? '—',
         loginTime: m.last_seen_at ? dayjs(m.last_seen_at).format('HH:mm') : '—',
         status,
         dot,
@@ -803,6 +819,13 @@ export class StatisticsService {
       });
     }
 
+    // ─── CSAT (last 7 days, matches this tab's window) ────────────────────
+    const [csatGreat, csatAverage, csatPoor] = await Promise.all([
+      this.prisma.csat_responses.count({ where: { workspace_id: workspaceId, rating: 3, responded_at: { gte: last7Days0 } } }),
+      this.prisma.csat_responses.count({ where: { workspace_id: workspaceId, rating: 2, responded_at: { gte: last7Days0 } } }),
+      this.prisma.csat_responses.count({ where: { workspace_id: workspaceId, rating: 1, responded_at: { gte: last7Days0 } } }),
+    ]);
+
     // ─── Tags chart ──────────────────────────────────────────────────────
     const topTags = await this.prisma.tags.findMany({
       where: { workspace_id: workspaceId },
@@ -829,7 +852,11 @@ export class StatisticsService {
         performance: {
           avgResponseTime: avgRespMin > 0 ? `${avgRespMin}m` : '—',
           resolutionRate: closed.length > 0 ? `${Math.round((exited / Math.max(queued + active + pending + exited, 1)) * 100)}%` : '—',
-          customerSatisfaction: '—', // requires CSAT system
+          customerSatisfaction: (() => {
+            const responded = csatGreat + csatAverage + csatPoor;
+            if (!responded) return '—';
+            return `${Math.round(((csatGreat * 100 + csatAverage * 50) / responded))}%`;
+          })(),
         },
         callStatistics: {
           totalCalls: inboundCalls + outboundCalls,
@@ -1056,14 +1083,15 @@ export class StatisticsService {
     let botTriggered = 0, respondedByBot = 0, receivedByBot = 0, escalatedToHuman = 0;
     let avgSessionSec = 0;
     let popularityRows: any[] = [];
+    let cbChats: any[] = [];
 
     if (cbIds.length > 0) {
       // chatbot_chats has no closed_at — we approximate session duration as
       // (updated_at - created_at) which is the activity window the chat had
       // before it stopped receiving updates.
-      const cbChats = await this.prisma.chatbot_chats.findMany({
+      cbChats = await this.prisma.chatbot_chats.findMany({
         where: { chatbot_id: { in: cbIds }, created_at: { gte: last7Days0 } },
-        select: { id: true, chatbot_id: true, created_at: true, updated_at: true },
+        select: { id: true, chatbot_id: true, contact_id: true, created_at: true, updated_at: true },
         take: 5000,
       }).catch(() => [] as any[]);
       botTriggered = cbChats.length;
@@ -1111,17 +1139,26 @@ export class StatisticsService {
     }).catch(() => 0);
     botTriggered += autoRuns;
 
-    // Escalated to human: is_assigned flag flips to 1 when an agent picks
-    // the conversation up after a bot session.
-    escalatedToHuman = await this.prisma.inbox.count({
-      where: {
-        workspace_id: workspaceId,
-        is_assigned: 1,
-        created_at: { gte: last7Days0 },
-      },
-    }).catch(() => 0);
+    // Escalated to human: is_assigned flag flips to 1 when an agent picks a
+    // conversation up. Only count it as a bot ESCALATION when that contact
+    // actually had a chatbot session first — otherwise a conversation that
+    // went straight to an agent (no bot on that number, manual assignment,
+    // etc.) would inflate this number despite the bot never touching it.
+    const botContactIds = [...new Set(cbChats.map((c: any) => c.contact_id.toString()))].map((id) => BigInt(id));
+    escalatedToHuman = botContactIds.length > 0
+      ? await this.prisma.inbox.count({
+          where: {
+            workspace_id: workspaceId,
+            is_assigned: 1,
+            created_at: { gte: last7Days0 },
+            modelable_type: 'App\\Models\\Contact',
+            modelable_id: { in: botContactIds },
+          },
+        }).catch(() => 0)
+      : 0;
 
-    // Bot vs Human trend (per day)
+    // Bot vs Human trend (per day) — "escalated" uses the same bot-contact
+    // scoping as the KPI above, not a raw is_assigned count.
     const botVsHumanData: any[] = [];
     for (let i = 6; i >= 0; i--) {
       const d = now.subtract(i, 'day');
@@ -1131,7 +1168,17 @@ export class StatisticsService {
         cbIds.length > 0
           ? this.prisma.chatbot_chats.count({ where: { chatbot_id: { in: cbIds }, created_at: { gte: start, lte: end } } }).catch(() => 0)
           : Promise.resolve(0),
-        this.prisma.inbox.count({ where: { workspace_id: workspaceId, is_assigned: 1, created_at: { gte: start, lte: end } } }).catch(() => 0),
+        botContactIds.length > 0
+          ? this.prisma.inbox.count({
+              where: {
+                workspace_id: workspaceId,
+                is_assigned: 1,
+                created_at: { gte: start, lte: end },
+                modelable_type: 'App\\Models\\Contact',
+                modelable_id: { in: botContactIds },
+              },
+            }).catch(() => 0)
+          : Promise.resolve(0),
       ]);
       botVsHumanData.push({ date: d.format('MMM D'), triggered, escalated });
     }
@@ -1337,38 +1384,212 @@ export class StatisticsService {
   }
 
   /**
-   * CSAT Summary — Honest empty state. EZCONN does not yet have a CSAT
-   * collection mechanism (no `csat_responses` table, no automation hook).
-   * Returns zero KPIs with `feature_status: 'not_configured'` so the
-   * frontend can display the configured-cards skeleton without faking data.
+   * Resolves ?teamIds=1,2&agentIds=3,4 into a concrete agent_id list for the
+   * CSAT endpoints. Team filtering goes through team_members since
+   * csat_responses only stores the agent, not the team directly.
    */
-  async getCsatSummary(workspaceId: bigint) {
-    const totalCompleted = await this.prisma.inbox.count({
-      where: { workspace_id: workspaceId, status: 'COMPLETED' },
-    });
+  private async resolveCsatAgentFilter(
+    workspaceId: bigint,
+    teamIds?: string,
+    agentIds?: string,
+  ): Promise<bigint[] | null> {
+    const ids = new Set<string>();
+    if (agentIds) {
+      for (const id of agentIds.split(',').map((s) => s.trim()).filter(Boolean)) ids.add(id);
+    }
+    if (teamIds) {
+      const teamIdList = teamIds.split(',').map((s) => s.trim()).filter(Boolean).map(BigInt);
+      if (teamIdList.length) {
+        const members = await this.prisma.team_members.findMany({
+          where: { team_id: { in: teamIdList } },
+          select: { user_id: true },
+        });
+        for (const m of members) ids.add(m.user_id.toString());
+      }
+    }
+    if (!agentIds && !teamIds) return null; // no filter requested
+    return Array.from(ids).map(BigInt);
+  }
+
+  /**
+   * CSAT Summary — real aggregation over csat_responses (rating request sent
+   * on `conversation.marked_as_done`, reply captured off the next inbound
+   * WhatsApp message). `satisfactionScore` is a weighted score: great = 100,
+   * average = 50, poor = 0, averaged across all responded requests.
+   */
+  async getCsatSummary(workspaceId: bigint, filters?: { teamIds?: string; agentIds?: string }) {
+    const agentFilter = await this.resolveCsatAgentFilter(workspaceId, filters?.teamIds, filters?.agentIds);
+    const where: any = { workspace_id: workspaceId };
+    if (agentFilter) where.agent_id = { in: agentFilter };
+
+    const [totalCompleted, rows] = await Promise.all([
+      this.prisma.inbox.count({ where: { workspace_id: workspaceId, status: 'COMPLETED' } }),
+      this.prisma.csat_responses.findMany({ where }),
+    ]);
+
+    const requested = rows.length;
+    const responded = rows.filter((r) => r.rating != null).length;
+    const great = rows.filter((r) => r.rating === 3).length;
+    const average = rows.filter((r) => r.rating === 2).length;
+    const poor = rows.filter((r) => r.rating === 1).length;
+
+    const satisfactionScore = responded > 0 ? Math.round(((great * 100 + average * 50) / responded)) : 0;
+    const feedbackRate = requested > 0 ? Math.round((responded / requested) * 100) : 0;
+
+    const distribution = {
+      great: responded > 0 ? Math.round((great / responded) * 100) : 0,
+      average: responded > 0 ? Math.round((average / responded) * 100) : 0,
+      poor: responded > 0 ? Math.round((poor / responded) * 100) : 0,
+    };
+
+    // Agent rankings — top 5 agents by satisfaction score among those with
+    // at least one responded CSAT request.
+    const byAgent = new Map<string, { great: number; average: number; poor: number; responded: number }>();
+    for (const r of rows) {
+      if (r.rating == null || !r.agent_id) continue;
+      const key = r.agent_id.toString();
+      const acc = byAgent.get(key) ?? { great: 0, average: 0, poor: 0, responded: 0 };
+      acc.responded++;
+      if (r.rating === 3) acc.great++;
+      else if (r.rating === 2) acc.average++;
+      else if (r.rating === 1) acc.poor++;
+      byAgent.set(key, acc);
+    }
+    const agentIds = Array.from(byAgent.keys()).map(BigInt);
+    const agentUsers = agentIds.length
+      ? await this.prisma.users.findMany({
+          where: { id: { in: agentIds } },
+          select: { id: true, full_name: true, first_name: true, last_name: true },
+        })
+      : [];
+    const agentRankings = agentIds
+      .map((id) => {
+        const acc = byAgent.get(id.toString())!;
+        const user = agentUsers.find((u) => u.id === id);
+        const name = user?.full_name || [user?.first_name, user?.last_name].filter(Boolean).join(' ') || `Agent ${id}`;
+        const score = Math.round(((acc.great * 100 + acc.average * 50) / acc.responded));
+        return { name, count: acc.responded, label: `${score}%`, positive: score >= 50 };
+      })
+      .sort((a, b) => parseInt(b.label) - parseInt(a.label))
+      .slice(0, 5);
+
+    // Distribution trend — last 14 days, counts of each rating per day.
+    const since = dayjs().subtract(13, 'days').startOf('day');
+    const byDay = new Map<string, { great: number; average: number; poor: number }>();
+    for (let i = 0; i < 14; i++) {
+      byDay.set(since.add(i, 'day').format('YYYY-MM-DD'), { great: 0, average: 0, poor: 0 });
+    }
+    for (const r of rows) {
+      if (r.rating == null || !r.responded_at) continue;
+      const key = dayjs(r.responded_at).format('YYYY-MM-DD');
+      const bucket = byDay.get(key);
+      if (!bucket) continue;
+      if (r.rating === 3) bucket.great++;
+      else if (r.rating === 2) bucket.average++;
+      else if (r.rating === 1) bucket.poor++;
+    }
+    const csatDistributionData = Array.from(byDay.entries()).map(([date, v]) => ({
+      date: dayjs(date).format('MMM D'),
+      ...v,
+    }));
+
     return {
-      feature_status: 'not_configured',
-      satisfactionScore: 0,
-      totalResponses: 0,
-      basedOnConversations: 0,
-      feedbackRate: 0,
-      responded: 0,
+      satisfactionScore,
+      totalResponses: responded,
+      basedOnConversations: requested,
+      feedbackRate,
+      responded,
       totalConversations: totalCompleted,
-      distribution: { great: 0, average: 0, poor: 0 },
-      agentRankings: [],
-      csatDistributionData: [],
+      distribution,
+      agentRankings,
+      csatDistributionData,
     };
   }
 
   /**
-   * CSAT Details — Honest empty state.
+   * CSAT Details — per-agent breakdown + individual feedback rows, both
+   * sourced from csat_responses.
    */
-  async getCsatDetails(workspaceId: bigint) {
-    return {
-      feature_status: 'not_configured',
-      agentCSAT: [],
-      feedback: [],
+  async getCsatDetails(workspaceId: bigint, filters?: { teamIds?: string; agentIds?: string }) {
+    const agentFilter = await this.resolveCsatAgentFilter(workspaceId, filters?.teamIds, filters?.agentIds);
+    const where: any = { workspace_id: workspaceId, rating: { not: null } };
+    if (agentFilter) where.agent_id = { in: agentFilter };
+
+    const rows = await this.prisma.csat_responses.findMany({
+      where,
+      orderBy: { responded_at: 'desc' },
+      take: 200,
+    });
+    if (!rows.length) return { agentCSAT: [], feedback: [] };
+
+    const agentIds = [...new Set(rows.map((r) => r.agent_id).filter((x): x is bigint => !!x))];
+    const contactIds = [...new Set(rows.map((r) => r.contact_id))];
+    const [agentUsers, contactRows, teamMembers] = await Promise.all([
+      agentIds.length
+        ? this.prisma.users.findMany({
+            where: { id: { in: agentIds } },
+            select: { id: true, full_name: true, first_name: true, last_name: true },
+          })
+        : [],
+      this.prisma.contacts.findMany({
+        where: { id: { in: contactIds } },
+        select: { id: true, full_name: true, first_name: true, last_name: true },
+      }),
+      agentIds.length
+        ? this.prisma.team_members.findMany({
+            where: { user_id: { in: agentIds } },
+            select: { user_id: true, teams: { select: { name: true } } },
+          }).catch(() => [] as any[])
+        : ([] as any[]),
+    ]);
+
+    const agentName = (id: bigint | null) => {
+      if (!id) return 'Unassigned';
+      const u = agentUsers.find((a) => a.id === id);
+      return u?.full_name || [u?.first_name, u?.last_name].filter(Boolean).join(' ') || `Agent ${id}`;
     };
+    const contactName = (id: bigint) => {
+      const c = contactRows.find((x) => x.id === id);
+      return c?.full_name || [c?.first_name, c?.last_name].filter(Boolean).join(' ') || 'Unknown';
+    };
+    const teamName = (id: bigint | null) => {
+      if (!id) return '—';
+      const m = teamMembers.find((tm: any) => tm.user_id === id);
+      return m?.teams?.name ?? '—';
+    };
+    const ratingLabel = (r: number | null) => (r === 3 ? 'Great' : r === 2 ? 'Average' : 'Poor');
+
+    const byAgent = new Map<string, { great: number; average: number; poor: number }>();
+    for (const r of rows) {
+      const key = (r.agent_id ?? 0n).toString();
+      const acc = byAgent.get(key) ?? { great: 0, average: 0, poor: 0 };
+      if (r.rating === 3) acc.great++;
+      else if (r.rating === 2) acc.average++;
+      else if (r.rating === 1) acc.poor++;
+      byAgent.set(key, acc);
+    }
+    const agentCSAT = Array.from(byAgent.entries()).map(([key, acc]) => {
+      const id = key === '0' ? null : BigInt(key);
+      return {
+        agentName: agentName(id),
+        agentId: key,
+        team: teamName(id),
+        great: acc.great,
+        average: acc.average,
+        poor: acc.poor,
+        total: acc.great + acc.average + acc.poor,
+      };
+    });
+
+    const feedback = rows.map((r) => ({
+      conversationId: r.inbox_id.toString(),
+      customer: contactName(r.contact_id),
+      agent: agentName(r.agent_id),
+      rating: ratingLabel(r.rating),
+      date: r.responded_at ? dayjs(r.responded_at).format('MMM D, YYYY') : '—',
+    }));
+
+    return { agentCSAT, feedback };
   }
 }
 

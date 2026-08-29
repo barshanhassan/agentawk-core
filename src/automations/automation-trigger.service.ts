@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AutomationProcessorService } from './automation-processor.service';
 import { TRIGGER_EVENTS } from './automations.constants';
 import { QuickReplyInputService } from './quick-reply-input.service';
+import { CsatService } from '../csat/csat.service';
 
 /**
  * Bridges NestJS EventEmitter events to automation trigger activities.
@@ -28,6 +29,7 @@ export class AutomationTriggerService {
     private readonly prisma: PrismaService,
     private readonly processor: AutomationProcessorService,
     private readonly quickReply: QuickReplyInputService,
+    private readonly csat: CsatService,
   ) {}
 
   // ─── Contact lifecycle ────────────────────────────────────────────
@@ -139,6 +141,19 @@ export class AutomationTriggerService {
     waChatId?: bigint;
   }) {
     if (!payload.contactId) return;
+
+    // -1. CSAT reply short-circuit. If this contact has a pending CSAT
+    // request, treat the reply as a rating only — don't also fan it out to
+    // keyword/inbound-message automations (a customer's "great" shouldn't
+    // reopen the conversation or trigger an unrelated auto-reply).
+    if (payload.channel === 'whatsapp') {
+      const wasCsat = await this.csat.tryHandleInbound({
+        workspaceId: payload.workspaceId,
+        contactId: payload.contactId,
+        text: payload.text,
+      });
+      if (wasCsat) return;
+    }
 
     // 0. Input-collection short-circuit. If a step is currently waiting on
     // this contact's reply (quick-reply / input activity), QuickReplyInputService
