@@ -1258,9 +1258,6 @@ CREATE TABLE `invoices` (
     `invoice_number` VARCHAR(64) NOT NULL,
     `plan_name` VARCHAR(255) NOT NULL,
     `amount` DECIMAL(12, 2) NOT NULL,
-    `subtotal` DECIMAL(12, 2) NULL,
-    `discount` DECIMAL(12, 2) NULL,
-    `coupon_codes` VARCHAR(255) NULL,
     `currency` VARCHAR(10) NOT NULL DEFAULT 'USD',
     `status` VARCHAR(30) NOT NULL DEFAULT 'paid',
     `billing_company` VARCHAR(255) NULL,
@@ -2489,25 +2486,6 @@ CREATE TABLE `iframes` (
     `created_at` TIMESTAMP(0) NULL,
     `updated_at` TIMESTAMP(0) NULL,
 
-    PRIMARY KEY (`id`)
-) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
--- CreateTable
-CREATE TABLE `csat_responses` (
-    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    `workspace_id` BIGINT UNSIGNED NOT NULL,
-    `inbox_id` BIGINT UNSIGNED NOT NULL,
-    `contact_id` BIGINT UNSIGNED NOT NULL,
-    `agent_id` BIGINT UNSIGNED NULL,
-    `rating` TINYINT NULL,
-    `requested_at` DATETIME(0) NOT NULL DEFAULT CURRENT_TIMESTAMP(0),
-    `responded_at` DATETIME(0) NULL,
-
-    INDEX `idx_csat_responses_on_workspace_id`(`workspace_id`),
-    INDEX `idx_csat_responses_on_inbox_id`(`inbox_id`),
-    INDEX `idx_csat_responses_on_contact_id`(`contact_id`),
-    INDEX `idx_csat_responses_on_agent_id`(`agent_id`),
-    INDEX `idx_csat_responses_workspace_rating`(`workspace_id`, `rating`),
     PRIMARY KEY (`id`)
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
