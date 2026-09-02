@@ -39,6 +39,15 @@ export class NotificationsController {
     return this.notifications.markAllRead('App\\Models\\User', userId);
   }
 
+  // Called when the agent opens a conversation — clears any unread "new
+  // message" notifications tied to that inbox so the bell badge count
+  // matches what they've actually seen.
+  @Post('read-by-inbox/:inboxId')
+  markReadByInbox(@Param('inboxId') inboxId: string, @Request() req: any) {
+    const userId = BigInt(req.user.sub || req.user.id || 0);
+    return this.notifications.markReadByInbox('App\\Models\\User', userId, BigInt(inboxId));
+  }
+
   @Delete('all')
   removeAll(@Request() req: any) {
     const userId = BigInt(req.user.sub || req.user.id || 0);

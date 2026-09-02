@@ -81,6 +81,23 @@ export class NotificationsService {
     return { success: true };
   }
 
+  // Clears every unread "new message" notification tied to one inbox for this
+  // user — called when the agent opens that conversation, so the bell badge
+  // doesn't keep counting messages they've already seen in the thread.
+  async markReadByInbox(notifiableType: string, notifiableId: bigint, inboxId: bigint) {
+    await this.prisma.notifications.updateMany({
+      where: {
+        notifiable_type: notifiableType,
+        notifiable_id: notifiableId,
+        read: 0,
+        triggerable_type: 'App\\Models\\Inbox',
+        triggerable_id: inboxId,
+      },
+      data: { read: 1, read_at: new Date(), updated_at: new Date() },
+    });
+    return { success: true };
+  }
+
   async deleteOne(id: string, notifiableType: string, notifiableId: bigint) {
     const n = await this.prisma.notifications.findUnique({ where: { id } });
     if (!n || n.notifiable_type !== notifiableType || n.notifiable_id !== notifiableId) {
