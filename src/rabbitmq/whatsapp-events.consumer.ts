@@ -389,6 +389,18 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
   }
 
   /** Digits-only normalisation matching how onboarding stores `phone_number`. */
+  /**
+   * Human-readable text for an inbound `interactive` message (button/list
+   * reply — e.g. a CSAT rating tap) so it shows properly in the inbox
+   * thread and conversation-list preview instead of the raw Meta JSON
+   * blob (`{"type":"button_reply","button_reply":{...}}`).
+   */
+  private interactiveReplyText(interactive: any): string | null {
+    if (!interactive) return null;
+    const reply = interactive.button_reply ?? interactive.list_reply;
+    return reply?.title ?? null;
+  }
+
   private normalizeStoredPhone(raw: any): string {
     return String(raw ?? '').replace(/[^0-9]/g, '');
   }
@@ -603,7 +615,7 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     let text: string | null = null;
     if (messageType === 'text') text = msg.text?.body ?? null;
     else if (messageType === 'button') text = msg.button?.text ?? null;
-    else if (messageType === 'interactive') text = JSON.stringify(msg.interactive ?? {});
+    else if (messageType === 'interactive') text = this.interactiveReplyText(msg.interactive);
     else if (['image', 'audio', 'video', 'document'].includes(messageType)) text = msg[messageType]?.caption ?? null;
 
     // Reply-to context (the merchant may have quoted a message).
@@ -1473,7 +1485,7 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     let text: string | null = null;
     if (messageType === 'text') text = msg.text?.body ?? null;
     else if (messageType === 'button') text = msg.button?.text ?? null;
-    else if (messageType === 'interactive') text = JSON.stringify(msg.interactive ?? {});
+    else if (messageType === 'interactive') text = this.interactiveReplyText(msg.interactive);
     else if (['image', 'audio', 'video', 'document'].includes(messageType)) text = msg[messageType]?.caption ?? null;
 
     const insertedMessage = await this.prisma.wa_messages.create({
@@ -1911,10 +1923,10 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
 
     // Signed URLs for the realtime patch — getChatMessages() re-signs on reload.
     const url = media.filePath
-      ? (await this.s3.getSignedUrl(media.filePath, 3600 * 24 * 7)) || media.fileUrl
+      ? (await this.s3.getCachedSignedUrl(media.filePath, 3600 * 24 * 7)) || media.fileUrl
       : media.fileUrl;
     const thumb = media.thumb?.filePath
-      ? (await this.s3.getSignedUrl(media.thumb.filePath, 3600 * 24 * 7)) || media.thumb?.fileUrl
+      ? (await this.s3.getCachedSignedUrl(media.thumb.filePath, 3600 * 24 * 7)) || media.thumb?.fileUrl
       : media.thumb?.fileUrl ?? null;
 
     return {
@@ -1986,7 +1998,7 @@ export class WhatsappEventsConsumer implements OnApplicationBootstrap {
     }
 
     // 5. Signed URL (7-day expiry — re-generated on each getMessages() call if needed)
-    const signedUrl = await this.s3.getSignedUrl(s3Key, 3600 * 24 * 7);
+    const signedUrl = await this.s3.getCachedSignedUrl(s3Key, 3600 * 24 * 7);
     if (!signedUrl) return;
 
     // 6. Persist to wa_messages.files — store s3Key so getMessages() can refresh the signed URL later

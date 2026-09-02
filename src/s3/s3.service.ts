@@ -10,6 +10,7 @@ import {
   ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
 
 /**
  * S3Service — replyagent S3Helper + GalleryHelper parity for NestJS.
@@ -42,6 +43,20 @@ export class S3Service {
         accessKeyId && secretAccessKey
           ? { accessKeyId, secretAccessKey }
           : undefined,
+      // Generous timeout for the rare call that still streams a body
+      // through the SDK directly. Measured on this environment: the very
+      // first HTTPS connection to S3 in a process's lifetime is slow
+      // (2-5s, sometimes more — looks like slow TLS/connection setup, not
+      // an app bug), but every subsequent request over a kept-alive
+      // connection drops to ~300ms. So — unlike an earlier attempt here —
+      // keep-alive is left ON (the SDK's default): disabling it would force
+      // every single request to eat that slow cold-start cost instead of
+      // paying it once per process.
+      requestHandler: new NodeHttpHandler({
+        connectionTimeout: 10_000,
+        requestTimeout: 60_000,
+      }),
+      maxAttempts: 3,
     });
   }
 
@@ -110,6 +125,27 @@ export class S3Service {
       this.logger.error(`getSignedUrl failed (${filePath}): ${e?.message || e}`);
       return null;
     }
+  }
+
+  // App-wide signed-URL cache, keyed by s3Key. Every caller (the inbox list
+  // endpoint, the realtime socket path when a new WhatsApp message lands,
+  // etc.) MUST go through this instead of calling getSignedUrl() directly
+  // for anything the frontend renders as a persistent <img>/<audio>/<video>
+  // src — two independent signSigV4 calls for the same object produce two
+  // different (both valid) query strings, and when a live socket-delivered
+  // URL is later swapped for a freshly re-signed one from a poll, the
+  // browser sees the src attribute change and aborts/restarts whatever was
+  // mid-playback. Sharing one cached signature keeps the URL byte-identical
+  // across every code path for as long as it's cached.
+  private readonly signedUrlCache = new Map<string, { url: string; expiresAt: number }>();
+
+  async getCachedSignedUrl(filePath: string, ttlSeconds = 604800): Promise<string | null> {
+    const now = Date.now();
+    const cached = this.signedUrlCache.get(filePath);
+    if (cached && cached.expiresAt > now + 3600_000) return cached.url; // >1hr left → reuse
+    const url = await this.getSignedUrl(filePath, ttlSeconds);
+    if (url) this.signedUrlCache.set(filePath, { url, expiresAt: now + ttlSeconds * 1000 });
+    return url;
   }
 
   /** Generate a signed URL for browser to upload directly via PUT. Default 1h expiry. */

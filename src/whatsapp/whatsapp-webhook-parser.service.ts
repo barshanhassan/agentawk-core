@@ -102,7 +102,13 @@ export class WhatsappWebhookParserService {
     let media: string | null = null;
     if (type === 'text') text = msg.text?.body ?? null;
     else if (type === 'button') text = msg.button?.text ?? null;
-    else if (type === 'interactive') text = JSON.stringify(msg.interactive ?? {});
+    else if (type === 'interactive') {
+      // Human-readable button/list-reply title (e.g. a CSAT rating tap) —
+      // not the raw Meta JSON blob, which used to leak into the inbox
+      // thread and conversation-list preview as
+      // {"type":"button_reply","button_reply":{...}}.
+      text = msg.interactive?.button_reply?.title ?? msg.interactive?.list_reply?.title ?? null;
+    }
     else if (type === 'image' || type === 'audio' || type === 'video' || type === 'document') {
       media = JSON.stringify(msg[type] ?? {});
       text = msg[type]?.caption ?? null;

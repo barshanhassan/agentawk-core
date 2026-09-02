@@ -1,4 +1,6 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import axios from 'axios';
+import FormData from 'form-data';
 
 /**
  * Thin wrapper around Meta Graph API endpoints used by WhatsApp Cloud,
@@ -28,6 +30,66 @@ export class MetaGraphApiClient {
       accessToken,
       body,
     );
+  }
+
+  /**
+   * Mark an inbound message as read — this is what actually shows the blue
+   * double-tick on the customer's side. Meta does NOT do this automatically
+   * just because we display the message in our own UI; the business has to
+   * explicitly call this endpoint with the customer's wamid.
+   */
+  async markMessageAsRead(phoneNumberId: string, accessToken: string, wamid: string) {
+    return this.request(
+      'POST',
+      `/${phoneNumberId}/messages`,
+      accessToken,
+      { messaging_product: 'whatsapp', status: 'read', message_id: wamid },
+    );
+  }
+
+  /**
+   * Upload media bytes directly to Meta and return the resulting media `id`,
+   * for use as `{ audio: { id, voice: true } }` etc. instead of `{ link }`.
+   * More reliable than link-based sends — Meta gets the bytes directly
+   * instead of having to fetch our S3 URL itself (which link-based voice
+   * notes have shown to fail intermittently with a "Media upload error").
+   */
+  async uploadMedia(
+    phoneNumberId: string,
+    accessToken: string,
+    buffer: Buffer,
+    mimeType: string,
+    filename: string,
+  ): Promise<string | null> {
+    try {
+      const form = new FormData();
+      form.append('messaging_product', 'whatsapp');
+      form.append('file', buffer, { filename, contentType: mimeType });
+      const res = await axios.post(`${this.base}/${phoneNumberId}/media`, form, {
+        headers: { Authorization: `Bearer ${accessToken}`, ...form.getHeaders() },
+      });
+      return res.data?.id ?? null;
+    } catch (e: any) {
+      this.logger.warn(`uploadMedia failed: ${JSON.stringify(e.response?.data ?? e.message)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Fetch metadata for a previously-uploaded media id — `{ id, mime_type, ... }`.
+   * Used right after `uploadMedia` to confirm Meta actually finished processing
+   * the file as the audio type we sent, before referencing the id in a send.
+   * Meta has been observed to still report `application/octet-stream` for a
+   * media id that was uploaded moments earlier with the correct content-type —
+   * this lets the caller detect and retry that instead of sending blind.
+   */
+  async getMediaInfo(mediaId: string, accessToken: string): Promise<{ id?: string; mime_type?: string } | null> {
+    try {
+      return await this.request('GET', `/${mediaId}?fields=id,mime_type`, accessToken);
+    } catch (e: any) {
+      this.logger.warn(`getMediaInfo failed for ${mediaId}: ${e?.message ?? e}`);
+      return null;
+    }
   }
 
   async fetchPhoneNumberProfile(phoneNumberId: string, accessToken: string) {

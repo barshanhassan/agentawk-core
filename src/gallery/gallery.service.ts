@@ -11,6 +11,7 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import * as sharp from 'sharp';
+import { Readable } from 'stream';
 import { PrismaService } from '../prisma/prisma.service';
 import { S3Service } from '../s3/s3.service';
 import {
@@ -501,8 +502,46 @@ export class GalleryService {
         message: 'File not found',
       });
     }
-    const stream = await this.s3.getObjectStream(media.file_path);
-    if (!stream) {
+    // Fetch via a signed URL with plain fetch() rather than the AWS SDK's
+    // GetObjectCommand body stream — on this environment the SDK's own
+    // HTTP client reliably hangs for tens of seconds (sometimes past a full
+    // minute) reading an object body, even for a file a few KB in size,
+    // while the exact same object downloads instantly through curl or a
+    // plain fetch() against a presigned URL. Metadata-only SDK calls
+    // (HeadObject, presign) are unaffected — only body streaming is.
+    const url = await this.s3.getCachedSignedUrl(media.file_path, 3600);
+    if (!url) {
+      throw new NotFoundException({
+        success: false,
+        code: 'NOT_FOUND',
+        message: 'File missing from storage',
+      });
+    }
+    // This environment's outbound path to S3 is flaky at the connection
+    // level — some of the IPs a hostname resolves to are unreachable, so a
+    // given attempt can time out even though the object itself is fine. A
+    // retry gets a fresh DNS resolution/connection attempt, which often
+    // lands on a reachable address the failed attempt didn't try.
+    let res: Response | null = null;
+    let lastErr: any = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        res = await fetch(url);
+        break;
+      } catch (e: any) {
+        lastErr = e;
+        this.logger.warn(`getDownloadStream fetch attempt ${attempt}/3 failed: ${e?.message ?? e}`);
+      }
+    }
+    if (!res) {
+      this.logger.error(`getDownloadStream: all fetch attempts failed: ${lastErr?.message ?? lastErr}`);
+      throw new NotFoundException({
+        success: false,
+        code: 'NOT_FOUND',
+        message: 'File missing from storage',
+      });
+    }
+    if (!res.ok || !res.body) {
       throw new NotFoundException({
         success: false,
         code: 'NOT_FOUND',
@@ -510,7 +549,7 @@ export class GalleryService {
       });
     }
     return {
-      stream,
+      stream: Readable.fromWeb(res.body as any),
       filename: media.object_name ?? 'download',
       mimeType: media.mime_type ?? 'application/octet-stream',
     };

@@ -11,6 +11,7 @@ import { ChatGateway } from './chat.gateway';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { RabbitMqService } from '../rabbitmq/rabbitmq.service';
 import { S3Service } from '../s3/s3.service';
+import { MetaGraphApiClient } from '../whatsapp/meta-graph-api.client';
 import OpenAI from 'openai';
 import { Readable, PassThrough } from 'stream';
 import { randomUUID } from 'crypto';
@@ -31,18 +32,16 @@ export class InboxService {
     private readonly rabbit: RabbitMqService,
     private readonly config: ConfigService,
     private readonly s3: S3Service,
+    private readonly meta: MetaGraphApiClient,
   ) {}
 
-  // In-memory signed URL cache — key: s3Key, value: {url, expiresAt ms}
-  private readonly signedUrlCache = new Map<string, { url: string; expiresAt: number }>();
-
+  // Delegates to S3Service's app-wide cache so this endpoint and the realtime
+  // socket path (WhatsappEventsConsumer) always resolve the same s3Key to the
+  // byte-identical signed URL — see S3Service.getCachedSignedUrl for why that
+  // matters (a live-socket URL getting silently swapped for a differently-
+  // signed one on the next poll was aborting in-progress voice-note playback).
   private async getCachedSignedUrl(s3Key: string, ttlSeconds = 604800): Promise<string> {
-    const now = Date.now();
-    const cached = this.signedUrlCache.get(s3Key);
-    if (cached && cached.expiresAt > now + 3600_000) return cached.url; // >1hr left → reuse
-    const url = await this.s3.getSignedUrl(s3Key, ttlSeconds);
-    if (url) this.signedUrlCache.set(s3Key, { url, expiresAt: now + ttlSeconds * 1000 });
-    return url ?? '';
+    return (await this.s3.getCachedSignedUrl(s3Key, ttlSeconds)) ?? '';
   }
 
   // Convert WebM/Opus (browser MediaRecorder default) to M4A (AAC in MP4 container).
@@ -64,6 +63,68 @@ export class InboxService {
         .noVideo()
         .audioCodec('aac')
         .audioBitrate('128k')
+        .output(tmpOut)
+        .on('end', () => {
+          try {
+            const data = fs.readFileSync(tmpOut);
+            resolve(data);
+          } catch (e) { reject(e); }
+          finally {
+            try { fs.unlinkSync(tmpIn); } catch {}
+            try { fs.unlinkSync(tmpOut); } catch {}
+          }
+        })
+        .on('error', (err) => {
+          try { fs.unlinkSync(tmpIn); } catch {}
+          try { fs.unlinkSync(tmpOut); } catch {}
+          reject(err);
+        })
+        .run();
+    });
+  }
+
+  /**
+   * WhatsApp only renders the proper voice-note bubble (waveform, mic icon —
+   * `voice: true` on the outbound payload) for audio/ogg with the Opus codec.
+   * M4A/AAC (used for regular audio-file attachments) plays fine but always
+   * shows as a plain generic audio player, never the voice-note UI.
+   */
+  private async convertWebmToOggOpus(buffer: Buffer): Promise<Buffer> {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const os = require('os');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const path = require('path');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs');
+    const ts = Date.now();
+    const tmpIn = path.join(os.tmpdir(), `wa_voice_in_${ts}.webm`);
+    const tmpOut = path.join(os.tmpdir(), `wa_voice_out_${ts}.ogg`);
+    fs.writeFileSync(tmpIn, buffer);
+    return new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(tmpIn)
+        .noVideo()
+        .audioCodec('libopus')
+        .audioBitrate('64k')
+        .audioFrequency(48000)
+        .audioChannels(1)
+        // Meta's voice-note processing has intermittently rejected files
+        // encoded with libopus's default "audio" application profile as
+        // application/octet-stream after upload, even though the file is a
+        // structurally valid Ogg/Opus stream. "voip" is the profile Meta's
+        // own recording pipeline uses and is what's documented to work
+        // reliably for WhatsApp voice notes.
+        // Root cause of the 131053 "processing it is of type
+        // application/octet-stream" failures: the browser's MediaRecorder
+        // webm/opus stream carries a small negative start timestamp
+        // (container pre-skip/priming offset). ffmpeg preserves that offset
+        // when remuxing straight to Ogg, and Meta's Ogg/Opus parser rejects
+        // the result — confirmed by re-transcoding a failing file through
+        // ffmpeg a second time (which resets the offset) and having Meta
+        // accept it. avoid_negative_ts is a muxer (output-side) option, not
+        // an input option — it normalizes the offset when writing the file.
+        .outputOptions(['-application', 'voip', '-avoid_negative_ts', 'make_zero'])
+        .format('ogg')
         .output(tmpOut)
         .on('end', () => {
           try {
@@ -1423,6 +1484,10 @@ export class InboxService {
 
     // Upload any attached files to S3 and build URL list for the message payload.
     const uploadedFileUrls: { url: string; name: string; size: number; mime: string }[] = [];
+    // Captured alongside the S3 upload so a voice note can ALSO go to Meta
+    // via direct media upload (more reliable than link-based sends — see
+    // the voice-note branch below).
+    let voiceNoteBuffer: { buffer: Buffer; mimeType: string; filename: string } | null = null;
     if (files && files.length > 0) {
       this.logger.log(`[UPLOAD] ${files.length} file(s): ${files.map(f => `${f.originalname}(${f.size}B)`).join(', ')}`);
       const uploadResults = await Promise.all(files.map(async (file, idx) => {
@@ -1443,21 +1508,51 @@ export class InboxService {
             this.logger.warn(`[IG AUDIO] WebM→M4a conversion failed (${convErr.message}) — uploading original`);
           }
         }
-        // WhatsApp does not support audio/webm — convert to M4A (AAC) which WhatsApp supports
+        // WhatsApp does not support audio/webm — convert before upload.
+        // A live mic recording (is_voice_note) goes to OGG/Opus so it renders
+        // as a real voice-note bubble; a regular audio-file attachment goes
+        // to M4A, which plays fine but only ever shows a plain audio player.
         if (
           type && type.toLowerCase().includes('whatsapp') &&
           file.mimetype && file.mimetype.startsWith('audio/') &&
           (file.mimetype.includes('webm') || file.originalname?.toLowerCase().endsWith('.webm'))
         ) {
-          try {
-            this.logger.log(`[WA AUDIO] Converting ${file.originalname} (${file.mimetype}) → m4a`);
-            file.buffer = await this.convertWebmToM4a(file.buffer);
-            file.originalname = file.originalname.replace(/\.webm$/i, '.m4a');
-            file.mimetype = 'audio/mp4';
-            file.size = file.buffer.length;
-            this.logger.log(`[WA AUDIO] Converted ok size=${file.size}B`);
-          } catch (convErr) {
-            this.logger.warn(`[WA AUDIO] WebM→M4a conversion failed (${convErr.message}) — uploading original`);
+          const isVoiceNote = data?.is_voice_note === true || data?.is_voice_note === 'true';
+          if (isVoiceNote) {
+            try {
+              this.logger.log(`[WA AUDIO] Converting voice note ${file.originalname} (${file.mimetype}) → ogg/opus`);
+              file.buffer = await this.convertWebmToOggOpus(file.buffer);
+              file.originalname = file.originalname.replace(/\.webm$/i, '.ogg');
+              // WhatsApp requires the exact "audio/ogg; codecs=opus" content-type
+              // for voice notes — a bare "audio/ogg" (no codecs param) makes
+              // Meta's own fetch treat it as application/octet-stream and fail
+              // the send with a "Media upload error".
+              file.mimetype = 'audio/ogg; codecs=opus';
+              file.size = file.buffer.length;
+              this.logger.log(`[WA AUDIO] Converted ok size=${file.size}B`);
+              voiceNoteBuffer = { buffer: file.buffer, mimeType: file.mimetype, filename: file.originalname };
+            } catch (convErr) {
+              this.logger.warn(`[WA AUDIO] WebM→Ogg conversion failed (${convErr.message}) — falling back to m4a`);
+              try {
+                file.buffer = await this.convertWebmToM4a(file.buffer);
+                file.originalname = file.originalname.replace(/\.webm$/i, '.m4a');
+                file.mimetype = 'audio/mp4';
+                file.size = file.buffer.length;
+              } catch (fallbackErr) {
+                this.logger.warn(`[WA AUDIO] M4a fallback also failed (${fallbackErr.message}) — uploading original`);
+              }
+            }
+          } else {
+            try {
+              this.logger.log(`[WA AUDIO] Converting ${file.originalname} (${file.mimetype}) → m4a`);
+              file.buffer = await this.convertWebmToM4a(file.buffer);
+              file.originalname = file.originalname.replace(/\.webm$/i, '.m4a');
+              file.mimetype = 'audio/mp4';
+              file.size = file.buffer.length;
+              this.logger.log(`[WA AUDIO] Converted ok size=${file.size}B`);
+            } catch (convErr) {
+              this.logger.warn(`[WA AUDIO] WebM→M4a conversion failed (${convErr.message}) — uploading original`);
+            }
           }
         }
         const key = `inbox/${inboxId}/attachments/${Date.now()}-${idx}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
@@ -1467,13 +1562,38 @@ export class InboxService {
             `File upload to S3 failed: ${this.s3.lastError ?? 'check AWS credentials/bucket config'}`,
           );
         }
-        const signedUrl = await this.s3.getSignedUrl(s3Key, 3600 * 24 * 7);
+        const signedUrl = await this.s3.getCachedSignedUrl(s3Key, 3600 * 24 * 7);
         if (!signedUrl) {
           throw new BadRequestException('Failed to generate signed URL after S3 upload');
         }
         return { url: signedUrl, name: file.originalname, size: file.size, mime: file.mimetype };
       }));
       uploadedFileUrls.push(...uploadResults);
+    }
+
+    // Files picked from the workspace Media Gallery — they're already on S3,
+    // so this only re-signs the existing key instead of downloading the
+    // bytes here and re-uploading them as a "new" file. That download+
+    // re-upload round trip was the whole reason gallery-picked attachments
+    // felt slow (each leg needing a body transfer to/from S3, on top of the
+    // browser's own earlier fetch to preview it) — re-signing is a cheap,
+    // metadata-only S3 call.
+    let galleryMediaIds: string[] = [];
+    try {
+      const raw = data.gallery_media_ids;
+      galleryMediaIds = typeof raw === 'string' ? JSON.parse(raw) : Array.isArray(raw) ? raw : [];
+    } catch {}
+    if (galleryMediaIds.length > 0) {
+      const galleryRows = await this.prisma.media_gallery.findMany({
+        where: { object_id: { in: galleryMediaIds }, workspace_id: inbox.workspace_id, object_status: 'AVAILABLE' },
+      });
+      const galleryResults = await Promise.all(galleryRows.map(async (g) => {
+        if (!g.file_path) return null;
+        const url = await this.s3.getCachedSignedUrl(g.file_path, 3600 * 24 * 7);
+        if (!url) return null;
+        return { url, name: g.object_name ?? 'attachment', size: Number(g.file_size ?? 0), mime: g.mime_type ?? 'application/octet-stream' };
+      }));
+      uploadedFileUrls.push(...(galleryResults.filter(Boolean) as typeof uploadedFileUrls));
     }
 
     if (!String(text).trim() && uploadedFileUrls.length === 0 && !isTemplateSend && !isLocationSend && !isGifSend) {
@@ -1661,7 +1781,62 @@ export class InboxService {
           waContext.type = fileType;
           if (fileType === 'image') waContext.image = { link: mediaUrl };
           else if (fileType === 'sticker') waContext.sticker = { link: mediaUrl };
-          else if (fileType === 'audio') waContext.audio = { link: mediaUrl };
+          else if (fileType === 'audio') {
+            // `voice: true` is what makes WhatsApp render this as a proper
+            // voice-note bubble (waveform, mic icon) instead of a generic
+            // audio-file player — only set it for a live mic recording from
+            // our composer, not a regular audio file the agent attached.
+            const isVoiceNote = data?.is_voice_note === true || data?.is_voice_note === 'true';
+            if (isVoiceNote && voiceNoteBuffer) {
+              // Link-based sends require Meta to fetch our S3 URL itself,
+              // which has intermittently failed for voice notes with a
+              // "Media upload error" even when the file/content-type were
+              // verified correct. Uploading the bytes directly to Meta and
+              // referencing the returned media id is the more reliable path.
+              // Meta's own /media upload docs show `type=audio/ogg` with no
+              // codecs parameter — the "; codecs=opus" qualifier belongs on
+              // the *message send* payload's declared type, not the upload's
+              // file part. Sending it here silently produced a media id that
+              // Meta's own delivery pipeline then rejected as octet-stream.
+              let mediaId = await this.meta.uploadMedia(
+                phone.wa_number_id,
+                account.access_token,
+                voiceNoteBuffer.buffer,
+                'audio/ogg',
+                voiceNoteBuffer.filename,
+              );
+              if (mediaId) {
+                // Observed: Meta sometimes still reports a freshly-uploaded
+                // media id as application/octet-stream for a moment before
+                // it finishes processing as audio/ogg — sending against it
+                // in that window is what produces error 131053 even though
+                // the same id/file succeeds a few seconds later. Poll briefly
+                // and re-upload once if it never settles to an audio type.
+                let verified = false;
+                for (let attempt = 0; attempt < 3 && !verified; attempt++) {
+                  if (attempt > 0) await new Promise((r) => setTimeout(r, 600));
+                  const info = await this.meta.getMediaInfo(mediaId, account.access_token);
+                  if (info?.mime_type?.startsWith('audio')) verified = true;
+                }
+                if (!verified) {
+                  this.logger.warn?.(
+                    `Voice note media ${mediaId} never verified as audio/*, re-uploading once before send`,
+                  );
+                  const reuploadId = await this.meta.uploadMedia(
+                    phone.wa_number_id,
+                    account.access_token,
+                    voiceNoteBuffer.buffer,
+                    'audio/ogg',
+                    voiceNoteBuffer.filename,
+                  );
+                  if (reuploadId) mediaId = reuploadId;
+                }
+              }
+              waContext.audio = mediaId ? { id: mediaId, voice: true } : { link: mediaUrl, voice: true };
+            } else {
+              waContext.audio = isVoiceNote ? { link: mediaUrl, voice: true } : { link: mediaUrl };
+            }
+          }
           else if (fileType === 'video') waContext.video = { link: mediaUrl };
           else waContext.document = { link: mediaUrl, filename: uploadedFileUrls[0].name };
         } else {
@@ -2967,9 +3142,25 @@ export class InboxService {
       where: { id: inboxId, workspace_id: workspaceId },
     });
     if (!inbox) throw new NotFoundException('Inbox not found');
+
+    // Tell Meta the customer's latest message was read — this is what shows
+    // the blue double-tick on their side. Meta never does this on its own
+    // just because we display the message in our UI. Runs on every call
+    // (even when is_read was already 1) because the frontend also calls this
+    // for a new message arriving in an already-open conversation, where the
+    // conversation-level flag has nothing new to flip but the message itself
+    // still needs its own read receipt sent. Best-effort: a failure here
+    // shouldn't block the agent from opening the conversation.
+    if (inbox.modelable_type.includes('WhatsappChat')) {
+      this.sendWhatsappReadReceipt(inbox.modelable_id).catch((e) =>
+        this.logger.warn(`WhatsApp read-receipt failed for inbox ${inboxId}: ${e?.message ?? e}`),
+      );
+    }
+
     // Opening a conversation clears BOTH the unread flag AND the transfer/assign
     // flag (replyagent getChatMessages:708 `['is_read'=>true, 'is_assigned'=>false]`,
-    // unconditional). Skip only when there is genuinely nothing to change.
+    // unconditional). Skip the DB write + broadcast only when there is
+    // genuinely nothing to change.
     if (inbox.is_read === 1 && inbox.is_assigned === 0) return { success: true, already_read: true };
     await this.prisma.inbox.update({
       where: { id: inboxId },
@@ -2978,7 +3169,28 @@ export class InboxService {
     this.chatGateway.emitToWorkspace(workspaceId, 'inbox_read', {
       inbox_id: inboxId.toString(),
     });
+
     return { success: true };
+  }
+
+  private async sendWhatsappReadReceipt(waChatId: bigint) {
+    const lastIncoming = await this.prisma.wa_messages.findFirst({
+      where: { wa_chat_id: waChatId, direction: 'INCOMING', wamid: { not: null } },
+      orderBy: { created_at: 'desc' },
+    });
+    if (!lastIncoming?.wamid) return;
+
+    const phoneNumber = await this.prisma.wa_phone_numbers.findUnique({
+      where: { id: lastIncoming.wa_number_id },
+    });
+    if (!phoneNumber) return;
+
+    const account = await this.prisma.wa_accounts.findUnique({
+      where: { id: phoneNumber.wa_account_id },
+    });
+    if (!account) return;
+
+    await this.meta.markMessageAsRead(phoneNumber.wa_number_id, account.access_token, lastIncoming.wamid);
   }
 
   // ─── Reactions ────────────────────────────────────────────────────

@@ -59,8 +59,15 @@ export class CsatService {
     if (!contactId || !workspaceId || !inboxId) return;
 
     // Guard against the same close firing twice (e.g. a bulk action that
-    // re-touches an already-COMPLETED row) — one CSAT request per inbox.
-    const existing = await this.prisma.csat_responses.findFirst({ where: { inbox_id: inboxId } });
+    // re-touches an already-COMPLETED row), while still allowing a fresh
+    // CSAT request each time this conversation is genuinely closed again
+    // later — a 24h cooldown tells apart "duplicate event for the same
+    // close" from "customer came back and the conversation got resolved
+    // again a day+ later".
+    const cooldownStart = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const existing = await this.prisma.csat_responses.findFirst({
+      where: { inbox_id: inboxId, requested_at: { gte: cooldownStart } },
+    });
     if (existing) return;
 
     const chat = await this.prisma.wa_chats.findFirst({
